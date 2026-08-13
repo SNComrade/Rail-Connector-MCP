@@ -21,6 +21,9 @@ the public repository is created and before it is announced.
 - Require the CI, CodeQL, dependency review, and secret-scan checks that
   actually exist after their first runs. Dependency audit and release checks
   remain additional push/tag gates when they do not produce pull-request checks.
+- Add a CodeQL code-scanning rule that blocks errors and security alerts rated
+  high or higher. A successful CodeQL workflow means analysis completed; it
+  does not mean the analysis found no alerts.
 - Require linear history unless a different merge policy is documented.
 - Protect `v*` tags from update and deletion.
 
@@ -54,6 +57,9 @@ the public repository is created and before it is announced.
 ## Before Announcement
 
 - Run all public workflows on the exact candidate commit.
+- Confirm the exact commit has no open CodeQL security alerts rated high or
+  critical. Review lower-severity alerts explicitly instead of relying only on
+  the workflow conclusion.
 - Perform a clean installation from the public clone URL.
 - Verify the three executable paths retain mode `100755` in a clean Linux clone.
 - Review the repository tree, npm package dry run, Git history, authorship, tags,

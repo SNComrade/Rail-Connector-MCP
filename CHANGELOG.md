@@ -5,16 +5,13 @@ Semantic Versioning after the first stable release.
 
 ## [Unreleased]
 
+## [1.0.0-beta.1] - 2026-08-13
+
 ### Added
 
 - Public project governance, security, support, compatibility, and contribution
   policies
 - Public CI, dependency review, CodeQL, dependency audit, and release checks
-
-## [1.0.0-beta.1] - Unreleased
-
-### Added
-
 - First public beta candidate
 - Native Windows broker and Linux/macOS tmux backends
 - Claude session discovery, resume, continue, fork, rename, archive, and stop

@@ -25,6 +25,12 @@ record must confirm applicable public findings were incorporated into the
 development source before release eligibility is claimed. Accepted public work
 and its attribution must be present in that reconciliation.
 
+For CodeQL, require both a successful analysis workflow and no open high or
+critical security alerts on the exact commit. The workflow can succeed while
+reporting findings. Configure the repository ruleset's CodeQL merge protection
+to block errors and high-or-higher security alerts, then inspect the security
+dashboard before tagging.
+
 ## Version And Tag
 
 1. Update `CHANGELOG.md` and remove `Unreleased` from the target release date.
@@ -35,10 +41,12 @@ and its attribution must be present in that reconciliation.
    reports `100755` for all three paths. On the first commit, use
    `git add --chmod=+x` for those paths.
 5. Confirm the release commit and package contain no sensitive material.
-6. Create an immutable annotated `v<version>` tag only after explicit human
+6. Confirm CodeQL has no open high or critical security alerts for the exact
+   commit; do not treat a green analysis workflow as a clean result by itself.
+7. Create an immutable annotated `v<version>` tag only after explicit human
    authorization.
-7. Let the tag workflow build and retain the runtime-only package artifact.
-8. Create the GitHub Release from the exact tag after reviewing the artifact.
+8. Let the tag workflow build and retain the runtime-only package artifact.
+9. Create the GitHub Release from the exact tag after reviewing the artifact.
 
 The first sequence is `1.0.0-beta.N`, then `1.0.0-rc.N`, then `1.0.0`. Never
 move or reuse a published tag.

@@ -2057,8 +2057,6 @@ function promptSnippets(value) {
   return [compact.slice(0, 80), compact.slice(-80)];
 }
 
-const ACTIVE_INPUT_LINE_RE = /^[ \t\u2502\u2503\u2551]*(?:>|❯)[ \t]*(.*)$/;
-const INLINE_ACTIVE_INPUT_RE = /^[ \t\u2500-\u257f]*(?:>|❯)[ \t]*(.*)$/;
 const BUSY_CAPTURE_PATTERN =
   "esc to interrupt|ctrl-c to cancel|thinking with \\w+ effort";
 const BUSY_CAPTURE_MATCH_RE = new RegExp(BUSY_CAPTURE_PATTERN, "gi");
@@ -2094,12 +2092,24 @@ const ULTRACODE_UNAVAILABLE_RE =
 const PERMISSION_INDICATOR_RE =
   /(?:^|\n)[ \t\u2502\u2503\u2551]*(?:(manual|default|plan|acceptEdits|auto|dontAsk|bypassPermissions)\s+mode\s+on|Permission mode:\s*(manual|default|plan|acceptEdits|auto|dontAsk|bypassPermissions))\b/gi;
 
+function activeInputLineText(line) {
+  let index = 0;
+  while (index < line.length) {
+    const code = line.charCodeAt(index);
+    if (code !== 0x09 && code !== 0x20 && (code < 0x2500 || code > 0x257f)) break;
+    index += 1;
+  }
+  if (line[index] !== ">" && line[index] !== "❯") return null;
+  index += 1;
+  while (line[index] === " " || line[index] === "\t") index += 1;
+  return line.slice(index);
+}
+
 function activeInputSlice(capture) {
   const lines = lastLines(String(capture), 12).split(/\r?\n/);
   for (let index = lines.length - 1; index >= Math.max(0, lines.length - 8); index -= 1) {
     const line = lines[index];
-    const match = line.match(ACTIVE_INPUT_LINE_RE) ?? line.match(INLINE_ACTIVE_INPUT_RE);
-    if (!match) continue;
+    if (activeInputLineText(line) === null) continue;
     return [line, ...lines.slice(index + 1)].join("\n");
   }
   return "";
@@ -2109,8 +2119,9 @@ function activeInputFirstLine(capture) {
   const activeInput = activeInputSlice(capture);
   if (!activeInput) return "";
   const firstLine = activeInput.split(/\r?\n/, 1)[0] ?? "";
-  const match = firstLine.match(ACTIVE_INPUT_LINE_RE) ?? firstLine.match(INLINE_ACTIVE_INPUT_RE);
-  return (match?.[1] ?? "").replace(/[\u200b-\u200d\u2060\ufeff]/g, "").trim();
+  return (activeInputLineText(firstLine) ?? "")
+    .replace(/[\u200b-\u200d\u2060\ufeff]/g, "")
+    .trim();
 }
 
 function captureWithoutPromptText(capture) {
