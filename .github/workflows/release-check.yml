@@ -1,0 +1,54 @@
+name: Release check
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Verify tagged package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          expected="v$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "$expected" || {
+            echo "Tag $GITHUB_REF_NAME does not match $expected" >&2
+            exit 1
+          }
+
+      - name: Install and test
+        run: npm ci && npm test
+
+      - name: Build package artifact
+        shell: bash
+        run: |
+          package="$(npm pack --silent)"
+          sha256sum "$package" > "$package.sha256"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rail-connector-mcp-${{ github.ref_name }}
+          path: |
+            rail-connector-mcp-*.tgz
+            rail-connector-mcp-*.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30

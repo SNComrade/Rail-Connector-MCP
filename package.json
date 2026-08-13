@@ -1,0 +1,92 @@
+{
+  "name": "rail-connector-mcp",
+  "version": "1.0.0-beta.1",
+  "description": "Local MCP bridge for operating Claude Code Remote Control from Codex.",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SNComrade/Rail-Connector-MCP.git"
+  },
+  "homepage": "https://github.com/SNComrade/Rail-Connector-MCP#readme",
+  "bugs": {
+    "url": "https://github.com/SNComrade/Rail-Connector-MCP/issues"
+  },
+  "main": "src/index.js",
+  "bin": {
+    "rail-connector-mcp": "src/index.js"
+  },
+  "files": [
+    "src/",
+    ".agents/skills/",
+    "docs/INSTALL.md",
+    "docs/LINUX.md",
+    "docs/MACOS.md",
+    "docs/RELEASE_PROCESS.md",
+    "docs/GITHUB_SETUP.md",
+    "docs/SECURITY_MODEL.md",
+    "docs/SKILL_INSTALL.md",
+    "docs/SKILLS.md",
+    "docs/SKILLS_LINUX.md",
+    "docs/SKILLS_WINDOWS.md",
+    "docs/TASK_GUIDE.md",
+    "docs/TROUBLESHOOTING.md",
+    "docs/USAGE.md",
+    "docs/WINDOWS.md",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md",
+    "COMPATIBILITY.md",
+    "CONTRIBUTING.md",
+    "GOVERNANCE.md",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "THIRD-PARTY-NOTICES.md"
+  ],
+  "scripts": {
+    "start": "node src/index.js",
+    "smoke": "node test/smoke.mjs",
+    "test:args": "node test/claude-args.mjs",
+    "test:capabilities": "node test/capabilities.mjs",
+    "test:lifecycle": "node test/lifecycle.mjs",
+    "test:submit": "node test/submit-prompt.mjs",
+    "test:submit-loop": "node test/submit-loop.mjs",
+    "test:sessions": "node test/session-listing.mjs",
+    "test:render": "node test/render-capture.mjs",
+    "test:broker": "node test/windows-broker.mjs",
+    "test:skills": "node test/skills.mjs",
+    "test:public": "node test/public-metadata.mjs",
+    "test:git-modes": "node test/git-modes.mjs",
+    "test:package": "node test/package-contents.mjs",
+    "test:live:windows": "node test/live-windows-acceptance.mjs",
+    "test:installer:unix": "node test/install-unix.mjs",
+    "test:installer:windows": "pwsh -NoProfile -File test/install-windows.ps1",
+    "test:tmux": "node test/tmux-integration.mjs",
+    "test:wrapper:windows": "node test/windows-command-wrapper.mjs",
+    "check": "node --check src/index.js",
+    "check:privacy": "node tools/leak-scan.mjs",
+    "test": "npm run check && npm run test:args && npm run test:capabilities && npm run test:lifecycle && npm run test:submit && npm run test:submit-loop && npm run test:sessions && npm run test:render && npm run test:broker && npm run test:skills && npm run test:public && npm run test:git-modes && npm run test:package && npm run check:privacy && npm run smoke"
+  },
+  "keywords": [
+    "mcp",
+    "remote-control",
+    "codex",
+    "terminal",
+    "node-pty",
+    "tmux"
+  ],
+  "author": "SNComrade",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": "^22.0.0 || ^24.0.0 || ^26.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@xterm/headless": "^6.0.0",
+    "node-pty": "^1.1.0",
+    "zod": "^4.4.3"
+  }
+}

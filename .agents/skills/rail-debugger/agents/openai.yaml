@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rail Connector Debugger"
+  short_description: "Debug Rail Connector lifecycle and posture"
+  default_prompt: "Use $rail-debugger to diagnose this Rail Connector installation, broker, session, prompt, or posture problem."

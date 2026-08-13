@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rail Connector Reviewer"
+  short_description: "Run verified independent Claude reviews"
+  default_prompt: "Use $rail-reviewer to run and verify an independent Claude review of this work."

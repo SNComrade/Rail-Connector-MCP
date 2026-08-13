@@ -1,0 +1,62 @@
+name: Bug report
+description: Report a reproducible Rail Connector MCP defect.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove credentials, usernames, local paths, transcripts, titles, session IDs, and Remote Control URLs. Report security issues privately through the Security tab.
+  - type: input
+    id: version
+    attributes:
+      label: Rail Connector version
+      placeholder: 1.0.0-beta.1 or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - WSL
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Runtime versions
+      description: Include Node.js, npm, Claude Code, and Codex versions.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Use synthetic names and paths.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include sanitized status, reason, signals, and error text when relevant.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed secrets, private data, local identity, session IDs, titles, transcripts, and live links.
+          required: true
