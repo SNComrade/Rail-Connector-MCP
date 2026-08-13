@@ -22,6 +22,11 @@ assert.equal(submitPreflightReason(captureSignals('> Try "review the repository"
 
 assert.equal(activeInputContainsText(`assistant transcript kept the words ${prompt}\n> `, prompt), false);
 assert.equal(activeInputContainsText(`> ${prompt}`, prompt), true);
+assert.equal(activeInputContainsText(`│ ❯\t${prompt}`, prompt), true);
+assert.equal(
+  activeInputContainsText(`>${"\t".repeat(100_000)}${prompt}`, prompt),
+  true
+);
 
 assert.deepEqual(submitResultStatus(captureSignals("Misting...   ( 1s  ·  1 tokens )\n> "), "Misting...\n> ", prompt), {
   status: "submitted",

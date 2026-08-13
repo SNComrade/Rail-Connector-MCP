@@ -219,6 +219,18 @@ try {
   assert.equal(sent.bracketedPasteRequested, true);
   assert.equal(sent.bracketedPasteUsed, true);
   assert.match(await waitForCapture(/ACK:broker prompt/), /ACK:broker prompt/);
+  const boundedDelayStartedAt = Date.now();
+  await windowsBrokerRequest("sendText", {
+    sessionName,
+    text: "bounded broker delay",
+    submit: true,
+    chunkDelayMs: Number.MAX_SAFE_INTEGER,
+    submitSettleMs: Number.MAX_SAFE_INTEGER,
+    leaseId: firstLease,
+    expectedGenerationId: activeGenerationId,
+  });
+  assert.ok(Date.now() - boundedDelayStartedAt < 3000);
+  assert.match(await waitForCapture(/ACK:bounded broker delay/), /ACK:bounded broker delay/);
   await assert.rejects(
     windowsBrokerRequest("updateMetadata", {
       sessionName,

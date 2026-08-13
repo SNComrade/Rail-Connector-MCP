@@ -19,6 +19,7 @@ const DEFAULT_TEXT_CHUNK_DELAY_MS = 10;
 const DEFAULT_SUBMIT_SETTLE_MS = 100;
 const REQUEST_READ_TIMEOUT_MS = 2000;
 const MAX_BROKER_CONNECTIONS = 64;
+const MAX_SLEEP_MS = 30_000;
 const COMPATIBILITY_INSPECTION_OPERATIONS = new Set([
   "ping",
   "status",
@@ -51,12 +52,17 @@ if (brokerToken.length < 32) {
 }
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  let delay = Number.isInteger(ms) ? ms : 0;
+  if (delay < 0) delay = 0;
+  if (delay > MAX_SLEEP_MS) delay = MAX_SLEEP_MS;
+  return new Promise((resolve) => setTimeout(resolve, delay));
 }
 
 function clampInteger(value, fallback, min, max) {
   if (!Number.isInteger(value)) return fallback;
-  return Math.max(min, Math.min(max, value));
+  if (value < min) return min;
+  if (value > max) return max;
+  return value;
 }
 
 function trimRawBuffer(buffer) {
