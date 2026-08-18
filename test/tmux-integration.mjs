@@ -160,6 +160,38 @@ try {
   );
   assert.equal(postUpgradeCapture.isError, undefined, postUpgradeCapture.content?.[0]?.text);
 
+  await tmux([
+    "set-option",
+    "-t",
+    managedName,
+    metadataOption,
+    JSON.stringify({
+      ...upgradedMetadata,
+      observedPosture: {
+        permissionMode: "plan",
+        model: "claude-fable-5",
+        effort: "high",
+        ultracode: null,
+        evidence: { effort: "legacy-test-fixture" },
+      },
+    }),
+  ]);
+  const statusWithLegacyObservation = await client.callTool(
+    { name: "status", arguments: {} },
+    undefined,
+    { timeout: 30000 }
+  );
+  assert.equal(
+    statusWithLegacyObservation.isError,
+    undefined,
+    statusWithLegacyObservation.content?.[0]?.text
+  );
+  const statusManagedSession = JSON.parse(
+    statusWithLegacyObservation.content?.[0]?.text ?? "{}"
+  ).managedSessions.find((session) => session.name === managedName);
+  assert.ok(statusManagedSession);
+  assert.equal(Object.hasOwn(statusManagedSession, "observedPosture"), false);
+
   const otherPane = await tmux([
     "split-window",
     "-d",

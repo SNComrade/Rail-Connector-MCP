@@ -335,13 +335,6 @@ function createSessionSummaryState() {
   };
 }
 
-const WORKFLOW_LAUNCH_STATUSES = new Set([
-  "async_launched",
-  "launched",
-  "running",
-  "completed",
-  "succeeded",
-]);
 const WORKFLOW_PENDING_LAUNCH_STATUSES = new Set([
   "async_launched",
   "launched",
@@ -364,6 +357,22 @@ const WORKFLOW_TERMINAL_TASK_STATUSES = new Set([
   "canceled",
   "interrupted",
 ]);
+const WORKFLOW_LAUNCH_STATUSES = new Set([
+  ...WORKFLOW_PENDING_LAUNCH_STATUSES,
+  "completed",
+  "succeeded",
+]);
+
+function completeTrackedWorkflowTask(state, taskId, timestamp = "") {
+  if (!taskId || !state.activeWorkflowTaskIds.has(taskId)) return false;
+  state.activeWorkflowTaskIds.delete(taskId);
+  state.pendingWorkflowCount = Math.max(
+    state.activeWorkflowTaskIds.size + state.unidentifiedPendingWorkflowCount,
+    Math.max(0, (state.pendingWorkflowCount ?? 1) - 1)
+  );
+  state.pendingWorkflowUpdatedAt = timestamp;
+  return true;
+}
 
 async function withManagedMutationLock(
   sessionName,
@@ -565,6 +574,10 @@ function addSessionRecord(
     if (record.effort) state.effort = String(record.effort);
   }
   const workflowResult = record.toolUseResult;
+  const workflowTaskId =
+    typeof workflowResult?.taskId === "string" && workflowResult.taskId
+      ? workflowResult.taskId
+      : "";
   if (
     workflowResult?.taskType === "local_workflow" &&
     typeof workflowResult.workflowName === "string" &&
@@ -575,10 +588,6 @@ function addSessionRecord(
     state.workflowLaunchStatus = workflowResult.status;
     state.workflowLaunchUpdatedAt = record.timestamp ?? "";
     if (WORKFLOW_PENDING_LAUNCH_STATUSES.has(workflowResult.status)) {
-      const workflowTaskId =
-        typeof workflowResult.taskId === "string" && workflowResult.taskId
-          ? workflowResult.taskId
-          : "";
       if (workflowTaskId) state.activeWorkflowTaskIds.add(workflowTaskId);
       else state.unidentifiedPendingWorkflowCount += 1;
       state.pendingWorkflowCount = Math.max(
@@ -588,6 +597,16 @@ function addSessionRecord(
       );
       state.pendingWorkflowUpdatedAt = record.timestamp ?? "";
     }
+  }
+  if (
+    workflowResult?.taskType === "local_workflow" &&
+    WORKFLOW_TERMINAL_TASK_STATUSES.has(workflowResult.status)
+  ) {
+    completeTrackedWorkflowTask(
+      state,
+      workflowTaskId,
+      record.timestamp ?? ""
+    );
   }
   const pendingWorkflowCount =
     record.pendingWorkflowCount ?? workflowResult?.pendingWorkflowCount;
@@ -609,18 +628,15 @@ function addSessionRecord(
       : "";
   if (
     retrievedWorkflowTaskId &&
-    state.activeWorkflowTaskIds.has(retrievedWorkflowTaskId) &&
     WORKFLOW_TERMINAL_RETRIEVAL_STATUSES.has(workflowResult.retrieval_status) &&
     (!retrievedWorkflowTaskStatus ||
       WORKFLOW_TERMINAL_TASK_STATUSES.has(retrievedWorkflowTaskStatus))
   ) {
-    state.activeWorkflowTaskIds.delete(retrievedWorkflowTaskId);
-    state.pendingWorkflowCount = Math.max(
-      state.activeWorkflowTaskIds.size +
-        state.unidentifiedPendingWorkflowCount,
-      Math.max(0, (state.pendingWorkflowCount ?? 1) - 1)
+    completeTrackedWorkflowTask(
+      state,
+      retrievedWorkflowTaskId,
+      record.timestamp ?? ""
     );
-    state.pendingWorkflowUpdatedAt = record.timestamp ?? "";
   }
   if (
     record.interruptedMessageId &&
@@ -6080,6 +6096,7 @@ server.registerTool(
     } else {
       managedSessions = [];
       for (const session of await tmuxManagedSessions()) {
+        const publicSession = publicLaunchMetadata(session);
         let workflowActivity = emptyWorkflowActivity();
         let workflowObservationStatus = "not_observed";
         try {
@@ -6093,7 +6110,7 @@ server.registerTool(
           workflowObservationStatus = "unavailable";
         }
         managedSessions.push({
-          ...session,
+          ...publicSession,
           workflowActivity,
           workflowPending:
             workflowObservationStatus === "unavailable"

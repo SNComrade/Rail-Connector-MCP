@@ -180,6 +180,54 @@ try {
     JSON.stringify(workflowCompleted),
     /incremental-private-name|incremental-private-task-id/
   );
+
+  fs.appendFileSync(
+    logFile,
+    jsonl([
+      {
+        ...baseRecord,
+        timestamp: "2026-08-18T09:08:00Z",
+        toolUseResult: {
+          status: "running",
+          taskType: "local_workflow",
+          workflowName: "direct-terminal-private-name",
+          taskId: "direct-terminal-private-task-id",
+        },
+      },
+    ]),
+    "utf8"
+  );
+  const directWorkflowPending = await sessionRuntimeObservation(metadata);
+  assert.equal(directWorkflowPending.workflowActivity.state, "pending");
+  assert.equal(directWorkflowPending.workflowActivity.pendingCount, 1);
+
+  fs.appendFileSync(
+    logFile,
+    jsonl([
+      {
+        ...baseRecord,
+        timestamp: "2026-08-18T09:09:00Z",
+        toolUseResult: {
+          status: "completed",
+          taskType: "local_workflow",
+          workflowName: "direct-terminal-private-name",
+          taskId: "direct-terminal-private-task-id",
+        },
+      },
+    ]),
+    "utf8"
+  );
+  const directWorkflowCompleted = await sessionRuntimeObservation(metadata);
+  assert.equal(directWorkflowCompleted.workflowActivity.state, "launch_observed");
+  assert.equal(directWorkflowCompleted.workflowActivity.pendingCount, 0);
+  assert.equal(
+    directWorkflowCompleted.workflowActivity.pendingObservedAt,
+    "2026-08-18T09:09:00Z"
+  );
+  assert.doesNotMatch(
+    JSON.stringify(directWorkflowCompleted),
+    /direct-terminal-private-name|direct-terminal-private-task-id/
+  );
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

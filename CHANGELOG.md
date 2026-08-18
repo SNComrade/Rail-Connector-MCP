@@ -58,6 +58,10 @@ Semantic Versioning after the first stable release.
 - Completed workflow state no longer retains pending-only evidence fields, and
   symlinked fixture paths use the same canonical project directory as runtime
   observation
+- Terminal local-workflow status records now retire their matching tracked
+  tasks instead of leaving `workflowPending` stuck after completion
+- Linux and macOS status output now removes legacy persisted
+  `observedPosture` metadata before reporting current managed-session evidence
 
 ### Security
 
