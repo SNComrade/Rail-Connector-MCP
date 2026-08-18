@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { activeInputContainsText, captureSignals, submitPreflightReason, submitResultStatus } from "../src/index.js";
+import {
+  activeInputContainsText,
+  captureSignals,
+  lifecycleBlockReason,
+  signalsWithWorkflowActivity,
+  submitPreflightReason,
+  submitResultStatus,
+} from "../src/index.js";
 
 const prompt = "Please review the repo and return a concise report.";
 
@@ -19,6 +26,15 @@ assert.equal(
 assert.equal(submitPreflightReason(captureSignals(`> ${prompt}`)), "active_input_not_empty");
 assert.equal(submitPreflightReason(captureSignals("> 1. keep this numbered draft")), "active_input_not_empty");
 assert.equal(submitPreflightReason(captureSignals('> Try "review the repository"')), "active_input_not_empty");
+const pendingWorkflowSignals = signalsWithWorkflowActivity(captureSignals("> "), {
+  pendingCount: 2,
+  pendingObservedAt: "2026-08-18T12:00:00Z",
+  evidence: "claude_session_log",
+});
+assert.equal(submitPreflightReason(pendingWorkflowSignals), "workflow_pending");
+assert.equal(lifecycleBlockReason(pendingWorkflowSignals), "workflow_pending");
+assert.equal(lifecycleBlockReason(captureSignals("> ")), "");
+assert.equal(lifecycleBlockReason(captureSignals("> unsent draft")), "awaiting_input");
 
 assert.equal(activeInputContainsText(`assistant transcript kept the words ${prompt}\n> `, prompt), false);
 assert.equal(activeInputContainsText(`> ${prompt}`, prompt), true);

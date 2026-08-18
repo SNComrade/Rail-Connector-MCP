@@ -14,6 +14,7 @@ const staleGuidance = [
   /managed Windows sessions live inside the MCP process/i,
   /use bypass only in a disposable isolated/i,
   /do not combine report-only review posture with Ultracode/i,
+  /claude_session_log_correlated_with_resolved_launch/i,
 ];
 
 function read(file) {
@@ -82,6 +83,16 @@ for (const skill of expectedSkills) {
   for (const pattern of staleGuidance) {
     assert.doesNotMatch(combined, pattern, `${skill} contains stale guidance: ${pattern}`);
   }
+  assert.match(combined, /Remote Control web/i, `${skill} must explain the web UI evidence scope`);
+  assert.match(combined, /session-bound web `?Extra`?/i, `${skill} must distinguish the web Extra label`);
+  assert.match(combined, /\/effort ultracode/i, `${skill} must teach explicit current-setting readback`);
+  assert.match(combined, /substantive\s+(?:turn|prompt)/i, `${skill} must reject trivial workflow validation`);
+  assert.match(combined, /awaiting_input/i, `${skill} must preserve protected composer drafts`);
+  assert.match(combined, /workflowPending/i, `${skill} must honor structured pending-workflow state`);
+  assert.match(combined, /workflow_pending/i, `${skill} must document the pending-workflow block reason`);
+  assert.match(combined, /launchEnvironment/, `${skill} must preserve child launch provenance`);
+  assert.match(combined, /currentMcpEnvironment/, `${skill} must separate refreshed MCP diagnostics`);
+  assert.match(combined, /timeout|termination/i, `${skill} must treat incomplete probes cautiously`);
 }
 
 const actualSkills = fs
@@ -90,5 +101,51 @@ const actualSkills = fs
   .map((entry) => entry.name)
   .sort();
 assert.deepEqual(actualSkills, expectedSkills, "active repo skill inventory must be intentional");
+
+const operatorGuidance = [
+  path.join(skillsRoot, "rail-operator", "SKILL.md"),
+  path.join(
+    skillsRoot,
+    "rail-operator",
+    "references",
+    "operator-playbook.md"
+  ),
+]
+  .map(read)
+  .join("\n");
+assert.match(operatorGuidance, /xhigh_correlated_unconfirmed/);
+assert.match(operatorGuidance, /claude-fable-5/);
+assert.match(operatorGuidance, /claude-opus-5/);
+assert.match(operatorGuidance, /conflicting_effort_evidence/);
+assert.match(operatorGuidance, /effort other than `xhigh` or `ultracode`/i);
+
+const debuggerGuidance = read(
+  path.join(
+    skillsRoot,
+    "rail-debugger",
+    "references",
+    "debugging-playbook.md"
+  )
+);
+assert.match(debuggerGuidance, /CLAUDE_CODE_EFFORT_LEVEL/);
+assert.match(debuggerGuidance, /workflow trigger\s+unknown/i);
+assert.match(debuggerGuidance, /effort other than `xhigh` or `ultracode`/i);
+
+const reviewerGuidance = [
+  path.join(skillsRoot, "rail-reviewer", "SKILL.md"),
+  path.join(
+    skillsRoot,
+    "rail-reviewer",
+    "references",
+    "review-prompt.md"
+  ),
+]
+  .map(read)
+  .join("\n");
+assert.match(reviewerGuidance, /at most 3 workflow agents/i);
+assert.match(reviewerGuidance, /no recursive delegation/i);
+assert.match(reviewerGuidance, /5 findings/i);
+assert.match(reviewerGuidance, /10 minutes/i);
+assert.match(reviewerGuidance, /200k aggregate tokens/i);
 
 console.log(`skills ok (${expectedSkills.length})`);

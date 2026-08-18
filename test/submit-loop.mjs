@@ -38,12 +38,47 @@ const blocked = scriptedBackend(["Misting...   ( 1s  ·  1 tokens )\n> "]);
 const blockedResult = await runSubmitPrompt(input, blocked.dependencies);
 assert.equal(blockedResult.status, "preflight_blocked");
 assert.equal(blockedResult.reason, "busy");
+assert.equal(blockedResult.forceUsed, false);
 assert.equal(blocked.calls.sendText.length, 0);
 assert.equal(blocked.calls.sendKey.length, 0);
+
+const workflowBlocked = scriptedBackend(["> "]);
+workflowBlocked.dependencies.runtimeObservation = async () => ({
+  workflowActivity: {
+    pendingCount: 1,
+    pendingObservedAt: "2026-08-18T12:00:00Z",
+    evidence: "claude_session_log",
+  },
+});
+const workflowBlockedResult = await runSubmitPrompt(
+  input,
+  workflowBlocked.dependencies
+);
+assert.equal(workflowBlockedResult.status, "preflight_blocked");
+assert.equal(workflowBlockedResult.reason, "workflow_pending");
+assert.equal(workflowBlockedResult.forceUsed, false);
+assert.equal(workflowBlockedResult.signals.workflowPending, true);
+assert.equal(workflowBlocked.calls.sendText.length, 0);
+assert.equal(workflowBlocked.calls.sendKey.length, 0);
+
+const forcedBusy = scriptedBackend([
+  "Misting...   ( 1s  ·  1 tokens )\n> ",
+  "> ",
+  "> ",
+]);
+const forcedBusyResult = await runSubmitPrompt(
+  { ...input, force: true, submitRetries: 0 },
+  forcedBusy.dependencies
+);
+assert.equal(forcedBusyResult.forceUsed, true);
+assert.equal(forcedBusyResult.forcedPastReason, "busy");
+assert.equal(forcedBusy.calls.sendText.length, 1);
 
 const recovered = scriptedBackend(["> ", `> ${prompt}`, `> ${prompt}`, "Misting...   ( 1s  ·  1 tokens )\n> "]);
 const recoveredResult = await runSubmitPrompt(input, recovered.dependencies);
 assert.equal(recoveredResult.status, "submitted");
+assert.equal(recoveredResult.forceUsed, false);
+assert.equal(recoveredResult.forcedPastReason, undefined);
 assert.equal(recoveredResult.retriesUsed, 1);
 assert.equal(recovered.calls.sendText.length, 1);
 assert.deepEqual(recovered.calls.sendText[0], [

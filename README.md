@@ -21,7 +21,7 @@ only to describe interoperability. See [NOTICE](NOTICE).
 
 ## Status
 
-The current version is `1.0.0-beta.1`, the first public beta candidate. Treat
+The current version is `1.0.0-beta.2`, the second public beta. Treat
 the MCP tool schemas and response fields as prerelease interfaces until a stable
 release is published. See [Compatibility](COMPATIBILITY.md).
 
@@ -76,7 +76,7 @@ For a published release, clone the immutable tag:
 Linux:
 
 ```bash
-git clone --branch v1.0.0-beta.1 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 ./install.sh
 ```
@@ -87,7 +87,7 @@ macOS uses the same installer after the prerequisites in
 Native Windows PowerShell:
 
 ```powershell
-git clone --branch v1.0.0-beta.1 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 .\install-windows.ps1
 ```

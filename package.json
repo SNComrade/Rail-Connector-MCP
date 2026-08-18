@@ -1,6 +1,6 @@
 {
   "name": "rail-connector-mcp",
-  "version": "1.0.0-beta.1",
+  "version": "1.0.0-beta.2",
   "description": "Local MCP bridge for operating Claude Code Remote Control from Codex.",
   "private": true,
   "repository": {
@@ -54,6 +54,7 @@
     "test:submit": "node test/submit-prompt.mjs",
     "test:submit-loop": "node test/submit-loop.mjs",
     "test:sessions": "node test/session-listing.mjs",
+    "test:runtime-observation": "node test/runtime-observation-file.mjs",
     "test:render": "node test/render-capture.mjs",
     "test:broker": "node test/windows-broker.mjs",
     "test:skills": "node test/skills.mjs",
@@ -67,7 +68,7 @@
     "test:wrapper:windows": "node test/windows-command-wrapper.mjs",
     "check": "node --check src/index.js",
     "check:privacy": "node tools/leak-scan.mjs",
-    "test": "npm run check && npm run test:args && npm run test:capabilities && npm run test:lifecycle && npm run test:submit && npm run test:submit-loop && npm run test:sessions && npm run test:render && npm run test:broker && npm run test:skills && npm run test:public && npm run test:git-modes && npm run test:package && npm run check:privacy && npm run smoke"
+    "test": "npm run check && npm run test:args && npm run test:capabilities && npm run test:lifecycle && npm run test:submit && npm run test:submit-loop && npm run test:sessions && npm run test:runtime-observation && npm run test:render && npm run test:broker && npm run test:skills && npm run test:public && npm run test:git-modes && npm run test:package && npm run check:privacy && npm run smoke"
   },
   "keywords": [
     "mcp",

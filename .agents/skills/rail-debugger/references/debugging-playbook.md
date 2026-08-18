@@ -66,13 +66,40 @@ resolved, and observed permission fields.
 ## Ultracode Fails
 
 - Call `get_claude_capabilities`.
+- Inspect `ultracode.capabilityStatus`, `supportSource`, `argumentProbe`, and
+  `environment`. A non-`xhigh` `CLAUDE_CODE_EFFORT_LEVEL` or
+  `CLAUDE_CODE_DISABLE_WORKFLOWS=1` in the MCP process is blocking; correct the
+  registration or process environment and start a fresh MCP process.
+- Check `argumentProbe.exitCode` and `controlExitCode`. Acceptance requires a
+  completed zero/nonzero pair. Treat timeout or termination as inconclusive;
+  changed stderr wording alone is not rejection. The documented direct launch
+  floor is Claude Code v2.1.203.
 - Use `ultracode: true` and `confirmUltracode: true`.
 - Omit ordinary `effort` and `safeMode`.
 - Confirm the selected launch mechanism. Current Claude builds may support
   direct `--effort=ultracode`; older builds may expose only the compatibility
   settings request.
-- Inspect session-log evidence and terminal signals. A requested-only result is
-  not observed activation.
+- Inspect `posture.ultracodeAssessment` after launch and after a substantive
+  turn. Separate parser acceptance, runtime effort, workflow activity, and
+  trigger attribution. `xhigh_correlated_unconfirmed` is not confirmed
+  UltraCode; `workflow_activity_observed` still leaves the workflow trigger
+  unknown.
+- Compare `launchEnvironment` with `currentMcpEnvironment`. A `different`
+  result after refresh can be legitimate; diagnose the original child from its
+  persisted sanitized launch snapshot. `launch_not_recorded` means older
+  metadata, not permission to infer launch state from the current MCP process.
+- Any bound effort other than `xhigh` or `ultracode`, such as `high` or `max`,
+  is conflicting evidence. Remote Control web may show `Extra` for underlying
+  xhigh while UltraCode is active. Treat a session-bound web `Extra` as
+  compatible presentation only; it confirms and disproves nothing, and
+  context-free terminal text remains unmapped. Verify that the view belongs to
+  the same managed name, conversation UUID, generation, and time window.
+- On an idle, empty composer, `/effort ultracode` returning the explicit
+  UltraCode setting is current-setting evidence. It may change posture, so it
+  cannot prove launch provenance. A trivial prompt cannot validate workflows.
+- Claude's UI may display the underlying `xhigh` effort while UltraCode is
+  requested. Do not require the footer to display the literal word
+  `UltraCode`.
 
 ## Windows Session Missing Or Stale
 
@@ -126,6 +153,13 @@ session is busy, replacement should be blocked unless
   when the xterm application mode reports it enabled. Compare
   `bracketedPasteRequested` with `bracketedPasteUsed`.
 - `preflight_blocked` should not be retried blindly.
+- A forced `submit_prompt` reports `forceUsed` and `forcedPastReason`; preserve
+  both when diagnosing why a prompt crossed its preflight gate.
+- `workflow_pending` means the terminal control line or the bound session log
+  still shows an active dynamic workflow. Do not submit or press Enter over it;
+  test aliases such as `C-m`, `C-j`, and `KPEnter` when diagnosing a bypass.
+- Native Windows returns `EINVAL` for an unsupported key name. Do not retry by
+  sending that name as composer text.
 - Use `force: true` only after inspecting the conflicting state.
 - Add new TUI prompt/composer shapes to submission fixtures.
 
@@ -142,6 +176,13 @@ session is busy, replacement should be blocked unless
 - An anchored `wait_for_claude_turn` requires a different assistant cursor with
   a terminal stop reason such as `end_turn`; `tool_use` is still in progress.
   A matching JSONL completion can supersede stale terminal status text.
+- A matching assistant completion cannot supersede `workflowPending: true`.
+  Inspect `workflowPendingEvidence`, `workflowPendingCount`, and
+  `workflowPendingObservedAt`; a matching workflow task result or explicit zero
+  count should release session-log evidence. A bound interruption record also
+  clears tracked workflow tasks. If evidence remains stale, inspect before
+  using an explicit force recovery and verify its `forceUsed` or
+  `workflowInterrupted` result.
 - Check `textLength` and `textTruncated` before diagnosing a large report as
   incomplete.
 - `needs_attention` is expected for approval, trust, limit, interruption,
@@ -192,6 +233,10 @@ Archive state is an MCP-local sidecar. It should:
 
 Default stop requires `signals.state: "idle"` and asks Claude to exit
 gracefully. `stop_blocked` is expected while busy or needing attention.
+If the reason is `awaiting_input`, preserve the unsent draft: submit or discard
+it only with explicit authorization, or leave the session running. If a bound
+session reports `workflow_pending`, wait for the workflow lifecycle to clear or
+use force only after accepting interruption of that work.
 `force: true` accepts interruption. A timeout or still-running backend must not
 be reported as stopped. Windows force-stop first closes ConPTY and then uses
 `taskkill /T /F`; `stop_timeout` remains tracked and can be retried.

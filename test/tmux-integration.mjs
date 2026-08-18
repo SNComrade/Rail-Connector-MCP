@@ -38,6 +38,14 @@ fs.writeFileSync(
     "printf 'https://claude.ai/code/session_tmux_integration\\n'",
     "while IFS= read -r command; do",
     "  if [[ \"$command\" == \"/exit\" ]]; then exit 0; fi",
+    "  if [[ \"$command\" == \"/workflow-test\" ]]; then",
+    "    printf 'Waiting for 1 dynamic workflow to finish\\n'",
+    "    continue",
+    "  fi",
+    "  if [[ \"$command\" == \"/workflow-clear\" ]]; then",
+    "    printf 'Worked for 2s\\n'",
+    "    continue",
+    "  fi",
     "  eval \"$command\"",
     "done",
     "",
@@ -191,6 +199,110 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   assert.equal(fs.readFileSync(outputFile, "utf8"), "alpha\nbeta\n");
+
+  const workflowStarted = await client.callTool(
+    {
+      name: "send_text",
+      arguments: {
+        managedSession: managedName,
+        text: "/workflow-test",
+        submit: true,
+      },
+    },
+    undefined,
+    { timeout: 30000 }
+  );
+  assert.equal(workflowStarted.isError, undefined, workflowStarted.content?.[0]?.text);
+  const workflowStartedPayload = JSON.parse(
+    workflowStarted.content?.[0]?.text ?? "{}"
+  );
+  assert.equal(workflowStartedPayload.signals.workflowPending, true);
+
+  const blockedWorkflowSubmit = await client.callTool(
+    {
+      name: "submit_prompt",
+      arguments: {
+        managedSession: managedName,
+        text: "must not submit",
+        force: false,
+      },
+    },
+    undefined,
+    { timeout: 30000 }
+  );
+  assert.equal(
+    blockedWorkflowSubmit.isError,
+    undefined,
+    blockedWorkflowSubmit.content?.[0]?.text
+  );
+  const blockedWorkflowSubmitPayload = JSON.parse(
+    blockedWorkflowSubmit.content?.[0]?.text ?? "{}"
+  );
+  assert.equal(blockedWorkflowSubmitPayload.status, "preflight_blocked");
+  assert.equal(blockedWorkflowSubmitPayload.reason, "workflow_pending");
+
+  const blockedWorkflowAlias = await client.callTool(
+    {
+      name: "send_key",
+      arguments: { managedSession: managedName, key: "C-m" },
+    },
+    undefined,
+    { timeout: 30000 }
+  );
+  assert.equal(
+    blockedWorkflowAlias.isError,
+    undefined,
+    blockedWorkflowAlias.content?.[0]?.text
+  );
+  const blockedWorkflowAliasPayload = JSON.parse(
+    blockedWorkflowAlias.content?.[0]?.text ?? "{}"
+  );
+  assert.equal(blockedWorkflowAliasPayload.status, "send_blocked");
+  assert.equal(blockedWorkflowAliasPayload.reason, "workflow_pending");
+
+  const blockedWorkflowStop = await client.callTool(
+    {
+      name: "stop_remote_control",
+      arguments: {
+        managedSession: managedName,
+        graceful: true,
+        force: false,
+      },
+    },
+    undefined,
+    { timeout: 30000 }
+  );
+  assert.equal(
+    blockedWorkflowStop.isError,
+    undefined,
+    blockedWorkflowStop.content?.[0]?.text
+  );
+  const blockedWorkflowStopPayload = JSON.parse(
+    blockedWorkflowStop.content?.[0]?.text ?? "{}"
+  );
+  assert.equal(blockedWorkflowStopPayload.status, "stop_blocked");
+  assert.equal(blockedWorkflowStopPayload.reason, "workflow_pending");
+
+  const workflowCleared = await client.callTool(
+    {
+      name: "send_text",
+      arguments: {
+        managedSession: managedName,
+        text: "/workflow-clear",
+        submit: true,
+        force: true,
+      },
+    },
+    undefined,
+    { timeout: 30000 }
+  );
+  assert.equal(workflowCleared.isError, undefined, workflowCleared.content?.[0]?.text);
+  const workflowClearedPayload = JSON.parse(
+    workflowCleared.content?.[0]?.text ?? "{}"
+  );
+  assert.equal(workflowClearedPayload.status, "sent");
+  assert.equal(workflowClearedPayload.forceUsed, true);
+  assert.equal(workflowClearedPayload.signals.workflowPending, false);
 
   const stopped = await client.callTool(
     { name: "stop_remote_control", arguments: { managedSession: managedName } },

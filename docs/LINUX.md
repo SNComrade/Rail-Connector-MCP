@@ -72,7 +72,7 @@ that login; those are separate OS profiles and separate Claude log folders.
 ## 3. Clone And Install
 
 ```bash
-git clone --branch v1.0.0-beta.1 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 ./install.sh
 ```
@@ -317,6 +317,12 @@ adopted.
 Metadata updates also compare the recorded `startedAtMs` generation and target
 the original pane ID. A delayed update cannot be written onto a same-name
 replacement session.
+
+New launches also store only sanitized UltraCode-relevant child environment
+categories. The tmux session receives explicit `CLAUDE_CONFIG_DIR`, effort,
+workflow-disable, and color values from the launching MCP, so an older tmux
+server environment cannot silently replace those launch inputs. Raw values are
+not returned in posture metadata.
 
 For a managed Rail session, capture it:
 

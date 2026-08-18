@@ -13,7 +13,7 @@ node --version
 npm --version
 ```
 
-Use Node 22, 24, or 26 for the first public beta.
+Use Node 22, 24, or 26 for the public beta series.
 
 Windows fallback compilation requires Python and Microsoft Visual Studio Build
 Tools with the Desktop development with C++ workload. Reopen PowerShell after

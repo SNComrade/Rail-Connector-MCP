@@ -7,14 +7,14 @@ To make a skill available from unrelated project repositories, ask Codex's
 native `$skill-installer` to install the immutable tagged GitHub directory:
 
 ```text
-$skill-installer Install rail-operator from https://github.com/SNComrade/Rail-Connector-MCP/tree/v1.0.0-beta.1/.agents/skills/rail-operator
+$skill-installer Install rail-operator from https://github.com/SNComrade/Rail-Connector-MCP/tree/v1.0.0-beta.2/.agents/skills/rail-operator
 ```
 
 Repeat for:
 
 ```text
-https://github.com/SNComrade/Rail-Connector-MCP/tree/v1.0.0-beta.1/.agents/skills/rail-debugger
-https://github.com/SNComrade/Rail-Connector-MCP/tree/v1.0.0-beta.1/.agents/skills/rail-reviewer
+https://github.com/SNComrade/Rail-Connector-MCP/tree/v1.0.0-beta.2/.agents/skills/rail-debugger
+https://github.com/SNComrade/Rail-Connector-MCP/tree/v1.0.0-beta.2/.agents/skills/rail-reviewer
 ```
 
 Open a fresh Codex task after installation so skill discovery is reloaded. MCP

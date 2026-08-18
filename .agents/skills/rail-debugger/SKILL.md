@@ -40,14 +40,24 @@ Do not reinstall before identifying the failed layer.
   Ultracode support from stale docs.
 - Request `status.includeAgentDetails` only when machine-wide Claude process
   inventory is necessary; managed-session status is the privacy-safe default.
-- Compare `posture.requested`, `posture.resolved`, `posture.observed`, and
-  evidence sources. Missing observation is unknown, not proof of failure.
+- Compare `posture.requested`, `posture.resolved`, `posture.observed`,
+  `posture.ultracodeAssessment`, and evidence sources. Missing observation is
+  unknown, not proof of failure.
 - For bypass failures, verify both policy `enabled: true` and
   `confirmBypassPermissions: true`. Local-host and isolated policies are both
   supported. Compare the policy fields and `status.mcpProcess` identity after
   registration changes. Never silently downgrade an explicit bypass request.
 - For Ultracode failures, verify the dedicated booleans, omitted ordinary
-  effort, chosen launch mechanism, and session-log/terminal evidence.
+  effort, calibrated probe exit status, MCP-process environment blockers,
+  chosen launch mechanism, runtime effort, and sanitized workflow activity.
+  Timeout or terminated probes are inconclusive. Compare the persisted child
+  `launchEnvironment` with `currentMcpEnvironment` after refresh; do not use the
+  new process to rewrite an existing session's launch evidence. `xhigh`
+  alone is correlated evidence, not confirmed Ultracode. Treat bound `high` or
+  `max` as conflicting effort evidence; leave unknown labels unmapped.
+- Before comparing Claude Desktop or CLI visuals, bind the view to the same
+  managed name, conversation UUID, generation, and time window. An unbound
+  screenshot cannot prove or disprove the MCP session's posture.
 - Prefer the transcript returned by `wait_for_claude_turn` over animated
   terminal capture.
 - Distinguish `needs_attention` from a completed result with additive

@@ -35,18 +35,20 @@
 `remoteName` labels Remote Control. `sessionTitle` names only a new Claude
 conversation. The returned `resolvedSessionId` is the durable identity.
 
-## Bypass Plus Ultracode
+## Fable 5 Plus Bypass Plus Ultracode
 
-Use when the user explicitly requests both:
+Use this launch recipe only when the user explicitly requests bypass and
+Ultracode with Fable 5:
 
 ```json
 {
   "cwd": "C:\\work\\project",
-  "managedSession": "claude-feature-a-ultracode",
-  "remoteName": "Codex Ultra",
-  "sessionTitle": "Feature A implementation",
+  "managedSession": "claude-feature-a-fable5-ultracode",
+  "remoteName": "Codex Fable 5 Ultra",
+  "sessionTitle": "Feature A Fable 5 implementation",
   "permissionMode": "bypassPermissions",
   "confirmBypassPermissions": true,
+  "model": "claude-fable-5",
   "ultracode": true,
   "confirmUltracode": true,
   "killExisting": false,
@@ -54,11 +56,64 @@ Use when the user explicitly requests both:
 }
 ```
 
-First verify `get_claude_capabilities` reports:
+## Opus 5 Plus Bypass Plus Ultracode
+
+Use this launch recipe only when the user explicitly requests bypass and
+Ultracode with Opus 5:
+
+```json
+{
+  "cwd": "C:\\work\\project",
+  "managedSession": "claude-feature-a-opus5-ultracode",
+  "remoteName": "Codex Opus 5 Ultra",
+  "sessionTitle": "Feature A Opus 5 implementation",
+  "permissionMode": "bypassPermissions",
+  "confirmBypassPermissions": true,
+  "model": "claude-opus-5",
+  "ultracode": true,
+  "confirmUltracode": true,
+  "killExisting": false,
+  "trustWorkspace": false
+}
+```
+
+For either recipe, first verify `get_claude_capabilities` reports:
 
 - bypass policy `enabled: true`
 - the installed permission mode
-- `ultracode.launchMechanism`
+- `ultracode.launchMechanism: "effort_flag"`
+- `ultracode.argumentProbe.accepted: true`, or documented support provenance
+- `ultracode.environment.status: "compatible"`
+
+The calibrated parser probe treats child exit status as authoritative. A zero
+exit for `--effort=ultracode` plus a nonzero invalid control is accepted even if
+Claude changes its error wording; timeout or signal termination is
+inconclusive. Claude Code v2.1.203 is the documented floor for direct
+`--effort=ultracode` startup.
+
+After launch, inspect `posture.ultracodeAssessment`. `requested_unconfirmed`
+means the request was accepted but runtime evidence has not arrived.
+`xhigh_correlated_unconfirmed` is consistent with UltraCode but is not proof of
+workflow orchestration. `workflow_activity_observed` reports sanitized Claude
+workflow activity while leaving its trigger attribution `unknown`. A bound
+effort other than `xhigh` or `ultracode`, such as `high` or `max`, produces
+`conflicting_effort_evidence`. Remote Control web can show `Extra` for the
+underlying xhigh setting while UltraCode is active. A session-bound web
+`Extra` is compatible presentation, not confirmation, conflict, or workflow
+evidence; context-free terminal text remains unmapped. On an idle, empty
+composer, `/effort ultracode` can provide explicit current-setting evidence,
+but it may change posture and cannot prove launch provenance. Use a substantive
+turn when testing workflow activity.
+
+Also inspect `launchEnvironment`, `currentMcpEnvironment`, and
+`environmentComparison`. The launch field is the sanitized child snapshot.
+After a Codex refresh, a different current MCP environment does not rewrite the
+already-running session's launch provenance. Treat `launch_not_recorded` as an
+older-session unknown rather than substituting the current process value.
+
+`trustWorkspace: false` keeps trust as a separate, visible decision. If the
+current capture returns `workspace_trust_required`, inspect it and respond only
+with the user's authorization.
 
 If policy is disabled, configure it in the same OS context as Codex:
 
@@ -162,7 +217,9 @@ time, conversation UUID, and managed generation without prompt or answer text;
 they reject stale cross-session use. `submitted` means acknowledgement was
 observed. `completed` means a new terminal JSONL assistant record such as
 `end_turn` was observed; `tool_use` is still in progress, and transcript
-completion supersedes stale terminal prose.
+completion supersedes stale terminal prose. It does not supersede
+`workflowPending: true`; a pending dynamic workflow keeps the result in
+`wait` until its lifecycle clears or the bounded timeout expires.
 For a large prompt, a pasted-text placeholder can become visible after the
 first capture. `submit_prompt` polls a bounded visibility window before deciding
 whether to send its Enter retry. If `paste_pending` still returns, inspect the
@@ -176,7 +233,16 @@ surface or resolve that warning independently.
 Use `send_text` or `send_key` only for an inspected interactive state.
 When either tool submits the composer, pass its non-empty `waitAfterCursor`
 verbatim to `wait_for_claude_turn`. Check `submitted`; an Enter key used on a
-menu intentionally does not create a remembered turn anchor.
+menu intentionally does not create a remembered turn anchor. Text and
+Enter/Return are blocked with reason `workflow_pending` while a dynamic
+workflow remains active. `C-m`, `C-j`, `KPEnter`, and `NumpadEnter` are also
+Enter-equivalent and use the same gate. Escape and cancellation keys remain
+available. Native Windows returns `EINVAL` for an unsupported key name rather
+than injecting its literal name into the composer. If an interruption leaves
+stale pending evidence, inspect the
+session before using the explicit `force: true` recovery on text, key, or
+rename; report the returned `forceUsed` field. A forced `submit_prompt` also
+returns `forcedPastReason`; preserve that reason in the operator report.
 
 ## Reconnect After Windows Refresh
 
@@ -239,7 +305,12 @@ Stop:
 }
 ```
 
-If stop is blocked, wait or inspect. `force: true` can discard in-flight work.
+If stop is blocked, wait or inspect. If the reason is `awaiting_input`, preserve
+the unsent draft: submit only with authorization, explicitly discard and
+recapture only with authorization, or leave the session running. Never use
+routine force cleanup to discard it. If the reason is `workflow_pending`, wait
+for `workflowPending` to clear. `force: true` can discard in-flight work; report
+`workflowInterrupted` or `replacementForceUsed` when returned.
 For an active token-derived session owned by an incompatible broker build,
 `force: true` uses the restricted generation-bound compatibility cleanup path
 and never reads terminal capture. Ordinary cross-version mutations stay

@@ -7,6 +7,7 @@ import {
   inspectSessionFile,
   listClaudeSessionSummaries,
   parsePortableWaitCursor,
+  projectDirFromCwd,
   sessionArchiveInfo,
   setSessionArchiveState,
   recentSessionRecords,
@@ -64,6 +65,10 @@ try {
   );
   const canonicalTargetA =
     fs.realpathSync.native?.(junctionPath) ?? fs.realpathSync(junctionPath);
+  assert.equal(
+    projectDirFromCwd(junctionPath),
+    projectDirFromCwd(canonicalTargetA)
+  );
   assert.equal(
     resolveAllowedManagedCwd(junctionPath, canonicalTargetA),
     junctionPath
@@ -260,6 +265,47 @@ const newTurnTranscript = {
   lastAssistant: { cursor: "assistant-1" },
   turnComplete: true,
 };
+const pendingWorkflowDecision = waitTurnDecision({
+  afterCursor: "assistant-0",
+  baselineTranscript: settledBaseline,
+  transcript: newTurnTranscript,
+  signals: {
+    state: "busy",
+    workflowPending: true,
+    workflowPendingCount: 1,
+  },
+  requireNewTurn: true,
+});
+assert.equal(pendingWorkflowDecision.status, "wait");
+assert.equal(pendingWorkflowDecision.evidence, "workflow_pending");
+assert.equal(
+  waitTurnDecision({
+    afterCursor: "assistant-0",
+    baselineTranscript: settledBaseline,
+    transcript: newTurnTranscript,
+    signals: {
+      state: "idle",
+      workflowPending: false,
+      workflowPendingCount: 0,
+    },
+    requireNewTurn: true,
+  }).status,
+  "completed"
+);
+assert.equal(
+  waitTurnDecision({
+    afterCursor: "assistant-0",
+    baselineTranscript: settledBaseline,
+    transcript: newTurnTranscript,
+    signals: {
+      state: "limit_warning",
+      workflowPending: true,
+      workflowPendingCount: 1,
+    },
+    requireNewTurn: true,
+  }).status,
+  "needs_attention"
+);
 assert.equal(
   waitTurnDecision({
     afterCursor: "assistant-0",

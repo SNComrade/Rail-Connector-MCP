@@ -7,6 +7,7 @@ import {
   bypassPolicyStatus,
   assertSafeManagedSessionName,
   assertSafeSessionId,
+  claudeChildLaunchEnvironmentStatus,
   claudeArgs,
   compareLaunchMetadata,
   managedSessionName,
@@ -15,7 +16,9 @@ import {
   resolveCommandFromPath,
   resolveAllowedCwd,
   textChunks,
+  tmuxChildEnvironmentArgs,
   upgradeLaunchMetadataToV3,
+  upgradeLaunchMetadataToV4,
   validateLaunchMetadata,
   windowsPtyLaunchDescriptor,
 } from "../src/index.js";
@@ -120,6 +123,50 @@ assert.deepEqual(directUltracodeArgs, [
   "--remote-control=Ultracode",
   "--permission-mode=default",
 ]);
+const experimentalSettingsUltracodeArgs = claudeArgs({
+  remoteName: "Ultracode Settings",
+  permissionMode: "default",
+  ultracode: true,
+  ultracodeMechanism: "settings",
+  confirmUltracode: true,
+});
+assert.deepEqual(experimentalSettingsUltracodeArgs, [
+  '--settings={"ultracode":true}',
+  "--remote-control=Ultracode Settings",
+  "--permission-mode=default",
+]);
+assert.equal(
+  requestedLaunchPostureFromArgs(experimentalSettingsUltracodeArgs)
+    .ultracodeMechanism,
+  "settings"
+);
+
+assert.deepEqual(
+  tmuxChildEnvironmentArgs({
+    CLAUDE_CONFIG_DIR: "/tmp/claude config",
+    CLAUDE_CODE_EFFORT_LEVEL: "xhigh",
+    CLAUDE_CODE_DISABLE_WORKFLOWS: "0",
+  }),
+  [
+    "-e",
+    "CLAUDE_CONFIG_DIR=/tmp/claude config",
+    "-e",
+    "CLAUDE_CODE_EFFORT_LEVEL=xhigh",
+    "-e",
+    "CLAUDE_CODE_DISABLE_WORKFLOWS=0",
+    "-e",
+    "FORCE_COLOR=1",
+  ]
+);
+const privateLaunchOverride = "private-launch-value-must-not-escape";
+const redactedLaunchEnvironment = claudeChildLaunchEnvironmentStatus({
+  CLAUDE_CODE_EFFORT_LEVEL: privateLaunchOverride,
+});
+assert.equal(redactedLaunchEnvironment.status, "blocking");
+assert.doesNotMatch(
+  JSON.stringify(redactedLaunchEnvironment),
+  new RegExp(privateLaunchOverride)
+);
 assert.throws(
   () => claudeArgs({ remoteName: "Bad", permissionMode: "default", effort: "ultracode" }),
   /Unsupported Claude effort/
@@ -448,6 +495,20 @@ try {
   assert.equal(upgradedMetadata.requestedPosture.bypassPermissionsPolicyMode, null);
   assert.equal(upgradedMetadata.resolvedPosture.bypassPermissionsPolicyMode, null);
   assert.deepEqual(validateLaunchMetadata(upgradedMetadata), upgradedMetadata);
+  const launchEnvironment = claudeChildLaunchEnvironmentStatus({
+    CLAUDE_CODE_EFFORT_LEVEL: "xhigh",
+    CLAUDE_CODE_DISABLE_WORKFLOWS: "0",
+  });
+  const currentMetadata = upgradeLaunchMetadataToV4(upgradedMetadata, {
+    launchEnvironment,
+  });
+  assert.equal(currentMetadata.schemaVersion, 4);
+  assert.deepEqual(currentMetadata.launchEnvironment, launchEnvironment);
+  assert.deepEqual(validateLaunchMetadata(currentMetadata), currentMetadata);
+  assert.throws(
+    () => upgradeLaunchMetadataToV4(upgradedMetadata),
+    /environment provenance is unavailable/
+  );
   assert.equal(validateLaunchMetadata({ ...validMetadata, schemaVersion: 1 }), null);
   assert.equal(validateLaunchMetadata({ ...validMetadata, cwd: 1 }), null);
   assert.equal(validateLaunchMetadata({ ...validMetadata, paneId: "0.0" }), null);

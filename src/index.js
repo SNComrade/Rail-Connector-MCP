@@ -7,6 +7,7 @@ import path from "node:path";
 import os from "node:os";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import {
@@ -26,7 +27,7 @@ const CLAUDE_CONFIG_DIR = path.resolve(
 const DEFAULT_CWD = HOME;
 const DEFAULT_MANAGED_SESSION = "rail-connector-managed";
 const DEFAULT_REMOTE_NAME = "Rail-Connector";
-export const SERVER_VERSION = "1.0.0-beta.1";
+export const SERVER_VERSION = "1.0.0-beta.2";
 const IS_NATIVE_WINDOWS = process.platform === "win32";
 const REMOTE_URL_RE = /https:\/\/claude\.ai\/code\/[A-Za-z0-9_:-]+/;
 const DEFAULT_TEXT_CHUNK_SIZE = 2048;
@@ -43,6 +44,9 @@ const CLAUDE_PERMISSION_MODES = ["default", "manual", "acceptEdits", "auto", "by
 const VERSION_SENSITIVE_PERMISSION_MODES = ["manual"];
 const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 const ULTRACODE_SETTINGS_JSON = JSON.stringify({ ultracode: true });
+const ULTRACODE_DIRECT_VERSION_FLOOR = [2, 1, 203];
+const ULTRACODE_DOCUMENTATION_URL =
+  "https://code.claude.com/docs/en/settings#available-settings";
 const TMUX_LAUNCH_METADATA_OPTION = "@rail_connector_launch";
 const ALLOWED_ROOTS_ENV = "RAIL_CONNECTOR_ALLOWED_ROOTS";
 const CLAUDE_COMMAND_ENV = "RAIL_CONNECTOR_CLAUDE_PATH";
@@ -70,9 +74,26 @@ const WAIT_STRONG_ATTENTION_STATES = new Set([
   "interrupted",
   "workspace_trust_required",
 ]);
+const SUBMIT_KEY_NAMES = new Set([
+  "Enter",
+  "Return",
+  "C-m",
+  "Ctrl-M",
+  "C-j",
+  "Ctrl-J",
+  "KPEnter",
+  "NumpadEnter",
+]);
 const MAX_TRANSCRIPT_ASSISTANT_CHARS = 128 * 1024;
 const BROKER_LEASE_TTL_MS = 120000;
 const BROKER_LEASE_RENEW_INTERVAL_MS = 30000;
+const CLAUDE_CAPABILITY_CACHE_TTL_MS = 60 * 1000;
+const MAX_CLAUDE_CAPABILITY_CACHE_ENTRIES = 8;
+const CLAUDE_CHILD_ENVIRONMENT_KEYS = [
+  "CLAUDE_CONFIG_DIR",
+  "CLAUDE_CODE_EFFORT_LEVEL",
+  "CLAUDE_CODE_DISABLE_WORKFLOWS",
+];
 const BROKER_UNAVAILABLE_CODES = new Set([
   "ENOENT",
   "ECONNREFUSED",
@@ -88,6 +109,7 @@ function brokerUnavailable(error) {
 }
 const sessionOperationLocks = new Map();
 const brokerMutationLeases = new Map();
+const claudeCapabilityCache = new Map();
 
 function text(data) {
   const value = typeof data === "string" ? data : JSON.stringify(data, null, 2);
@@ -266,9 +288,11 @@ export function resolveAllowedCleanupCwd(cwd, canonicalCwd = null) {
   return resolved;
 }
 
-function projectDirFromCwd(cwd = DEFAULT_CWD) {
+export function projectDirFromCwd(cwd = DEFAULT_CWD) {
   const resolved = resolveAllowedCwd(cwd);
-  const encoded = resolved.replace(/[^A-Za-z0-9]/g, "-");
+  const canonical =
+    fs.realpathSync.native?.(resolved) ?? fs.realpathSync(resolved);
+  const encoded = canonical.replace(/[^A-Za-z0-9]/g, "-");
   return path.join(CLAUDE_CONFIG_DIR, "projects", encoded);
 }
 
@@ -299,9 +323,46 @@ function createSessionSummaryState() {
     permissionMode: "",
     model: "",
     effort: "",
+    workflowLaunchObserved: false,
+    workflowLaunchStatus: "",
+    workflowLaunchUpdatedAt: "",
+    pendingWorkflowCount: null,
+    pendingWorkflowUpdatedAt: "",
+    activeWorkflowTaskIds: new Set(),
+    unidentifiedPendingWorkflowCount: 0,
     searchTextParts: [],
   };
 }
+
+const WORKFLOW_LAUNCH_STATUSES = new Set([
+  "async_launched",
+  "launched",
+  "running",
+  "completed",
+  "succeeded",
+]);
+const WORKFLOW_PENDING_LAUNCH_STATUSES = new Set([
+  "async_launched",
+  "launched",
+  "running",
+]);
+const WORKFLOW_TERMINAL_RETRIEVAL_STATUSES = new Set([
+  "success",
+  "failed",
+  "error",
+  "cancelled",
+  "canceled",
+  "interrupted",
+]);
+const WORKFLOW_TERMINAL_TASK_STATUSES = new Set([
+  "completed",
+  "succeeded",
+  "failed",
+  "error",
+  "cancelled",
+  "canceled",
+  "interrupted",
+]);
 
 async function withManagedMutationLock(
   sessionName,
@@ -467,7 +528,12 @@ function conversationMessageFromRecord(record) {
   return body ? { role, body } : null;
 }
 
-function addSessionRecord(state, record, expectedSessionId = "") {
+function addSessionRecord(
+  state,
+  record,
+  expectedSessionId = "",
+  includeConversationText = true
+) {
   if (!recordMatchesSession(record, expectedSessionId)) return;
   if (record.isSidechain === true) return;
   if (record.timestamp) state.lastTimestamp = record.timestamp;
@@ -497,6 +563,76 @@ function addSessionRecord(state, record, expectedSessionId = "") {
     if (record.message?.model) state.model = String(record.message.model);
     if (record.effort) state.effort = String(record.effort);
   }
+  const workflowResult = record.toolUseResult;
+  if (
+    workflowResult?.taskType === "local_workflow" &&
+    typeof workflowResult.workflowName === "string" &&
+    workflowResult.workflowName.trim() &&
+    WORKFLOW_LAUNCH_STATUSES.has(workflowResult.status)
+  ) {
+    state.workflowLaunchObserved = true;
+    state.workflowLaunchStatus = workflowResult.status;
+    state.workflowLaunchUpdatedAt = record.timestamp ?? "";
+    if (WORKFLOW_PENDING_LAUNCH_STATUSES.has(workflowResult.status)) {
+      const workflowTaskId =
+        typeof workflowResult.taskId === "string" && workflowResult.taskId
+          ? workflowResult.taskId
+          : "";
+      if (workflowTaskId) state.activeWorkflowTaskIds.add(workflowTaskId);
+      else state.unidentifiedPendingWorkflowCount += 1;
+      state.pendingWorkflowCount = Math.max(
+        state.pendingWorkflowCount ?? 0,
+        state.activeWorkflowTaskIds.size +
+          state.unidentifiedPendingWorkflowCount
+      );
+      state.pendingWorkflowUpdatedAt = record.timestamp ?? "";
+    }
+  }
+  const pendingWorkflowCount =
+    record.pendingWorkflowCount ?? workflowResult?.pendingWorkflowCount;
+  if (Number.isInteger(pendingWorkflowCount) && pendingWorkflowCount >= 0) {
+    state.pendingWorkflowCount = pendingWorkflowCount;
+    state.pendingWorkflowUpdatedAt = record.timestamp ?? "";
+    if (pendingWorkflowCount === 0) {
+      state.activeWorkflowTaskIds.clear();
+      state.unidentifiedPendingWorkflowCount = 0;
+    }
+  }
+  const retrievedWorkflowTaskId =
+    typeof workflowResult?.task?.task_id === "string"
+      ? workflowResult.task.task_id
+      : "";
+  const retrievedWorkflowTaskStatus =
+    typeof workflowResult?.task?.status === "string"
+      ? workflowResult.task.status
+      : "";
+  if (
+    retrievedWorkflowTaskId &&
+    state.activeWorkflowTaskIds.has(retrievedWorkflowTaskId) &&
+    WORKFLOW_TERMINAL_RETRIEVAL_STATUSES.has(workflowResult.retrieval_status) &&
+    (!retrievedWorkflowTaskStatus ||
+      WORKFLOW_TERMINAL_TASK_STATUSES.has(retrievedWorkflowTaskStatus))
+  ) {
+    state.activeWorkflowTaskIds.delete(retrievedWorkflowTaskId);
+    state.pendingWorkflowCount = Math.max(
+      state.activeWorkflowTaskIds.size +
+        state.unidentifiedPendingWorkflowCount,
+      Math.max(0, (state.pendingWorkflowCount ?? 1) - 1)
+    );
+    state.pendingWorkflowUpdatedAt = record.timestamp ?? "";
+  }
+  if (
+    record.interruptedMessageId &&
+    (state.pendingWorkflowCount > 0 ||
+      state.activeWorkflowTaskIds.size > 0 ||
+      state.unidentifiedPendingWorkflowCount > 0)
+  ) {
+    state.activeWorkflowTaskIds.clear();
+    state.unidentifiedPendingWorkflowCount = 0;
+    state.pendingWorkflowCount = 0;
+    state.pendingWorkflowUpdatedAt = record.timestamp ?? "";
+  }
+  if (!includeConversationText) return;
   const conversationMessage = conversationMessageFromRecord(record);
   if (!conversationMessage) return;
   const { role, body } = conversationMessage;
@@ -1326,6 +1462,57 @@ export function bypassPolicyStatus(env = process.env) {
   };
 }
 
+export function ultracodeEnvironmentStatus(
+  env = process.env,
+  evidenceScope = "mcp_process_environment"
+) {
+  const effortOverride =
+    typeof env.CLAUDE_CODE_EFFORT_LEVEL === "string"
+      ? env.CLAUDE_CODE_EFFORT_LEVEL.trim().toLowerCase()
+      : "";
+  const workflowsDisabled = env.CLAUDE_CODE_DISABLE_WORKFLOWS === "1";
+  const blockers = [];
+  if (effortOverride && effortOverride !== "xhigh") {
+    blockers.push("non_xhigh_effort_override");
+  }
+  if (workflowsDisabled) blockers.push("workflows_disabled");
+  const status = blockers.length ? "blocking" : "compatible";
+  const launchSnapshot = evidenceScope === "claude_child_launch_environment";
+  return {
+    status,
+    evidenceScope,
+    effortOverrideStatus: !effortOverride
+      ? "unset"
+      : effortOverride === "xhigh"
+        ? "compatible_xhigh"
+        : "blocking_non_xhigh",
+    workflowsDisabled,
+    blockers,
+    note:
+      status === "blocking"
+        ? launchSnapshot
+          ? "The captured Claude child launch environment contains an override that prevents the requested UltraCode workflow posture."
+          : "The MCP process environment contains an override that prevents the requested UltraCode workflow posture."
+        : launchSnapshot
+          ? "No blocking UltraCode override was present in the captured Claude child launch environment. Claude settings can still differ."
+          : "No blocking UltraCode override was found in the MCP process environment. Claude settings or child-process configuration can still differ.",
+  };
+}
+
+export function claudeChildLaunchEnvironmentStatus(env = process.env) {
+  return ultracodeEnvironmentStatus(
+    env,
+    "claude_child_launch_environment"
+  );
+}
+
+export function tmuxChildEnvironmentArgs(env = process.env) {
+  return CLAUDE_CHILD_ENVIRONMENT_KEYS.flatMap((name) => [
+    "-e",
+    `${name}=${typeof env[name] === "string" ? env[name] : ""}`,
+  ]).concat(["-e", "FORCE_COLOR=1"]);
+}
+
 export function assertBypassPolicy(permissionMode, env = process.env) {
   const policy = bypassPolicyStatus(env);
   if (permissionMode !== "bypassPermissions") return policy;
@@ -1495,15 +1682,23 @@ async function tmuxCapture(sessionName, lines = 120) {
   return result.stdout;
 }
 
-function createLaunchMetadata({ cwd, args, startedAtMs, launchOptions, resolvedSessionId = null }) {
+function createLaunchMetadata({
+  cwd,
+  args,
+  startedAtMs,
+  launchOptions,
+  launchEnvironment,
+  resolvedSessionId = null,
+}) {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     cwd,
     startedAt: new Date(startedAtMs).toISOString(),
     startedAtMs,
     args,
     requestedPosture: requestedLaunchPosture(launchOptions),
     resolvedPosture: resolvedLaunchPosture(launchOptions),
+    launchEnvironment,
     resolvedSessionId,
     observedPosture: null,
   };
@@ -1560,8 +1755,36 @@ const launchMetadataSchemaV3 = z
   })
   .strict();
 
+const launchEnvironmentSchema = z
+  .object({
+    status: z.enum(["compatible", "blocking"]),
+    evidenceScope: z.literal("claude_child_launch_environment"),
+    effortOverrideStatus: z.enum([
+      "unset",
+      "compatible_xhigh",
+      "blocking_non_xhigh",
+    ]),
+    workflowsDisabled: z.boolean(),
+    blockers: z
+      .array(z.enum(["non_xhigh_effort_override", "workflows_disabled"]))
+      .max(2),
+    note: z.string().max(512),
+  })
+  .strict();
+
+const launchMetadataSchemaV4 = launchMetadataSchemaV3.extend({
+  schemaVersion: z.literal(4),
+  launchEnvironment: launchEnvironmentSchema,
+});
+
 export function validateLaunchMetadata(value) {
-  const parsed = z.union([launchMetadataSchemaV2, launchMetadataSchemaV3]).safeParse(value);
+  const parsed = z
+    .union([
+      launchMetadataSchemaV2,
+      launchMetadataSchemaV3,
+      launchMetadataSchemaV4,
+    ])
+    .safeParse(value);
   if (!parsed.success) return null;
   try {
     const cwd = resolveAllowedCwd(parsed.data.cwd);
@@ -1603,6 +1826,29 @@ export function upgradeLaunchMetadataToV3(metadata, updates = {}) {
     observedPosture:
       updates.observedPosture ?? metadata.observedPosture ?? null,
   };
+}
+
+export function upgradeLaunchMetadataToV4(metadata, updates = {}) {
+  const upgraded = upgradeLaunchMetadataToV3(metadata, updates);
+  const launchEnvironment =
+    updates.launchEnvironment ?? metadata.launchEnvironment ?? null;
+  if (!launchEnvironment) {
+    throw new Error(
+      "Launch-time Claude child environment provenance is unavailable."
+    );
+  }
+  return {
+    ...upgraded,
+    schemaVersion: 4,
+    launchEnvironment,
+  };
+}
+
+function updatedLaunchMetadata(metadata, updates = {}) {
+  if (metadata.schemaVersion === 4 || updates.launchEnvironment) {
+    return upgradeLaunchMetadataToV4(metadata, updates);
+  }
+  return upgradeLaunchMetadataToV3(metadata, updates);
 }
 
 async function readTmuxLaunchMetadata(sessionName) {
@@ -1858,7 +2104,7 @@ async function backendLaunchMetadata(sessionName) {
     const session = await managedWindowsBrokerSession(sessionName);
     if (!session) return null;
     return {
-      schemaVersion: 3,
+      schemaVersion: session.launchEnvironment ? 4 : 3,
       cwd: session.cwd,
       startedAt: session.startedAt,
       startedAtMs: session.startedAtMs ?? Date.parse(session.startedAt),
@@ -1867,6 +2113,9 @@ async function backendLaunchMetadata(sessionName) {
       args: session.args,
       requestedPosture: session.requestedPosture ?? requestedLaunchPostureFromArgs(session.args),
       resolvedPosture: session.resolvedPosture ?? requestedLaunchPostureFromArgs(session.args),
+      ...(session.launchEnvironment
+        ? { launchEnvironment: session.launchEnvironment }
+        : {}),
       resolvedSessionId: session.resolvedSessionId ?? null,
       observedPosture: session.observedPosture ?? null,
       exited: Boolean(session.exited),
@@ -1874,6 +2123,12 @@ async function backendLaunchMetadata(sessionName) {
     };
   }
   return managedTmuxMetadata(sessionName);
+}
+
+export function publicLaunchMetadata(metadata) {
+  if (!metadata || typeof metadata !== "object") return metadata;
+  const { observedPosture: _legacyObservedPosture, ...publicMetadata } = metadata;
+  return publicMetadata;
 }
 
 async function backendUpdateMetadata(
@@ -1914,7 +2169,7 @@ async function backendUpdateMetadata(
     error.code = "ESTALE";
     throw error;
   }
-  const updated = upgradeLaunchMetadataToV3(metadata, updates);
+  const updated = updatedLaunchMetadata(metadata, updates);
   const error = await writeTmuxLaunchMetadata(metadata.paneId, updated);
   if (error) throw new Error(error);
   return { status: "updated", metadata: updated };
@@ -1978,8 +2233,7 @@ export function trustedSessionLogPosture(observed = {}) {
   for (const field of ["permissionMode", "model", "effort", "ultracode"]) {
     const evidence = observed?.evidence?.[field];
     if (
-      typeof evidence === "string" &&
-      evidence.startsWith("claude_session_log") &&
+      evidence === "claude_session_log" &&
       observed?.[field] !== null &&
       observed?.[field] !== undefined
     ) {
@@ -1990,32 +2244,34 @@ export function trustedSessionLogPosture(observed = {}) {
   return trusted;
 }
 
-async function managedPostureReport(sessionName, signals, metadata = null) {
+async function managedPostureReport(
+  sessionName,
+  signals,
+  metadata = null,
+  transcriptObserved = null
+) {
   const currentMetadata = metadata ?? (await backendLaunchMetadata(sessionName));
-  const transcriptObserved = await sessionRuntimeObservation(currentMetadata);
-  const priorObserved = mergeObservedPosture(
-    trustedSessionLogPosture(currentMetadata?.observedPosture),
-    transcriptObserved
-  );
-  const report = launchPostureReport(
-    currentMetadata?.requestedPosture ?? null,
-    currentMetadata?.resolvedPosture ?? currentMetadata?.requestedPosture ?? null,
-    signals,
-    priorObserved
-  );
-  if (currentMetadata) {
+  if (!IS_NATIVE_WINDOWS && currentMetadata?.schemaVersion === 2) {
     try {
       await backendUpdateMetadata(
         sessionName,
-        { observedPosture: priorObserved },
+        {},
         currentMetadata.startedAtMs,
         currentMetadata.generationId
       );
     } catch {
-      // Posture reporting still succeeds when persistence is temporarily unavailable.
+      // Reporting remains available if a legacy tmux metadata upgrade races.
     }
   }
-  return report;
+  const currentTranscriptObserved =
+    transcriptObserved ?? (await sessionRuntimeObservation(currentMetadata));
+  return launchPostureReport(
+    currentMetadata?.requestedPosture ?? null,
+    currentMetadata?.resolvedPosture ?? currentMetadata?.requestedPosture ?? null,
+    signals,
+    currentTranscriptObserved,
+    { launchEnvironment: currentMetadata?.launchEnvironment ?? null }
+  );
 }
 
 async function assertManagedMutationPolicy(sessionName) {
@@ -2068,6 +2324,8 @@ const COMPLETE_CAPTURE_MATCH_RE =
   /(?:^|\n)[ \t\u2502\u2503\u2551]*(?:[✢✻✽●○]\s*)?[A-Z][\p{L}\p{M}-]+ for (?:\d+h[ \t]*)?(?:\d+m[ \t]*)?\d+s(?=$|[ \t]*(?:[>/?]|plan mode|○|\/rc))/gmu;
 const COMPLETE_INLINE_CAPTURE_MATCH_RE =
   /[✢✻✽●○]\s*[A-Z][\p{L}\p{M}-]+ for (?:\d+h[ \t]*)?(?:\d+m[ \t]*)?\d+s(?=$|[ \t]*(?:[>/?]|plan mode|○|\/rc|←))/gmu;
+const DYNAMIC_WORKFLOW_WAIT_MATCH_RE =
+  /(?:^|\n)[ \t\u2502\u2503\u2551]*(?:[✢✳✶✻✽✦][ \t]*)?Waiting for(?:[ \t]+[1-9]\d*[ \t]+background agents?[ \t]+and)?[ \t]+([1-9]\d*)[ \t]+dynamic workflows?[ \t]+to finish[ \t]*(?=$|\r?\n)/gmu;
 const SESSION_LIMIT_RE =
   /(?:^|\n)(?![^\n]*\bno\s+(?:real\s+)?(?:session|usage)\s+limit)[^\n]*(?:(?:session|usage)\s+limit\s+(?:warning|reached|reset|resets?|soon|remaining)|limit\s+(?:warning|reached|reset|resets?))/i;
 const APPROVAL_QUESTION_RE =
@@ -2172,6 +2430,7 @@ function activeTuiControlRegion(capture, lines = 80) {
     lastMatchEnd(recent, BUSY_CAPTURE_MATCH_RE),
     lastMatchEnd(recent, BUSY_STATUS_LINE_MATCH_RE),
     lastMatchEnd(recent, BUSY_TIMED_STATUS_LINE_MATCH_RE),
+    lastMatchEnd(recent, DYNAMIC_WORKFLOW_WAIT_MATCH_RE),
     lastMatchEnd(recent, COMPLETE_CAPTURE_MATCH_RE),
     lastMatchEnd(recent, COMPLETE_INLINE_CAPTURE_MATCH_RE)
   );
@@ -2183,7 +2442,8 @@ function likelyBusyFromCapture(capture) {
   const busyIndex = Math.max(
     lastMatchIndex(signalCapture, BUSY_CAPTURE_MATCH_RE),
     lastMatchIndex(signalCapture, BUSY_STATUS_LINE_MATCH_RE),
-    lastMatchIndex(signalCapture, BUSY_TIMED_STATUS_LINE_MATCH_RE)
+    lastMatchIndex(signalCapture, BUSY_TIMED_STATUS_LINE_MATCH_RE),
+    lastMatchIndex(signalCapture, DYNAMIC_WORKFLOW_WAIT_MATCH_RE)
   );
   if (busyIndex === -1) return false;
 
@@ -2192,6 +2452,32 @@ function likelyBusyFromCapture(capture) {
     lastMatchIndex(signalCapture, COMPLETE_INLINE_CAPTURE_MATCH_RE)
   );
   return completeIndex === -1 || completeIndex < busyIndex;
+}
+
+function terminalWorkflowActivityFromCapture(capture) {
+  const signalCapture = captureWithoutPromptText(capture);
+  let waitIndex = -1;
+  let pendingCount = null;
+  for (const match of signalCapture.matchAll(DYNAMIC_WORKFLOW_WAIT_MATCH_RE)) {
+    if (typeof match.index === "number" && match.index >= waitIndex) {
+      waitIndex = match.index;
+      pendingCount = Number(match[1]);
+    }
+  }
+  const completeIndex = Math.max(
+    lastMatchIndex(signalCapture, COMPLETE_CAPTURE_MATCH_RE),
+    lastMatchIndex(signalCapture, COMPLETE_INLINE_CAPTURE_MATCH_RE)
+  );
+  const pending =
+    waitIndex >= 0 &&
+    Number.isInteger(pendingCount) &&
+    pendingCount > 0 &&
+    (completeIndex < 0 || completeIndex < waitIndex);
+  return {
+    pending,
+    pendingCount: pending ? pendingCount : null,
+    evidence: pending ? "terminal_heuristic" : "",
+  };
 }
 
 function sessionLimitWarningFromCapture(capture) {
@@ -2265,6 +2551,7 @@ function effortEventFromCapture(capture) {
 export function captureSignals(capture) {
   const recentCapture = lastLines(capture, 80);
   const likelyBusy = likelyBusyFromCapture(recentCapture);
+  const terminalWorkflowActivity = terminalWorkflowActivityFromCapture(recentCapture);
   const sessionLimitWarning = sessionLimitWarningFromCapture(capture);
   const approvalRequired = approvalRequiredFromCapture(capture);
   const pastePlaceholder = pastePlaceholderFromCapture(capture);
@@ -2301,15 +2588,166 @@ export function captureSignals(capture) {
     permissionModeIndicator,
     permissionModeEvidence: permissionModeIndicator ? "terminal_heuristic" : "",
     activeInputHasText,
+    workflowPending: terminalWorkflowActivity.pending,
+    workflowPendingCount: terminalWorkflowActivity.pendingCount,
+    workflowPendingEvidence: terminalWorkflowActivity.evidence,
+    workflowPendingObservedAt: "",
     state,
   };
 }
 
-export function launchPostureReport(requested, resolved = requested, signals = {}, priorObserved = {}) {
+export function signalsWithWorkflowActivity(signals = {}, workflowActivity = {}) {
+  const baseState = signals.state || "idle";
+  const logPendingCount = Number.isInteger(workflowActivity.pendingCount)
+    ? workflowActivity.pendingCount
+    : null;
+  const logPending = logPendingCount !== null && logPendingCount > 0;
+  const terminalPending = signals.workflowPending === true;
+  const workflowPending = logPending || terminalPending;
+  const workflowPendingEvidence = logPending
+    ? workflowActivity.evidence || "claude_session_log"
+    : terminalPending
+      ? signals.workflowPendingEvidence || "terminal_heuristic"
+      : logPendingCount !== null
+        ? workflowActivity.evidence || "claude_session_log"
+        : "";
+  const workflowPendingCount = logPending
+    ? logPendingCount
+    : terminalPending
+      ? signals.workflowPendingCount
+      : logPendingCount;
+  return {
+    ...signals,
+    likelyBusy: Boolean(signals.likelyBusy || workflowPending),
+    workflowPending,
+    workflowPendingCount,
+    workflowPendingEvidence,
+    workflowPendingObservedAt: logPendingCount !== null
+      ? workflowActivity.pendingObservedAt || workflowActivity.lastObservedAt || ""
+      : signals.workflowPendingObservedAt || "",
+    state:
+      workflowPending && baseState === "idle"
+        ? "busy"
+        : baseState,
+  };
+}
+
+function emptyWorkflowActivity() {
+  return {
+    state: "not_observed",
+    launchObserved: false,
+    launchStatus: null,
+    pendingCount: null,
+    pendingObservedAt: "",
+    lastObservedAt: "",
+    evidence: "",
+    triggerAttribution: "unknown",
+  };
+}
+
+function environmentCategoryFingerprint(environment) {
+  if (!environment) return "";
+  return JSON.stringify({
+    status: environment.status,
+    effortOverrideStatus: environment.effortOverrideStatus,
+    workflowsDisabled: environment.workflowsDisabled,
+    blockers: environment.blockers,
+  });
+}
+
+function assessUltracodePosture(
+  requested,
+  resolved,
+  signals,
+  priorObserved,
+  launchEnvironment = null
+) {
+  const requestedUltracode = Boolean(requested?.ultracode ?? resolved?.ultracode);
+  const runtimeEffort = priorObserved.effort || null;
+  const terminalEffort = signals.effortIndicator || null;
+  const workflowActivity = priorObserved.workflowActivity ?? emptyWorkflowActivity();
+  const currentMcpEnvironment = ultracodeEnvironmentStatus();
+  const environmentComparison = !launchEnvironment
+    ? "launch_not_recorded"
+    : environmentCategoryFingerprint(launchEnvironment) ===
+        environmentCategoryFingerprint(currentMcpEnvironment)
+      ? "match"
+      : "different";
+  const sessionUltracodeObserved =
+    priorObserved.ultracode === true &&
+    priorObserved.evidence?.ultracode === "claude_session_log";
+  const conflictSources = [];
+  for (const [source, effort] of [
+    ["claude_session_log", runtimeEffort],
+    ["terminal_heuristic", terminalEffort],
+  ]) {
+    if (requestedUltracode && effort && !["xhigh", "ultracode"].includes(effort)) {
+      conflictSources.push({ source, effort });
+    }
+  }
+
+  let status = "not_requested";
+  let note = "UltraCode was not requested for this managed launch.";
+  if (requestedUltracode) {
+    status = "requested_unconfirmed";
+    note = "The UltraCode launch request was resolved, but no independent runtime or workflow evidence is available yet.";
+    if (launchEnvironment?.status === "blocking" && !sessionUltracodeObserved) {
+      status = "environment_blocked";
+      note = "The captured Claude child launch environment contains an override that blocks UltraCode workflow behavior.";
+    } else if (conflictSources.length) {
+      status = "conflicting_effort_evidence";
+      note = "A bound runtime or terminal effort indicator conflicts with the requested UltraCode posture.";
+    } else if (sessionUltracodeObserved) {
+      status = "runtime_setting_observed";
+      note = "An explicit UltraCode session-log indicator was observed.";
+    } else if (signals.ultracodeUnavailable) {
+      status = "rejected_terminal_heuristic";
+      note = "Current terminal output appears to reject UltraCode. The terminal classification is heuristic evidence.";
+    } else if (signals.ultracodeActive) {
+      status = "terminal_indicator_heuristic";
+      note = "Terminal output resembles an explicit UltraCode indicator, but terminal evidence is heuristic and does not authenticate runtime state.";
+    } else if (workflowActivity.launchObserved || workflowActivity.pendingCount > 0) {
+      status = "workflow_activity_observed";
+      note = "Claude workflow activity was observed, but the session log does not attribute that activity specifically to UltraCode.";
+    } else if (runtimeEffort === "xhigh" || terminalEffort === "xhigh") {
+      status = "xhigh_correlated_unconfirmed";
+      note = "xhigh effort is consistent with UltraCode, but xhigh alone does not prove that UltraCode workflow orchestration is active.";
+    }
+  }
+
+  return {
+    requested: requestedUltracode,
+    launchMechanism: requestedUltracode
+      ? resolved?.ultracodeMechanism ?? requested?.ultracodeMechanism ?? null
+      : null,
+    launchStatus: requestedUltracode ? "request_resolved_for_launch" : "not_requested",
+    runtimeEffort,
+    terminalEffort,
+    workflowActivity,
+    workflowTriggerAttribution: "unknown",
+    environment: launchEnvironment ?? currentMcpEnvironment,
+    launchEnvironment,
+    currentMcpEnvironment,
+    environmentComparison,
+    conflict: conflictSources.length > 0,
+    conflictSources,
+    status,
+    note,
+  };
+}
+
+export function launchPostureReport(
+  requested,
+  resolved = requested,
+  signals = {},
+  priorObserved = {},
+  { launchEnvironment = null } = {}
+) {
   const priorPermissionMode = priorObserved.permissionMode || null;
   const priorEffort = priorObserved.effort || null;
   const priorUltracode =
-    priorObserved.ultracode === true || priorObserved.ultracode === false
+    (priorObserved.ultracode === true || priorObserved.ultracode === false) &&
+    priorObserved.evidence?.ultracode === "claude_session_log"
       ? priorObserved.ultracode
       : null;
   const observed = {
@@ -2347,7 +2785,7 @@ export function launchPostureReport(requested, resolved = requested, signals = {
   let verification = "requested_only";
   let note = "Launch values are requested CLI arguments, not confirmed effective runtime state.";
   const evidenceValues = Object.values(observed.evidence).filter(Boolean);
-  if (evidenceValues.some((value) => value.startsWith("claude_session_log"))) {
+  if (evidenceValues.some((value) => value === "claude_session_log")) {
     verification = "session_log_observed";
     note =
       "Observed fields come from Claude's local session log when available; any remaining terminal-derived fields are identified separately as heuristics.";
@@ -2374,6 +2812,13 @@ export function launchPostureReport(requested, resolved = requested, signals = {
       effort: observed.effort ? observed.evidence.effort || "observed" : "requested_only",
       ultracode: observed.ultracode !== null ? observed.evidence.ultracode || "observed" : "requested_only",
     },
+    ultracodeAssessment: assessUltracodePosture(
+      requested,
+      resolved,
+      signals,
+      priorObserved,
+      launchEnvironment
+    ),
     note,
   };
 }
@@ -2407,6 +2852,7 @@ export function startupReadiness({ stillRunning, signals, remoteUrl, needsWorksp
 }
 
 export function submitPreflightReason(signals) {
+  if (signals.workflowPending) return "workflow_pending";
   if (signals.state === "exited") return "exited";
   if (signals.state === "limit_warning") return "limit_warning";
   if (signals.state === "approval_required") return "approval_required";
@@ -2416,6 +2862,11 @@ export function submitPreflightReason(signals) {
   if (signals.state === "paste_pending") return "paste_pending";
   if (signals.state === "awaiting_input") return "active_input_not_empty";
   return "";
+}
+
+export function lifecycleBlockReason(signals) {
+  if (signals.workflowPending) return "workflow_pending";
+  return signals.state === "idle" ? "" : signals.state;
 }
 
 export function submitResultStatus(signals, capture, promptText, { wasBusyBeforeSubmit = false } = {}) {
@@ -2464,12 +2915,22 @@ export function textChunks(value, chunkSize) {
 function tmuxKeyName(key) {
   const names = {
     Return: "Enter",
+    "C-m": "Enter",
+    "Ctrl-M": "Enter",
+    "C-j": "Enter",
+    "Ctrl-J": "Enter",
+    KPEnter: "Enter",
+    NumpadEnter: "Enter",
     Esc: "Escape",
     "Ctrl-C": "C-c",
     "Ctrl-D": "C-d",
     Backspace: "BSpace",
   };
   return names[key] ?? key;
+}
+
+export function keySubmitsComposer(key) {
+  return SUBMIT_KEY_NAMES.has(String(key));
 }
 
 async function backendExists(sessionName) {
@@ -2764,51 +3225,163 @@ export async function recentSessionRecords(
 
 export function runtimeObservationFromRecords(records, metadata = {}) {
   const state = createSessionSummaryState();
+  for (const record of records) addRuntimeObservationRecord(state, record, metadata);
+  return runtimeObservationFromState(state);
+}
+
+function addRuntimeObservationRecord(state, record, metadata = {}) {
   const launchStartedAtMs = Number(metadata?.startedAtMs);
-  for (const record of records) {
-    if (Number.isFinite(launchStartedAtMs)) {
-      const recordTimestampMs = Date.parse(record.timestamp ?? "");
-      if (
-        !Number.isFinite(recordTimestampMs) ||
-        recordTimestampMs < launchStartedAtMs - 5000
-      ) {
-        continue;
-      }
+  if (Number.isFinite(launchStartedAtMs)) {
+    const recordTimestampMs = Date.parse(record.timestamp ?? "");
+    if (
+      !Number.isFinite(recordTimestampMs) ||
+      recordTimestampMs < launchStartedAtMs - 5000
+    ) {
+      return;
     }
-    addSessionRecord(state, record, metadata?.resolvedSessionId);
   }
-  const ultracodeObserved =
-    state.effort === "ultracode" ||
-    (state.effort === "xhigh" &&
-      metadata?.resolvedPosture?.ultracode === true &&
-      metadata?.resolvedPosture?.ultracodeMechanism === "effort")
-      ? true
-      : null;
-  const ultracodeEvidence =
-    state.effort === "ultracode"
-      ? "claude_session_log"
-      : ultracodeObserved === true
-        ? "claude_session_log_correlated_with_resolved_launch"
-        : "";
+  addSessionRecord(state, record, metadata?.resolvedSessionId, false);
+}
+
+function runtimeObservationFromState(state) {
+  const ultracodeObserved = state.effort === "ultracode" ? true : null;
+  const workflowActivityObserved =
+    state.workflowLaunchObserved || state.pendingWorkflowCount !== null;
+  const workflowState = state.workflowLaunchObserved
+    ? state.pendingWorkflowCount > 0
+      ? "pending"
+      : "launch_observed"
+    : state.pendingWorkflowCount > 0
+      ? "pending_without_launch_record"
+      : state.pendingWorkflowCount === 0
+        ? "idle_count_observed"
+        : "not_observed";
   return {
     permissionMode: state.permissionMode || null,
     model: state.model || null,
     effort: state.effort || null,
     ultracode: ultracodeObserved,
+    workflowActivity: {
+      state: workflowState,
+      launchObserved: state.workflowLaunchObserved,
+      launchStatus: state.workflowLaunchStatus || null,
+      pendingCount: state.pendingWorkflowCount,
+      pendingObservedAt: state.pendingWorkflowUpdatedAt || "",
+      lastObservedAt:
+        state.pendingWorkflowUpdatedAt || state.workflowLaunchUpdatedAt || "",
+      evidence: workflowActivityObserved ? "claude_session_log" : "",
+      triggerAttribution: "unknown",
+    },
     evidence: {
       permissionMode: state.permissionMode ? "claude_session_log" : "",
       model: state.model ? "claude_session_log" : "",
       effort: state.effort ? "claude_session_log" : "",
-      ultracode: ultracodeEvidence,
+      ultracode: ultracodeObserved === true ? "claude_session_log" : "",
     },
   };
 }
 
-async function sessionRuntimeObservation(metadata) {
-  return runtimeObservationFromRecords(
-    await recentSessionRecords(metadata),
-    metadata
-  );
+const runtimeObservationCache = new Map();
+const runtimeObservationLoads = new Map();
+const MAX_RUNTIME_OBSERVATION_CACHE_ENTRIES = 128;
+const RUNTIME_OBSERVATION_READ_BYTES = 256 * 1024;
+
+function runtimeObservationLogFile(metadata) {
+  if (!metadata?.cwd || !metadata?.resolvedSessionId) return "";
+  const resolvedSessionId = String(metadata.resolvedSessionId);
+  if (!SESSION_ID_RE.test(resolvedSessionId)) return "";
+  return path.join(projectDirFromCwd(metadata.cwd), `${resolvedSessionId}.jsonl`);
+}
+
+function runtimeObservationCacheKey(metadata, file) {
+  return [
+    file,
+    metadata?.resolvedSessionId ?? "",
+    Number(metadata?.startedAtMs) || 0,
+  ].join("\0");
+}
+
+function newRuntimeObservationCacheEntry(stat) {
+  return {
+    fileIdentity: `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`,
+    offset: 0,
+    remainder: "",
+    decoder: new StringDecoder("utf8"),
+    state: createSessionSummaryState(),
+  };
+}
+
+async function loadRuntimeObservation(metadata, file, key) {
+  let stat;
+  try {
+    stat = await fs.promises.lstat(file);
+  } catch (error) {
+    if (error.code === "ENOENT") return runtimeObservationFromState(createSessionSummaryState());
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    return runtimeObservationFromState(createSessionSummaryState());
+  }
+
+  const fileIdentity = `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+  let entry = runtimeObservationCache.get(key);
+  if (
+    !entry ||
+    entry.fileIdentity !== fileIdentity ||
+    stat.size < entry.offset
+  ) {
+    entry = newRuntimeObservationCacheEntry(stat);
+  }
+
+  const handle = await fs.promises.open(file, "r");
+  try {
+    const buffer = Buffer.alloc(RUNTIME_OBSERVATION_READ_BYTES);
+    while (entry.offset < stat.size) {
+      const requestedBytes = Math.min(buffer.length, stat.size - entry.offset);
+      const { bytesRead } = await handle.read(
+        buffer,
+        0,
+        requestedBytes,
+        entry.offset
+      );
+      if (bytesRead <= 0) break;
+      entry.offset += bytesRead;
+      entry.remainder += entry.decoder.write(buffer.subarray(0, bytesRead));
+      const lines = entry.remainder.split(/\r?\n/);
+      entry.remainder = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line) continue;
+        try {
+          addRuntimeObservationRecord(entry.state, JSON.parse(line), metadata);
+        } catch {
+          // Ignore malformed records without discarding later append-only evidence.
+        }
+      }
+    }
+  } finally {
+    await handle.close();
+  }
+
+  runtimeObservationCache.delete(key);
+  runtimeObservationCache.set(key, entry);
+  while (runtimeObservationCache.size > MAX_RUNTIME_OBSERVATION_CACHE_ENTRIES) {
+    runtimeObservationCache.delete(runtimeObservationCache.keys().next().value);
+  }
+  return runtimeObservationFromState(entry.state);
+}
+
+export async function sessionRuntimeObservation(metadata) {
+  const file = runtimeObservationLogFile(metadata);
+  if (!file) return runtimeObservationFromState(createSessionSummaryState());
+  const key = runtimeObservationCacheKey(metadata, file);
+  const prior = runtimeObservationLoads.get(key) ?? Promise.resolve();
+  const current = prior.catch(() => {}).then(() => loadRuntimeObservation(metadata, file, key));
+  runtimeObservationLoads.set(key, current);
+  try {
+    return await current;
+  } finally {
+    if (runtimeObservationLoads.get(key) === current) runtimeObservationLoads.delete(key);
+  }
 }
 
 async function promptAcknowledgedInSession(
@@ -2921,6 +3494,12 @@ export function waitTurnDecision({
   );
   if (WAIT_STRONG_ATTENTION_STATES.has(signals.state)) {
     return { status: "needs_attention", evidence: signals.state };
+  }
+  if (signals.workflowPending) {
+    if (WAIT_ATTENTION_STATES.has(signals.state)) {
+      return { status: "needs_attention", evidence: signals.state };
+    }
+    return { status: "wait", evidence: "workflow_pending" };
   }
   if (
     transcript.turnComplete &&
@@ -3096,6 +3675,7 @@ export async function runSubmitPrompt(
     sendKey = backendSendKey,
     delay = sleep,
     promptAcknowledged = promptAcknowledgedInSession,
+    runtimeObservation = async () => ({ workflowActivity: emptyWorkflowActivity() }),
   } = {}
 ) {
   const sessionName = managedSessionName(input);
@@ -3106,14 +3686,22 @@ export async function runSubmitPrompt(
   const chunkSize = clampInteger(input.chunkSize, DEFAULT_TEXT_CHUNK_SIZE, 256, 8192);
   const chunkDelayMs = clampInteger(input.chunkDelayMs, DEFAULT_TEXT_CHUNK_DELAY_MS, 0, 100);
   const bracketedPaste = requestedPasteMode === "bracketed" || requestedPasteMode === "auto";
+  const observedSignals = async (captureText) => {
+    const observation = await runtimeObservation();
+    return signalsWithWorkflowActivity(
+      captureSignals(captureText),
+      observation?.workflowActivity
+    );
+  };
   let capturedText = await capture(sessionName, lines);
-  const preflightSignals = captureSignals(capturedText);
+  const preflightSignals = await observedSignals(capturedText);
   const preflightReason = submitPreflightReason(preflightSignals);
   if (preflightReason && !input.force) {
     return {
       status: "preflight_blocked",
       reason: preflightReason,
       managedSession: sessionName,
+      forceUsed: false,
       pasteMode: bracketedPaste ? "bracketed" : "literal",
       requestedPasteMode,
       retriesUsed: 0,
@@ -3141,7 +3729,7 @@ export async function runSubmitPrompt(
     for (let poll = 0; poll < SUBMIT_RETRY_VISIBILITY_POLLS; poll += 1) {
       await delay(retryDelayMs);
       capturedText = await capture(sessionName, lines);
-      const signals = captureSignals(capturedText);
+      const signals = await observedSignals(capturedText);
       transcriptAcknowledged =
         transcriptAcknowledged || (await promptAcknowledged(sessionName, input.text, submittedAtMs));
       if (
@@ -3165,7 +3753,7 @@ export async function runSubmitPrompt(
   }
 
   capturedText = await capture(sessionName, lines);
-  const signals = captureSignals(capturedText);
+  const signals = await observedSignals(capturedText);
   transcriptAcknowledged =
     transcriptAcknowledged || (await promptAcknowledged(sessionName, input.text, submittedAtMs));
   const result = transcriptAcknowledged
@@ -3177,6 +3765,9 @@ export async function runSubmitPrompt(
     status: result.status,
     reason: result.reason || undefined,
     managedSession: sessionName,
+    forceUsed: Boolean(input.force && preflightReason),
+    forcedPastReason:
+      input.force && preflightReason ? preflightReason : undefined,
     pasteMode: bracketedPasteUsed ? "bracketed" : "literal",
     requestedPasteMode,
     bracketedPasteRequested: bracketedPaste,
@@ -3246,7 +3837,98 @@ function claudeVersionAtLeast(versionOutput, required) {
   return true;
 }
 
-export function parseClaudeCapabilities(versionOutput, helpOutput, command = "claude") {
+function probeExitOutcome(probe, prefix = "") {
+  const key = (name) =>
+    prefix ? `${prefix}${name[0].toUpperCase()}${name.slice(1)}` : name;
+  const attempted = probe[key("attempted")] === true;
+  const succeeded = probe[key("succeeded")];
+  const explicitExitCode = probe[key("exitCode")];
+  const exitCode = Number.isInteger(explicitExitCode)
+    ? explicitExitCode
+    : succeeded === true
+      ? 0
+      : succeeded === false
+        ? 1
+        : null;
+  const timedOut = probe[key("timedOut")] === true;
+  const terminated =
+    probe[key("terminated")] === true ||
+    typeof probe[key("signal")] === "string";
+  const completed =
+    attempted && !timedOut && !terminated && Number.isInteger(exitCode);
+  return {
+    attempted,
+    completed,
+    exitCode,
+    timedOut,
+    terminated,
+    accepted: completed && exitCode === 0,
+    rejected: completed && exitCode !== 0,
+  };
+}
+
+function ultracodeProbeStatus(probe = {}) {
+  const attempted = probe.attempted === true;
+  const output = [probe.stdout, probe.stderr, probe.error]
+    .filter((value) => typeof value === "string")
+    .join("\n");
+  const controlOutput = [probe.controlStdout, probe.controlStderr, probe.controlError]
+    .filter((value) => typeof value === "string")
+    .join("\n");
+  const validOutcome = probeExitOutcome(probe);
+  const controlOutcome = probeExitOutcome(probe, "control");
+  const rejectionTextMatched =
+    /(?:unknown|invalid|unsupported)\s+--effort\s+value[^\r\n]*ultracode/i.test(
+      output
+    );
+  const controlRejectionTextMatched =
+    /(?:unknown|invalid|unsupported)\s+--effort\s+value[^\r\n]*rail-invalid-probe/i.test(
+      controlOutput
+    );
+  const rejected = validOutcome.rejected;
+  const controlAttempted = controlOutcome.attempted;
+  const controlRejected = controlOutcome.rejected;
+  const accepted = validOutcome.accepted && controlRejected;
+  const excluded =
+    validOutcome.timedOut ||
+    validOutcome.terminated ||
+    controlOutcome.timedOut ||
+    controlOutcome.terminated;
+  return {
+    attempted,
+    accepted,
+    rejected,
+    controlAttempted,
+    controlRejected,
+    exitCode: validOutcome.exitCode,
+    controlExitCode: controlOutcome.exitCode,
+    validProbeCompleted: validOutcome.completed,
+    controlProbeCompleted: controlOutcome.completed,
+    timedOut: validOutcome.timedOut,
+    controlTimedOut: controlOutcome.timedOut,
+    terminated: validOutcome.terminated,
+    controlTerminated: controlOutcome.terminated,
+    rejectionTextMatched,
+    controlRejectionTextMatched,
+    evidenceBasis: "exit_status_calibrated",
+    result: !attempted
+      ? "not_run"
+      : excluded
+        ? "inconclusive"
+      : accepted
+        ? "accepted"
+        : rejected
+          ? "rejected"
+          : "inconclusive",
+  };
+}
+
+export function parseClaudeCapabilities(
+  versionOutput,
+  helpOutput,
+  command = "claude",
+  ultracodeProbe = {}
+) {
   const effortBlock = cliOptionBlock(helpOutput, "--effort <level>");
   const permissionBlock = cliOptionBlock(helpOutput, "--permission-mode <mode>");
   const advertisedEffortLevels = CLAUDE_EFFORT_LEVELS.filter((level) => optionBlockLists(effortBlock, level));
@@ -3257,13 +3939,35 @@ export function parseClaudeCapabilities(versionOutput, helpOutput, command = "cl
     ? [...new Set(quotedPermissionModes)]
     : CLAUDE_PERMISSION_MODES.filter((mode) => optionBlockLists(permissionBlock, mode));
   const settingsFlagAvailable = helpOutput.includes("--settings <file-or-json>");
-  const versionSupportsDirectUltracode = claudeVersionAtLeast(versionOutput, [2, 1, 203]);
-  const directUltracodeAvailable = advertisedUltracode || versionSupportsDirectUltracode;
+  const versionSupportsDirectUltracode = claudeVersionAtLeast(
+    versionOutput,
+    ULTRACODE_DIRECT_VERSION_FLOOR
+  );
+  const argumentProbe = ultracodeProbeStatus(ultracodeProbe);
+  const directUltracodeAvailable =
+    !argumentProbe.rejected &&
+    (advertisedUltracode || argumentProbe.accepted || versionSupportsDirectUltracode);
   const ultracodeLaunchMechanism = directUltracodeAvailable
     ? "effort_flag"
     : settingsFlagAvailable
       ? "experimental_session_settings"
       : "unavailable";
+  let capabilityStatus = "unavailable";
+  if (argumentProbe.rejected) capabilityStatus = "rejected";
+  else if (advertisedUltracode) capabilityStatus = "advertised";
+  else if (argumentProbe.accepted) capabilityStatus = "accepted_unadvertised";
+  else if (versionSupportsDirectUltracode) {
+    capabilityStatus = argumentProbe.attempted
+      ? "officially_supported_probe_inconclusive"
+      : "officially_supported_unprobed";
+  } else if (settingsFlagAvailable) capabilityStatus = "experimental_settings_only";
+
+  let supportSource = "unavailable";
+  if (argumentProbe.rejected) supportSource = "parser_probe_rejected";
+  else if (advertisedUltracode) supportSource = "help_advertised";
+  else if (argumentProbe.accepted) supportSource = "parser_probe";
+  else if (versionSupportsDirectUltracode) supportSource = "official_version_contract";
+  else if (settingsFlagAvailable) supportSource = "experimental_settings";
   const bypassPolicy = bypassPolicyStatus();
   return {
     available: true,
@@ -3294,12 +3998,20 @@ export function parseClaudeCapabilities(versionOutput, helpOutput, command = "cl
     ultracode: {
       advertisedAsEffort: advertisedUltracode,
       supportedByInstalledVersion: versionSupportsDirectUltracode,
+      directLaunchVersionFloor: ULTRACODE_DIRECT_VERSION_FLOOR.join("."),
+      documentationUrl: ULTRACODE_DOCUMENTATION_URL,
+      capabilityStatus,
+      supportSource,
+      argumentProbe,
+      environment: ultracodeEnvironmentStatus(),
       mcpLaunchRequestAvailable: directUltracodeAvailable,
       experimentalSessionSettingsRequestAvailable: !directUltracodeAvailable && settingsFlagAvailable,
       launchMechanism: ultracodeLaunchMechanism,
       accountAndPolicyStatus: "unverified_no_authoritative_runtime_state",
-      note: directUltracodeAvailable
-        ? "The installed Claude CLI supports the direct Ultracode effort request, so the MCP uses --effort=ultracode. Session-log and terminal evidence are reported separately from the request."
+      note: argumentProbe.rejected
+        ? "The calibrated parser probe rejected --effort=ultracode. Help advertisement and version coverage remain provenance only and do not override that rejection."
+        : directUltracodeAvailable
+        ? "The installed Claude CLI accepts or is covered by the documented direct UltraCode effort request, so the MCP uses --effort=ultracode. Acceptance, runtime effort, and workflow evidence are reported separately."
         : settingsFlagAvailable
           ? "The installed Claude CLI exposes generic session settings but does not advertise Ultracode. The MCP can make an explicitly confirmed experimental settings request, but support and activation remain unverified."
           : "The installed Claude CLI exposes no supported Ultracode launch path.",
@@ -3423,13 +4135,83 @@ async function execClaudeCommand(command, args, options) {
   return execFileAsync(command, args, options);
 }
 
-async function inspectClaudeCapabilities(command = resolveClaudeCommand()) {
+async function runClaudeArgumentProbe(command, args) {
   try {
-    const [versionResult, helpResult] = await Promise.all([
+    const result = await execClaudeCommand(command, args, {
+      timeout: 10000,
+      maxBuffer: 1024 * 1024,
+    });
+    return {
+      attempted: true,
+      succeeded: true,
+      exitCode: 0,
+      timedOut: false,
+      terminated: false,
+      signal: null,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    };
+  } catch (error) {
+    const timedOut = error?.code === "ETIMEDOUT" || error?.killed === true;
+    return {
+      attempted: true,
+      succeeded: false,
+      exitCode: Number.isInteger(error?.code) ? error.code : null,
+      timedOut,
+      terminated: Boolean(error?.signal),
+      signal: typeof error?.signal === "string" ? error.signal : null,
+      stdout: error?.stdout,
+      stderr: error?.stderr,
+      error: error?.message,
+    };
+  }
+}
+
+function claudeCapabilityCacheKey(command) {
+  let executableIdentity = "unavailable";
+  try {
+    const stat = fs.statSync(command);
+    executableIdentity = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+  } catch {
+    // The uncached inspection reports an unreadable executable.
+  }
+  const environment = ultracodeEnvironmentStatus();
+  const policy = bypassPolicyStatus();
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        command: normalizeForPathCompare(command),
+        executableIdentity,
+        environment: environmentCategoryFingerprint(environment),
+        bypassPolicyMode: policy.mode,
+      })
+    )
+    .digest("hex");
+}
+
+async function inspectClaudeCapabilitiesUncached(command) {
+  try {
+    const [versionResult, helpResult, ultracodeProbe, ultracodeControlProbe] = await Promise.all([
       execClaudeCommand(command, ["--version"], { timeout: 10000, maxBuffer: 1024 * 1024 }),
       execClaudeCommand(command, ["--help"], { timeout: 10000, maxBuffer: 2 * 1024 * 1024 }),
+      runClaudeArgumentProbe(command, ["--effort=ultracode", "--version"]),
+      runClaudeArgumentProbe(command, [
+        "--effort=rail-invalid-probe",
+        "--version",
+      ]),
     ]);
-    return parseClaudeCapabilities(versionResult.stdout, helpResult.stdout, command);
+    return parseClaudeCapabilities(versionResult.stdout, helpResult.stdout, command, {
+      ...ultracodeProbe,
+      controlAttempted: ultracodeControlProbe.attempted,
+      controlSucceeded: ultracodeControlProbe.succeeded,
+      controlExitCode: ultracodeControlProbe.exitCode,
+      controlTimedOut: ultracodeControlProbe.timedOut,
+      controlTerminated: ultracodeControlProbe.terminated,
+      controlSignal: ultracodeControlProbe.signal,
+      controlStdout: ultracodeControlProbe.stdout,
+      controlStderr: ultracodeControlProbe.stderr,
+      controlError: ultracodeControlProbe.error,
+    });
   } catch (error) {
     const policy = bypassPolicyStatus();
     return {
@@ -3455,11 +4237,40 @@ async function inspectClaudeCapabilities(command = resolveClaudeCommand()) {
   }
 }
 
+async function inspectClaudeCapabilities(command = resolveClaudeCommand()) {
+  const key = claudeCapabilityCacheKey(command);
+  const now = Date.now();
+  const cached = claudeCapabilityCache.get(key);
+  if (cached && cached.expiresAt > now) return cached.promise;
+  if (cached) claudeCapabilityCache.delete(key);
+
+  const promise = inspectClaudeCapabilitiesUncached(command);
+  claudeCapabilityCache.set(key, {
+    expiresAt: now + CLAUDE_CAPABILITY_CACHE_TTL_MS,
+    promise,
+  });
+  for (const [cacheKey, entry] of claudeCapabilityCache) {
+    if (entry.expiresAt <= now) claudeCapabilityCache.delete(cacheKey);
+  }
+  while (claudeCapabilityCache.size > MAX_CLAUDE_CAPABILITY_CACHE_ENTRIES) {
+    claudeCapabilityCache.delete(claudeCapabilityCache.keys().next().value);
+  }
+  return promise;
+}
+
 export function resolveLaunchOptionsFromCapabilities(options, capabilities) {
   const needsUltracodeInspection = options.ultracode && !options.ultracodeMechanism;
   const needsEffortInspection = Boolean(options.effort);
   if (capabilities.available === false) {
     throw new Error(`Claude capability inspection failed: ${capabilities.error}`);
+  }
+  if (
+    needsUltracodeInspection &&
+    capabilities.ultracode?.environment?.status === "blocking"
+  ) {
+    throw new Error(
+      `The MCP process environment blocks UltraCode: ${capabilities.ultracode.environment.blockers.join(", ")}. Remove the blocking Claude override and restart the MCP process.`
+    );
   }
   if (needsEffortInspection && !capabilities.advertised?.effortLevels?.includes(options.effort)) {
     throw new Error(`The installed Claude CLI does not advertise effort level ${options.effort}.`);
@@ -3514,6 +4325,10 @@ async function backendStartUnlocked({
   const preparedLaunchOptions = await prepareLaunchOptions(launchOptions, claudeCommand);
   const rawSessionExists = IS_NATIVE_WINDOWS ? await backendExists(sessionName) : await tmuxExists(sessionName);
   let windowsReplacement = null;
+  let replacementAudit = {
+    forceUsed: false,
+    workflowInterrupted: false,
+  };
   if (rawSessionExists) {
     if (!IS_NATIVE_WINDOWS) await requireManagedTmuxSession(sessionName);
     const existing = await backendLaunchMetadata(sessionName);
@@ -3535,7 +4350,7 @@ async function backendStartUnlocked({
       return {
         status: "already_running",
         capture: await backendCapture(sessionName, 80, existing),
-        existingSession: existing,
+        existingSession: publicLaunchMetadata(existing),
         existingRequestedPosture: existing?.requestedPosture ?? null,
         existingResolvedPosture: existing?.resolvedPosture ?? existing?.requestedPosture ?? null,
         requestedArgs,
@@ -3550,22 +4365,33 @@ async function backendStartUnlocked({
       120,
       existing
     );
-    const existingSignals = captureSignals(existingCapture);
-    if (existingSignals.state !== "idle" && !forceKillExisting) {
+    const existingObservation = await sessionRuntimeObservation(existing);
+    const existingSignals = signalsWithWorkflowActivity(
+      captureSignals(existingCapture),
+      existingObservation.workflowActivity
+    );
+    const replacementBlockReason = lifecycleBlockReason(existingSignals);
+    if (replacementBlockReason && !forceKillExisting) {
       throw new Error(
-        `Refusing to replace non-idle managed session ${sessionName} (${existingSignals.state}). Wait for it to become idle or pass forceKillExisting=true after reviewing the capture.`
+        `Refusing to replace managed session ${sessionName} (${replacementBlockReason}). Wait for it to become idle or pass forceKillExisting=true after reviewing the capture.`
       );
     }
+    replacementAudit = {
+      forceUsed: Boolean(forceKillExisting && replacementBlockReason),
+      workflowInterrupted: Boolean(
+        forceKillExisting && existingSignals.workflowPending
+      ),
+    };
     if (IS_NATIVE_WINDOWS) {
       windowsReplacement = {
-        graceful: existingSignals.state === "idle",
+        graceful: !replacementBlockReason,
         force: forceKillExisting,
         expectedStartedAtMs: existing?.startedAtMs ?? null,
         expectedGenerationId: existing?.generationId ?? null,
       };
     } else {
       const stopResult = await backendStopUnlocked(sessionName, {
-        graceful: existingSignals.state === "idle",
+        graceful: !replacementBlockReason,
         force: forceKillExisting,
       });
       if (stopResult.status !== "stopped" && stopResult.status !== "not_running") {
@@ -3577,11 +4403,19 @@ async function backendStartUnlocked({
   const sessionLogSnapshot = snapshotSessionLogs(resolvedCwd);
   const args = claudeArgs(preparedLaunchOptions);
   const startedAtMs = Date.now();
+  const childEnvironment = {
+    ...process.env,
+    CLAUDE_CONFIG_DIR,
+    FORCE_COLOR: "1",
+  };
+  const launchEnvironment =
+    claudeChildLaunchEnvironmentStatus(childEnvironment);
   const launchMetadata = createLaunchMetadata({
     cwd: resolvedCwd,
     args,
     startedAtMs,
     launchOptions: preparedLaunchOptions,
+    launchEnvironment,
     resolvedSessionId:
       preparedLaunchOptions.newSessionId ??
       (!preparedLaunchOptions.forkSession ? preparedLaunchOptions.sessionId ?? null : null),
@@ -3596,9 +4430,10 @@ async function backendStartUnlocked({
       rows: 40,
       cwd: resolvedCwd,
       canonicalCwd: canonicalResolvedCwd,
-      env: { ...process.env, FORCE_COLOR: "1" },
+      env: childEnvironment,
       requestedPosture: launchMetadata.requestedPosture,
       resolvedPosture: launchMetadata.resolvedPosture,
+      launchEnvironment,
       resolvedSessionId: launchMetadata.resolvedSessionId,
       expectedStartedAtMs:
         windowsReplacement?.expectedStartedAtMs ?? undefined,
@@ -3618,7 +4453,7 @@ async function backendStartUnlocked({
       return {
         status: "already_running",
         capture: brokerResult.capture,
-        existingSession: brokerResult.metadata,
+        existingSession: publicLaunchMetadata(brokerResult.metadata),
         existingRequestedPosture: brokerResult.metadata?.requestedPosture ?? null,
         existingResolvedPosture: brokerResult.metadata?.resolvedPosture ?? null,
         requestedArgs: args,
@@ -3636,11 +4471,22 @@ async function backendStartUnlocked({
       args,
       launchMetadata,
       sessionLogSnapshot,
+      replacementAudit,
     };
   }
 
   const started = await tmux(
-    ["new-session", "-d", "-s", sessionName, "-c", resolvedCwd, claudeCommand, ...args],
+    [
+      "new-session",
+      "-d",
+      ...tmuxChildEnvironmentArgs(childEnvironment),
+      "-s",
+      sessionName,
+      "-c",
+      resolvedCwd,
+      claudeCommand,
+      ...args,
+    ],
     { timeoutMs: 10000 }
   );
   if (!started.ok) throw new Error(started.stderr || "Failed to start tmux session");
@@ -3656,7 +4502,15 @@ async function backendStartUnlocked({
     await tmux(["kill-session", "-t", sessionName], { timeoutMs: 5000 });
     throw new Error(`Unable to establish tmux session ownership: ${metadataError}`);
   }
-  return { status: "started", capture: "", startedAtMs, args, launchMetadata, sessionLogSnapshot };
+  return {
+    status: "started",
+    capture: "",
+    startedAtMs,
+    args,
+    launchMetadata,
+    sessionLogSnapshot,
+    replacementAudit,
+  };
 }
 
 async function backendStart(options) {
@@ -3978,7 +4832,12 @@ server.registerTool(
       forceKillExisting,
     });
     if (started.status === "already_running") {
-      const signals = captureSignals(started.capture);
+      const existingMetadata = await backendLaunchMetadata(sessionName);
+      const observation = await sessionRuntimeObservation(existingMetadata);
+      const signals = signalsWithWorkflowActivity(
+        captureSignals(started.capture),
+        observation.workflowActivity
+      );
       return text({
         ...started,
         backend,
@@ -3987,7 +4846,9 @@ server.registerTool(
         posture: launchPostureReport(
           started.existingRequestedPosture,
           started.existingResolvedPosture,
-          signals
+          signals,
+          observation,
+          { launchEnvironment: existingMetadata?.launchEnvironment ?? null }
         ),
       });
     }
@@ -4019,7 +4880,18 @@ server.registerTool(
         exitCode,
         capture: deadCapture,
         signals,
-        posture: launchPostureReport(requestedPosture, resolvedPosture, signals),
+        posture: launchPostureReport(
+          requestedPosture,
+          resolvedPosture,
+          signals,
+          {},
+          {
+            launchEnvironment:
+              deadMetadata?.launchEnvironment ??
+              started.launchMetadata?.launchEnvironment ??
+              null,
+          }
+        ),
         note: "Claude exited during startup. Most often this means Claude Code is not authenticated in this same OS context - run `claude` here, log in, then retry.",
       });
     }
@@ -4135,12 +5007,17 @@ server.registerTool(
       permissionModeResolved: resolvedPosture.permissionMode,
       model: input.model ?? null,
       effort: input.ultracode ? "xhigh" : input.effort ?? null,
+      effortRequested: input.effort ?? null,
       ultracode: input.ultracode,
+      ultracodeRequested: input.ultracode,
       ultracodeMechanism: requestedPosture.ultracodeMechanism,
       continueLatest,
       resumedByName: resumeSessionName ?? null,
       forkSession,
       axScreenReader: input.axScreenReader,
+      replacementForceUsed: started.replacementAudit?.forceUsed ?? false,
+      workflowInterrupted:
+        started.replacementAudit?.workflowInterrupted ?? false,
       needsWorkspaceTrust,
       metadataWarning,
       note: readiness.note || undefined,
@@ -4167,13 +5044,22 @@ server.registerTool(
     const sessionName = managedSessionName(input);
     const metadata = await backendLaunchMetadata(sessionName);
     const capture = await backendCapture(sessionName, input.lines, metadata);
-    const signals = captureSignals(capture);
+    const observation = await sessionRuntimeObservation(metadata);
+    const signals = signalsWithWorkflowActivity(
+      captureSignals(capture),
+      observation.workflowActivity
+    );
     return text({
       managedSession: sessionName,
       capture,
       signals,
       transcript: await sessionTranscriptSnapshot(metadata),
-      posture: await managedPostureReport(sessionName, signals, metadata),
+      posture: await managedPostureReport(
+        sessionName,
+        signals,
+        metadata,
+        observation
+      ),
     });
   }
 );
@@ -4257,7 +5143,11 @@ server.registerTool(
         baselineTranscript = null;
       }
       capture = await backendCapture(sessionName, input.lines, metadata);
-      signals = captureSignals(capture);
+      const observation = await sessionRuntimeObservation(metadata);
+      signals = signalsWithWorkflowActivity(
+        captureSignals(capture),
+        observation.workflowActivity
+      );
       transcript = await sessionTranscriptSnapshot(metadata);
       baselineTranscript ??= transcriptCursorBaseline(transcript);
       const decision = waitTurnDecision({
@@ -4285,7 +5175,12 @@ server.registerTool(
           capture,
           signals,
           transcript,
-          posture: await managedPostureReport(sessionName, signals, metadata),
+          posture: await managedPostureReport(
+            sessionName,
+            signals,
+            metadata,
+            observation
+          ),
         });
       }
       if (decision.status === "needs_attention") {
@@ -4296,7 +5191,12 @@ server.registerTool(
           capture,
           signals,
           transcript,
-          posture: await managedPostureReport(sessionName, signals, metadata),
+          posture: await managedPostureReport(
+            sessionName,
+            signals,
+            metadata,
+            observation
+          ),
         });
       }
       await sleep(input.pollIntervalMs);
@@ -4316,18 +5216,43 @@ server.registerTool(
   "send_text",
   {
     description:
-      "Send literal text to the managed native Claude session. Use submit=true to press Enter after sending. For multi-line prompts use submit_prompt; newlines sent here may submit early. This can affect a live Claude session.",
+      "Send literal text to the managed native Claude session. Use submit=true to press Enter after sending. For multi-line prompts use submit_prompt; newlines sent here may submit early. Pending workflows block this unless force=true after inspection. This can affect a live Claude session.",
     inputSchema: {
       managedSession: z.string().default(DEFAULT_MANAGED_SESSION),
       tmuxSession: z.string().optional().describe("Deprecated alias for managedSession."),
       text: z.string().max(65536),
       submit: z.boolean().default(false),
+      force: z
+        .boolean()
+        .default(false)
+        .describe("Bypass only the pending-workflow text gate after inspecting the session."),
     },
   },
   async (input) => {
     const sessionName = managedSessionName(input);
     return withManagedMutationLock(sessionName, async () => {
       const metadata = await assertManagedMutationPolicy(sessionName);
+      const beforeCapture = await backendCapture(sessionName, 80, metadata);
+      const beforeObservation = await sessionRuntimeObservation(metadata);
+      const beforeSignals = signalsWithWorkflowActivity(
+        captureSignals(beforeCapture),
+        beforeObservation.workflowActivity
+      );
+      if (beforeSignals.workflowPending && !input.force) {
+        return text({
+          status: "send_blocked",
+          reason: "workflow_pending",
+          managedSession: sessionName,
+          capture: beforeCapture,
+          signals: beforeSignals,
+          posture: await managedPostureReport(
+            sessionName,
+            beforeSignals,
+            metadata,
+            beforeObservation
+          ),
+        });
+      }
       const baselineTranscript = input.submit
         ? await sessionTranscriptSnapshot(metadata)
         : null;
@@ -4335,7 +5260,11 @@ server.registerTool(
       if (input.submit) pendingTurnAnchors.delete(sessionName);
       await backendSendText(sessionName, input.text, input.submit, { metadata });
       const capture = await backendCapture(sessionName, 80, metadata);
-      const signals = captureSignals(capture);
+      const observation = await sessionRuntimeObservation(metadata);
+      const signals = signalsWithWorkflowActivity(
+        captureSignals(capture),
+        observation.workflowActivity
+      );
       const transcriptAcknowledged = input.submit
         ? await promptAcknowledgedInSession(
             sessionName,
@@ -4363,6 +5292,7 @@ server.registerTool(
       return text({
         status: "sent",
         managedSession: sessionName,
+        forceUsed: Boolean(input.force && beforeSignals.workflowPending),
         submitRequested: input.submit,
         submitted: turnStarted,
         transcriptAcknowledged,
@@ -4375,7 +5305,12 @@ server.registerTool(
           : undefined,
         capture,
         signals,
-        posture: await managedPostureReport(sessionName, signals, metadata),
+        posture: await managedPostureReport(
+          sessionName,
+          signals,
+          metadata,
+          observation
+        ),
       });
     });
   }
@@ -4432,6 +5367,7 @@ server.registerTool(
         sendKey: (name, key) => backendSendKey(name, key, metadata),
         promptAcknowledged: (name, prompt, sinceMs) =>
           promptAcknowledgedInSession(name, prompt, sinceMs, metadata),
+        runtimeObservation: () => sessionRuntimeObservation(metadata),
       });
       if (submitResultStartedTurn(result) && metadata?.startedAtMs) {
         pendingTurnAnchors.set(
@@ -4446,8 +5382,14 @@ server.registerTool(
         pendingTurnAnchors.delete(sessionName);
       }
       const currentMetadata = await backendLaunchMetadata(sessionName);
+      const currentObservation = await sessionRuntimeObservation(currentMetadata);
+      const currentSignals = signalsWithWorkflowActivity(
+        result.signals,
+        currentObservation.workflowActivity
+      );
       return text({
         ...result,
+        signals: currentSignals,
         waitAfterCursor: waitAfterCursor(
           baselineTranscript,
           metadata,
@@ -4456,8 +5398,9 @@ server.registerTool(
         transcript: await sessionTranscriptSnapshot(currentMetadata),
         posture: await managedPostureReport(
           result.managedSession,
-          result.signals,
-          currentMetadata
+          currentSignals,
+          currentMetadata,
+          currentObservation
         ),
       });
     });
@@ -4467,33 +5410,62 @@ server.registerTool(
 server.registerTool(
   "send_key",
   {
-    description: "Send a single key name to the managed native Claude session, such as Enter, Escape, C-c, Up, Down.",
+    description: "Send a single key name to the managed native Claude session, such as Enter, Escape, C-c, Up, Down. Enter-equivalent keys are blocked during pending workflows unless force=true after inspection.",
     inputSchema: {
       managedSession: z.string().default(DEFAULT_MANAGED_SESSION),
       tmuxSession: z.string().optional().describe("Deprecated alias for managedSession."),
       key: z.string().regex(/^[A-Za-z0-9_-]{1,30}$/),
+      force: z
+        .boolean()
+        .default(false)
+        .describe("Bypass only the pending-workflow Enter-equivalent gate after inspecting the session."),
     },
   },
   async (input) => {
     const sessionName = managedSessionName(input);
     return withManagedMutationLock(sessionName, async () => {
       const metadata = await assertManagedMutationPolicy(sessionName);
-      const submitsComposer =
-        input.key === "Enter" || input.key === "Return";
+      const submitsComposer = keySubmitsComposer(input.key);
       const baselineTranscript = submitsComposer
         ? await sessionTranscriptSnapshot(metadata)
         : null;
       const beforeCapture = submitsComposer
         ? await backendCapture(sessionName, 80, metadata)
         : "";
+      const beforeObservation = submitsComposer
+        ? await sessionRuntimeObservation(metadata)
+        : null;
       const beforeSignals = submitsComposer
-        ? captureSignals(beforeCapture)
+        ? signalsWithWorkflowActivity(
+            captureSignals(beforeCapture),
+            beforeObservation.workflowActivity
+          )
         : {};
+      if (submitsComposer && beforeSignals.workflowPending && !input.force) {
+        return text({
+          status: "send_blocked",
+          reason: "workflow_pending",
+          managedSession: sessionName,
+          key: input.key,
+          capture: beforeCapture,
+          signals: beforeSignals,
+          posture: await managedPostureReport(
+            sessionName,
+            beforeSignals,
+            metadata,
+            beforeObservation
+          ),
+        });
+      }
       const submittedAtMs = Date.now();
       if (submitsComposer) pendingTurnAnchors.delete(sessionName);
       await backendSendKey(sessionName, input.key, metadata);
       const capture = await backendCapture(sessionName, 80, metadata);
-      const signals = captureSignals(capture);
+      const observation = await sessionRuntimeObservation(metadata);
+      const signals = signalsWithWorkflowActivity(
+        captureSignals(capture),
+        observation.workflowActivity
+      );
       const afterTranscript = submitsComposer
         ? await sessionTranscriptSnapshot(metadata)
         : null;
@@ -4522,6 +5494,9 @@ server.registerTool(
         status: "sent",
         managedSession: sessionName,
         key: input.key,
+        forceUsed: Boolean(
+          input.force && submitsComposer && beforeSignals.workflowPending
+        ),
         submitted: turnStarted,
         waitAfterCursor: submitsComposer
           ? waitAfterCursor(
@@ -4532,7 +5507,12 @@ server.registerTool(
           : undefined,
         capture,
         signals,
-        posture: await managedPostureReport(sessionName, signals, metadata),
+        posture: await managedPostureReport(
+          sessionName,
+          signals,
+          metadata,
+          observation
+        ),
       });
     });
   }
@@ -4550,6 +5530,10 @@ server.registerTool(
         .string()
         .regex(/^[A-Za-z0-9 _.:@()#-]{1,80}$/)
         .refine((value) => !value.startsWith("-"), "Session title cannot begin with '-'."),
+      force: z
+        .boolean()
+        .default(false)
+        .describe("Bypass only the pending-workflow rename gate after inspecting the session."),
     },
   },
   async (input) => {
@@ -4571,11 +5555,16 @@ server.registerTool(
         });
       }
       const before = await backendCapture(sessionName, 100, metadata);
-      const beforeSignals = captureSignals(before);
-      if (beforeSignals.state !== "idle") {
+      const beforeObservation = await sessionRuntimeObservation(metadata);
+      const beforeSignals = signalsWithWorkflowActivity(
+        captureSignals(before),
+        beforeObservation.workflowActivity
+      );
+      const renameBlockReason = lifecycleBlockReason(beforeSignals);
+      if (renameBlockReason && !(input.force && renameBlockReason === "workflow_pending")) {
         return text({
           status: "rename_blocked",
-          reason: beforeSignals.state,
+          reason: renameBlockReason,
           managedSession: sessionName,
           resolvedSessionId: metadata.resolvedSessionId,
           capture: before,
@@ -4600,7 +5589,11 @@ server.registerTool(
         await sleep(200);
       }
       const capture = await backendCapture(sessionName, 100, metadata);
-      const signals = captureSignals(capture);
+      const observation = await sessionRuntimeObservation(metadata);
+      const signals = signalsWithWorkflowActivity(
+        captureSignals(capture),
+        observation.workflowActivity
+      );
       return text({
         status: observed.title === input.title ? "renamed" : "rename_unverified",
         managedSession: sessionName,
@@ -4608,6 +5601,9 @@ server.registerTool(
         requestedTitle: input.title,
         observedTitle: observed.title,
         titleSource: observed.titleSource,
+        forceUsed: Boolean(
+          input.force && renameBlockReason === "workflow_pending"
+        ),
         capture,
         signals,
       });
@@ -4732,7 +5728,12 @@ server.registerTool(
         }
         throw error;
       }
-      const signals = captureSignals(capture);
+      const metadata = await backendLaunchMetadata(sessionName);
+      const observation = await sessionRuntimeObservation(metadata);
+      const signals = signalsWithWorkflowActivity(
+        captureSignals(capture),
+        observation.workflowActivity
+      );
       if (signals.state === "exited") {
         return text(
           await backendStopUnlocked(sessionName, {
@@ -4741,22 +5742,28 @@ server.registerTool(
           })
         );
       }
-      if (!input.force && signals.state !== "idle") {
+      const stopBlockReason = lifecycleBlockReason(signals);
+      if (!input.force && stopBlockReason) {
         return text({
           status: "stop_blocked",
-          reason: signals.state,
+          reason: stopBlockReason,
           managedSession: sessionName,
           capture,
           signals,
           note: "Claude is not idle. Wait for the turn or attention state to clear, or retry with force=true.",
         });
       }
-      return text(
-        await backendStopUnlocked(sessionName, {
-          graceful: input.graceful && signals.state === "idle",
+      const stopped = await backendStopUnlocked(sessionName, {
+          graceful: input.graceful && !stopBlockReason,
           force: input.force,
-        })
-      );
+        });
+      return text({
+        ...stopped,
+        forceUsed: Boolean(input.force && stopBlockReason),
+        workflowInterrupted: Boolean(
+          input.force && signals.workflowPending
+        ),
+      });
     });
   }
 );
@@ -4765,7 +5772,7 @@ server.registerTool(
   "get_claude_capabilities",
   {
     description:
-      "Inspect the installed Claude CLI with bounded version/help probes without starting an interactive session. Reports advertised and experimental request paths; terminal capture cannot authenticate effective runtime posture.",
+      "Inspect the installed Claude CLI with bounded version, help, and UltraCode parser probes without starting an interactive session. Reports capability provenance and MCP-process environment blockers separately from runtime evidence.",
     inputSchema: {},
   },
   async () => text(await inspectClaudeCapabilities())
@@ -4809,10 +5816,32 @@ server.registerTool(
             session.cwd,
             session.canonicalCwd
           );
-          const { canonicalCwd: _canonicalCwd, ...publicSession } = session;
+          const {
+            canonicalCwd: _canonicalCwd,
+            observedPosture: _legacyObservedPosture,
+            ...publicSession
+          } = session;
+          let workflowActivity = emptyWorkflowActivity();
+          let workflowObservationStatus = "not_observed";
+          try {
+            workflowActivity = (
+              await sessionRuntimeObservation({ ...session, cwd })
+            ).workflowActivity;
+            workflowObservationStatus = workflowActivity.evidence
+              ? "observed"
+              : "not_observed";
+          } catch {
+            workflowObservationStatus = "unavailable";
+          }
           managedSessions.push({
             ...publicSession,
             cwd,
+            workflowActivity,
+            workflowPending:
+              workflowObservationStatus === "unavailable"
+                ? null
+                : workflowActivity.pendingCount > 0,
+            workflowObservationStatus,
           });
         } catch {
           try {
@@ -4835,7 +5864,30 @@ server.registerTool(
         }
       }
     } else {
-      managedSessions = await tmuxManagedSessions();
+      managedSessions = [];
+      for (const session of await tmuxManagedSessions()) {
+        let workflowActivity = emptyWorkflowActivity();
+        let workflowObservationStatus = "not_observed";
+        try {
+          workflowActivity = (
+            await sessionRuntimeObservation(session)
+          ).workflowActivity;
+          workflowObservationStatus = workflowActivity.evidence
+            ? "observed"
+            : "not_observed";
+        } catch {
+          workflowObservationStatus = "unavailable";
+        }
+        managedSessions.push({
+          ...session,
+          workflowActivity,
+          workflowPending:
+            workflowObservationStatus === "unavailable"
+              ? null
+              : workflowActivity.pendingCount > 0,
+          workflowObservationStatus,
+        });
+      }
     }
     return text({
       platform: process.platform,

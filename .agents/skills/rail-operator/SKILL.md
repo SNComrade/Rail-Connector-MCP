@@ -25,6 +25,15 @@ task project as `cwd`, even when this skill is loaded from the MCP repo.
 - Claude spinner phrases are variable. Trust the returned structured state,
   completion ordering, and transcript cursor rather than matching a particular
   phrase.
+- Treat `workflowPending: true` as busy even when the composer appears idle.
+  The MCP combines the exact dynamic-workflow wait control line with sanitized
+  session-log task lifecycle evidence and blocks submit, low-level text/Enter,
+  rename, replacement, and ordinary stop with reason `workflow_pending`.
+- Treat `C-m`, `C-j`, `KPEnter`, and other documented Enter equivalents as
+  submissions. They use the same pending-workflow gate as `Enter` and `Return`.
+- Do not infer workflow completion from a final assistant record alone. Keep
+  waiting until `workflowPending` clears, handle a bounded timeout, or inspect
+  and deliberately authorize a force action.
 - Treat `tool_use` as in progress. Check `textTruncated` before assuming a large
   report was returned in full.
 - Never type over a busy or non-empty composer unless the user deliberately
@@ -57,14 +66,30 @@ bypass authorization from workspace trust or team size.
 
 When the user explicitly asks for Ultracode:
 
-1. Pass `ultracode: true`.
-2. Pass `confirmUltracode: true`.
+1. Confirm `ultracode.argumentProbe`, `capabilityStatus`, `supportSource`, and
+   `environment`. Probe acceptance requires a zero exit for UltraCode and a
+   nonzero invalid control; timeout or termination is inconclusive. A blocking
+   process override must be corrected before launch.
+2. Pass `ultracode: true` and `confirmUltracode: true`.
 3. Omit ordinary `effort` and `safeMode`.
-4. Inspect requested, resolved, and observed posture. Current supported Claude
-   builds use direct `--effort=ultracode`.
+4. Inspect `posture.ultracodeAssessment` after start and after the turn. Current
+   supported Claude builds use direct `--effort=ultracode`. Compare the
+   persisted `launchEnvironment` with `currentMcpEnvironment`; after a refresh,
+   the latter is diagnostics for the new MCP process, not retroactive launch
+   evidence for the existing Claude child.
 
 Do not claim an unobserved posture is confirmed. Use each field's evidence
-source; session-log evidence is stronger than terminal heuristics.
+source; session-log evidence is stronger than terminal heuristics. `xhigh` is
+consistent with Ultracode but does not prove workflow orchestration. Claude's
+Remote Control web UI can label the underlying `xhigh` level as `Extra` while
+Ultracode is active. A session-bound web `Extra` is compatible UI presentation,
+not confirmation, conflict, or workflow evidence; context-free terminal text
+must remain unmapped. Any bound effort other than `xhigh` or `ultracode`, such
+as `high` or `max`, is a conflict to investigate. On an idle, empty composer,
+`/effort ultracode` returning the explicit UltraCode setting is current-setting
+evidence, but the command can change posture and does not prove launch
+provenance. A trivial turn cannot validate dynamic workflows. Bind visual
+comparisons to the same managed name, conversation UUID, generation, and time.
 
 ## Workflow
 
@@ -83,11 +108,25 @@ source; session-log evidence is stronger than terminal heuristics.
    `waitAfterCursor` verbatim. Handle `needs_attention` before sending more
    work. A `completed` result may also carry an additive `attention` warning;
    report or resolve it without discarding the completed answer.
+   `workflow_pending` keeps the wait active even if a terminal assistant record
+   has already appeared.
 6. **Manage.** Rename only while idle. Archive/unarchive by UUID; those tools
-   only change the MCP-local catalog, never Claude's transcript.
-7. **Finish.** Gracefully stop only an idle session created by this workflow,
-   unless the user explicitly asks to stop or retain another known session. Report the managed name and running state. Disclose a
-   Remote Control URL only when requested or necessary.
+   only change the MCP-local catalog, never Claude's transcript. If an
+   interrupted workflow leaves stale pending evidence, inspect first; text,
+   Enter-equivalent key, rename, submit, replacement, and stop tools expose
+   explicit force recovery. Report `forceUsed`, `replacementForceUsed`, or
+   `workflowInterrupted` rather than hiding the override. For forced prompt
+   submission, also report `forcedPastReason`. Native Windows rejects
+   unsupported key names with `EINVAL`; never retry by sending the key name as
+   text.
+7. **Finish.** Gracefully stop only an idle session created by this workflow
+   with an empty composer, unless the user explicitly asks to stop or retain
+   another known session. If stop reports
+   `awaiting_input`, preserve the draft: submit it only with authorization,
+   explicitly discard and recapture only with authorization, or leave the
+   session running. Never force-stop an unsent draft as routine cleanup. Report
+   the managed name and running state. Disclose a Remote Control URL only when
+   requested or necessary.
 
 Read [operator-playbook.md](references/operator-playbook.md) for exact call
 recipes and recovery paths.

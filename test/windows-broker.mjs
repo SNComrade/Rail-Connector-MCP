@@ -29,6 +29,15 @@ process.env.RAIL_CONNECTOR_CLAUDE_PATH = process.execPath;
 const sessionName = `broker_test_${process.pid}`;
 const tokenA = "a".repeat(64);
 const tokenB = "b".repeat(64);
+const launchEnvironment = {
+  status: "compatible",
+  evidenceScope: "claude_child_launch_environment",
+  effortOverrideStatus: "compatible_xhigh",
+  workflowsDisabled: false,
+  blockers: [],
+  note: "This caller-provided note must not be trusted.",
+  rawValue: "private-launch-value-must-not-persist",
+};
 const pipeA = windowsBrokerPaths(
   { ...process.env, RAIL_CONNECTOR_STATE_DIR: stateDir },
   tokenA
@@ -125,6 +134,24 @@ try {
     }),
     (error) => error?.code === "ECWDPROVENANCE"
   );
+  await assert.rejects(
+    windowsBrokerRequest("start", {
+      sessionName: `${sessionName}_launch_env_rejected`,
+      command: process.execPath,
+      args: [fixture],
+      metadataCommand: process.execPath,
+      metadataArgs: [fixture],
+      cwd: repoRoot,
+      canonicalCwd: canonicalRepoRoot,
+      env: { ...process.env },
+      launchEnvironment: {
+        ...launchEnvironment,
+        status: "blocking",
+      },
+      leaseId: "rejected-launch-env-lease",
+    }),
+    (error) => error?.code === "ELAUNCHENV"
+  );
 
   const started = await windowsBrokerRequest("start", {
     sessionName,
@@ -137,11 +164,24 @@ try {
     env: { ...process.env },
     requestedPosture: { permissionMode: "default" },
     resolvedPosture: { permissionMode: "manual" },
+    launchEnvironment,
     resolvedSessionId: "33333333-3333-4333-8333-333333333333",
     leaseId: "startup-lease",
     leaseTtlMs: 10000,
   });
   assert.equal(started.status, "started");
+  assert.deepEqual(started.metadata.launchEnvironment, {
+    status: "compatible",
+    evidenceScope: "claude_child_launch_environment",
+    effortOverrideStatus: "compatible_xhigh",
+    workflowsDisabled: false,
+    blockers: [],
+    note: "No blocking UltraCode override was present in the captured Claude child launch environment. Claude settings can still differ.",
+  });
+  assert.doesNotMatch(
+    JSON.stringify(started.metadata),
+    /private-launch-value-must-not-persist/
+  );
   activeGenerationId = started.metadata.generationId;
   assert.match(activeGenerationId, /^[0-9a-f-]{36}$/i);
   assert.match(await waitForCapture(/Fake Claude TUI/), /Fake Claude TUI/);
@@ -219,6 +259,32 @@ try {
   assert.equal(sent.bracketedPasteRequested, true);
   assert.equal(sent.bracketedPasteUsed, true);
   assert.match(await waitForCapture(/ACK:broker prompt/), /ACK:broker prompt/);
+  await windowsBrokerRequest("sendText", {
+    sessionName,
+    text: "broker key alias",
+    submit: false,
+    leaseId: firstLease,
+    expectedGenerationId: activeGenerationId,
+  });
+  await windowsBrokerRequest("sendKey", {
+    sessionName,
+    key: "KPEnter",
+    leaseId: firstLease,
+    expectedGenerationId: activeGenerationId,
+  });
+  assert.match(
+    await waitForCapture(/ACK:broker key alias/),
+    /ACK:broker key alias/
+  );
+  await assert.rejects(
+    windowsBrokerRequest("sendKey", {
+      sessionName,
+      key: "UnsupportedKey",
+      leaseId: firstLease,
+      expectedGenerationId: activeGenerationId,
+    }),
+    (error) => error?.code === "EINVAL"
+  );
   const boundedDelayStartedAt = Date.now();
   await windowsBrokerRequest("sendText", {
     sessionName,

@@ -140,6 +140,23 @@ requests when the lease is absent, expired, or belongs to another MCP client.
 This prevents accidental mixed prompts; it does not decide which agent's
 request is semantically correct.
 
+The mutation lease covers one MCP operation, not the full duration of a Claude
+dynamic workflow. Before submitting text or Enter, renaming, replacing, or
+stopping, the MCP therefore recomputes sanitized workflow activity from the
+bound session log and combines it with Claude's exact terminal wait control
+line. A positive result blocks the operation with `workflow_pending` unless the
+operation exposes and receives an explicit force choice. A
+workflow task ID is retained only inside the process-local reducer so a later
+matching terminal retrieval can clear the pending count; IDs and workflow names
+are never returned. Unidentified launches remain counted when an identified
+peer completes, and a bound interruption or explicit zero count clears the
+tracked set. Enter-equivalent aliases such as `C-m` and `C-j` use the same gate.
+A session-log read error fails the mutation instead of silently treating the
+session as idle. An absent or not-yet-bound log is reported as not observed and
+leaves the terminal signal as the available lifecycle evidence. Explicit force
+recovery is machine-readable in stop, replacement, text, key, and rename
+results.
+
 Linux/macOS uses validated tmux ownership metadata and refuses to control an
 unmanaged same-name session or one whose pane identity changed. Metadata
 updates compare the launch generation and target the original pane rather than
@@ -162,10 +179,38 @@ Responses separate:
 Do not report an unobserved field as confirmed. Session-log evidence is stronger
 than terminal heuristics, but neither is an authenticated Anthropic control
 plane. When Claude records `xhigh` for a successfully resolved direct
-`--effort=ultracode` launch, the MCP identifies that correlation explicitly
-rather than presenting the launch request alone as runtime observation.
-Terminal-only posture heuristics are returned for the current capture but are
-not persisted as durable observation. When a JSONL record contains both
+`--effort=ultracode` launch, the MCP reports the correlation as unconfirmed.
+It reports only sanitized successful local-workflow launch evidence or a
+positive pending count and does not attribute a workflow trigger when the log
+cannot prove one. Failed, cancelled, rejected, and unknown workflow statuses
+do not become successful launch evidence.
+Current session-log evidence is recomputed for each posture report so stale
+persisted correlation cannot hide a newer conflict. The MCP incrementally
+reduces the complete append-only log for each bound launch, so direct evidence
+does not disappear when a conversation grows beyond the transcript tail
+window. This cache is process-local, bounded, and reset when the log is
+replaced or truncated; it is not broker or tmux posture persistence.
+Terminal-only posture
+heuristics are returned for the current capture but are not persisted as
+durable observation. Legacy broker or tmux `observedPosture` metadata remains
+read-compatible for migration but is excluded from public lifecycle responses.
+Environment diagnostics return sanitized categories and blocker names, never
+the raw effort override value. New managed launches persist those sanitized
+categories as `launchEnvironment`; posture reports show that snapshot
+separately from `currentMcpEnvironment` after an MCP refresh. Linux/macOS tmux
+launches explicitly set `CLAUDE_CONFIG_DIR`, the two UltraCode-relevant Claude
+environment variables, and `FORCE_COLOR` for the child instead of trusting a
+possibly older tmux-server copy. No raw value is added to public posture or
+managed metadata.
+
+Capability inspection calibrates the requested UltraCode parser probe against
+an invalid control by process exit status. Timeout and signal termination are
+inconclusive, and stderr text is corroboration rather than authority. Results
+are cached for no more than 60 seconds per resolved executable/file identity
+and sanitized process posture, preventing repeated probe storms without
+surviving an MCP process restart.
+
+When a JSONL record contains both
 `sessionId` and legacy `session_id`, the top-level `sessionId` is authoritative;
 the legacy field is used only when the top-level field is absent. Sidechain
 records are excluded from the main transcript and runtime-posture observation.

@@ -49,7 +49,16 @@ try {
     "unarchive_claude_session",
     "wait_for_claude_turn",
   ]);
-  assert.match(tools.tools.find((tool) => tool.name === "send_text").description, /multi-line prompts use submit_prompt/);
+  const sendTextTool = tools.tools.find((tool) => tool.name === "send_text");
+  assert.match(sendTextTool.description, /multi-line prompts use submit_prompt/);
+  assert.ok(sendTextTool.inputSchema.properties.force);
+  assert.ok(
+    tools.tools.find((tool) => tool.name === "send_key").inputSchema.properties.force
+  );
+  assert.ok(
+    tools.tools.find((tool) => tool.name === "rename_claude_session")
+      .inputSchema.properties.force
+  );
   const startTool = tools.tools.find((tool) => tool.name === "start_remote_control");
   assert.ok(startTool.inputSchema.properties.ultracode);
   assert.ok(startTool.inputSchema.properties.confirmUltracode);
