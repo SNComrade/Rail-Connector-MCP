@@ -38,6 +38,8 @@ Semantic Versioning after the first stable release.
 - Stale or cross-generation waits fail closed instead of returning an older turn
 - Junction and symlink project paths bind to Claude's canonical session-log
   directory
+- Claude `--effort` rejection diagnostics are parsed linearly instead of with
+  unbounded regular expressions over CLI output
 - Unsupported native-Windows key names return `EINVAL` instead of being typed
   into Claude's composer
 - Forced `submit_prompt` calls report both `forceUsed` and `forcedPastReason`

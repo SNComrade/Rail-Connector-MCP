@@ -154,6 +154,33 @@ assert.equal(
   false
 );
 
+const adversarialPrefix = "invalid --effort value ".repeat(100_000);
+const adversarialControlPrefix = "unsupported --effort value ".repeat(100_000);
+const adversarialDiagnostics = parseClaudeCapabilities(
+  "2.1.234 (Claude Code)\n",
+  help,
+  "claude.exe",
+  {
+    attempted: true,
+    succeeded: true,
+    exitCode: 0,
+    stderr: `ultracode ${adversarialPrefix}other`,
+    controlAttempted: true,
+    controlSucceeded: false,
+    controlExitCode: 64,
+    controlStderr: `rail-invalid-probe ${adversarialControlPrefix}other`,
+  }
+);
+assert.equal(adversarialDiagnostics.ultracode.argumentProbe.accepted, true);
+assert.equal(
+  adversarialDiagnostics.ultracode.argumentProbe.rejectionTextMatched,
+  false
+);
+assert.equal(
+  adversarialDiagnostics.ultracode.argumentProbe.controlRejectionTextMatched,
+  false
+);
+
 for (const excludedProbe of [
   { timedOut: true },
   { terminated: true, signal: "SIGTERM" },

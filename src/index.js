@@ -3867,6 +3867,67 @@ function probeExitOutcome(probe, prefix = "") {
   };
 }
 
+function skipCliWhitespace(text, index) {
+  while (index < text.length) {
+    const code = text.charCodeAt(index);
+    if (code !== 0x20 && (code < 0x09 || code > 0x0d)) break;
+    index += 1;
+  }
+  return index;
+}
+
+function effortRejectionTextMatches(text, requestedValue) {
+  const normalizedText = String(text).toLowerCase();
+  const normalizedValue = requestedValue.toLowerCase();
+  const rejectionWords = ["unknown", "invalid", "unsupported"];
+  let lineStart = 0;
+
+  while (lineStart < normalizedText.length) {
+    let lineEnd = lineStart;
+    while (lineEnd < normalizedText.length) {
+      const code = normalizedText.charCodeAt(lineEnd);
+      if (code === 0x0a || code === 0x0d) break;
+      lineEnd += 1;
+    }
+
+    const line = normalizedText.slice(lineStart, lineEnd);
+    const lastRequestedValue = line.lastIndexOf(normalizedValue);
+    if (lastRequestedValue >= 0) {
+      for (const rejectionWord of rejectionWords) {
+        let wordIndex = line.indexOf(rejectionWord);
+        while (wordIndex >= 0) {
+          const afterWord = wordIndex + rejectionWord.length;
+          const effortIndex = skipCliWhitespace(line, afterWord);
+          if (
+            effortIndex > afterWord &&
+            line.startsWith("--effort", effortIndex)
+          ) {
+            const afterEffort = effortIndex + "--effort".length;
+            const valueIndex = skipCliWhitespace(line, afterEffort);
+            if (
+              valueIndex > afterEffort &&
+              line.startsWith("value", valueIndex) &&
+              lastRequestedValue >= valueIndex + "value".length
+            ) {
+              return true;
+            }
+          }
+          wordIndex = line.indexOf(rejectionWord, afterWord);
+        }
+      }
+    }
+
+    while (lineEnd < normalizedText.length) {
+      const code = normalizedText.charCodeAt(lineEnd);
+      if (code !== 0x0a && code !== 0x0d) break;
+      lineEnd += 1;
+    }
+    lineStart = lineEnd;
+  }
+
+  return false;
+}
+
 function ultracodeProbeStatus(probe = {}) {
   const attempted = probe.attempted === true;
   const output = [probe.stdout, probe.stderr, probe.error]
@@ -3877,14 +3938,11 @@ function ultracodeProbeStatus(probe = {}) {
     .join("\n");
   const validOutcome = probeExitOutcome(probe);
   const controlOutcome = probeExitOutcome(probe, "control");
-  const rejectionTextMatched =
-    /(?:unknown|invalid|unsupported)\s+--effort\s+value[^\r\n]*ultracode/i.test(
-      output
-    );
-  const controlRejectionTextMatched =
-    /(?:unknown|invalid|unsupported)\s+--effort\s+value[^\r\n]*rail-invalid-probe/i.test(
-      controlOutput
-    );
+  const rejectionTextMatched = effortRejectionTextMatches(output, "ultracode");
+  const controlRejectionTextMatched = effortRejectionTextMatches(
+    controlOutput,
+    "rail-invalid-probe"
+  );
   const rejected = validOutcome.rejected;
   const controlAttempted = controlOutcome.attempted;
   const controlRejected = controlOutcome.rejected;
