@@ -31,6 +31,10 @@ Semantic Versioning after the first stable release.
   transcript-wait, cleanup, and evidence-reporting contracts
 - Windows broker compatibility advanced for stricter launch provenance and key
   transport behavior
+- Linux and macOS now require tmux 3.2 or newer so per-session child
+  environments can use the isolated `new-session -e` transport
+- Cold runtime-observation reads now use a bounded head/tail window before
+  continuing incrementally and report when middle bytes were skipped
 
 ### Fixed
 
@@ -43,6 +47,17 @@ Semantic Versioning after the first stable release.
 - Unsupported native-Windows key names return `EINVAL` instead of being typed
   into Claude's composer
 - Forced `submit_prompt` calls report both `forceUsed` and `forcedPastReason`
+- Non-parser CLI failures no longer masquerade as calibrated UltraCode argument
+  rejection
+- Invalid Windows launch metadata is rejected before a PTY can be spawned, and
+  equivalent blocker sets are canonicalized independent of caller ordering
+- Reconnecting to an existing session no longer applies current MCP
+  environment blockers that could not have affected the persisted child
+- Workflow-only forced rename no longer bypasses a simultaneous approval,
+  trust, draft, busy, or other terminal attention state
+- Completed workflow state no longer retains pending-only evidence fields, and
+  symlinked fixture paths use the same canonical project directory as runtime
+  observation
 
 ### Security
 

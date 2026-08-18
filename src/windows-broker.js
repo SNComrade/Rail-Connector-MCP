@@ -234,7 +234,7 @@ function validatedLaunchEnvironment(value) {
     evidenceScope: "claude_child_launch_environment",
     effortOverrideStatus: value.effortOverrideStatus,
     workflowsDisabled: value.workflowsDisabled,
-    blockers: [...new Set(value.blockers)],
+    blockers: [...new Set(value.blockers)].sort(),
     note:
       value.status === "blocking"
         ? "The captured Claude child launch environment contains an override that prevents the requested UltraCode workflow posture."
@@ -473,6 +473,7 @@ async function startSession(
     throw error;
   }
   const { requestedCwd, canonicalCwd } = launchCwd;
+  const launchEnvironment = validatedLaunchEnvironment(payload.launchEnvironment);
   const renderer = createTerminalRenderer({
     cols: clampInteger(payload.cols, 140, 40, 400),
     rows: clampInteger(payload.rows, 40, 10, 200),
@@ -507,7 +508,7 @@ async function startSession(
     args: launch.metadataArgs,
     requestedPosture: payload.requestedPosture ?? null,
     resolvedPosture: payload.resolvedPosture ?? null,
-    launchEnvironment: validatedLaunchEnvironment(payload.launchEnvironment),
+    launchEnvironment,
     resolvedSessionId: payload.resolvedSessionId ?? null,
     observedPosture: payload.observedPosture ?? null,
     lease: {

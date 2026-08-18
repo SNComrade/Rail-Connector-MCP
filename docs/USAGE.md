@@ -287,6 +287,17 @@ not exposed through these fields. A later matching task result, explicit zero
 counter, bound interruption record, or newer terminal completion marker
 releases its corresponding session-log or terminal evidence. An unidentified
 launch remains fail-closed until one of those explicit release events arrives.
+`workflowPendingEvidence` and `workflowPendingObservedAt` are empty whenever no
+workflow is currently pending. `terminalState` preserves a simultaneous
+approval, trust, draft, or other terminal state so workflow-only force controls
+cannot bypass it.
+
+The first session-log observation is bounded. Small logs are read fully; large
+logs use a 256 KiB head plus a 2 MiB tail and then continue incrementally from
+that checkpoint. `workflowObservationCoverage` reports `full`, `head_tail`, or
+`none`, and `workflowObservationSkippedBytes` reports any skipped middle bytes.
+When the middle was skipped, workflow state is rebuilt only from the recent
+tail so old head records cannot masquerade as current pending work.
 
 Use `waitAfterCursor` returned by `submit_prompt` when waiting:
 

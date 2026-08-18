@@ -48,6 +48,7 @@ const ULTRACODE_DIRECT_VERSION_FLOOR = [2, 1, 203];
 const ULTRACODE_DOCUMENTATION_URL =
   "https://code.claude.com/docs/en/settings#available-settings";
 const TMUX_LAUNCH_METADATA_OPTION = "@rail_connector_launch";
+const MIN_TMUX_VERSION = [3, 2];
 const ALLOWED_ROOTS_ENV = "RAIL_CONNECTOR_ALLOWED_ROOTS";
 const CLAUDE_COMMAND_ENV = "RAIL_CONNECTOR_CLAUDE_PATH";
 const TMUX_COMMAND_ENV = "RAIL_CONNECTOR_TMUX_PATH";
@@ -1614,6 +1615,45 @@ async function tmux(args, options = {}) {
   }
 }
 
+export function tmuxVersionStatus(output) {
+  const raw = String(output ?? "").trim();
+  const match = /^tmux\s+(\d+)\.(\d+)/i.exec(raw);
+  if (!match) {
+    return {
+      raw,
+      detectedVersion: "",
+      minimumVersion: MIN_TMUX_VERSION.join("."),
+      supported: false,
+      reason: "unrecognized_version",
+    };
+  }
+  const version = [Number(match[1]), Number(match[2])];
+  const supported =
+    version[0] > MIN_TMUX_VERSION[0] ||
+    (version[0] === MIN_TMUX_VERSION[0] && version[1] >= MIN_TMUX_VERSION[1]);
+  return {
+    raw,
+    detectedVersion: version.join("."),
+    minimumVersion: MIN_TMUX_VERSION.join("."),
+    supported,
+    reason: supported ? "" : "version_too_old",
+  };
+}
+
+async function requireSupportedTmuxVersion() {
+  const result = await tmux(["-V"], { timeoutMs: 5000 });
+  if (!result.ok) {
+    throw new Error(result.stderr || "Unable to inspect the installed tmux version.");
+  }
+  const status = tmuxVersionStatus(result.stdout);
+  if (!status.supported) {
+    throw new Error(
+      `tmux ${status.minimumVersion} or newer is required for isolated per-session launch environments; detected ${status.detectedVersion || status.raw || "an unrecognized version"}.`
+    );
+  }
+  return status;
+}
+
 async function tmuxWithInput(args, input, options = {}) {
   return new Promise((resolve) => {
     let child;
@@ -2437,13 +2477,15 @@ function activeTuiControlRegion(capture, lines = 80) {
   return phaseBoundary >= 0 ? recent.slice(phaseBoundary) : recent;
 }
 
-function likelyBusyFromCapture(capture) {
+function likelyBusyFromCapture(capture, { includeWorkflow = true } = {}) {
   const signalCapture = captureWithoutPromptText(capture);
   const busyIndex = Math.max(
     lastMatchIndex(signalCapture, BUSY_CAPTURE_MATCH_RE),
     lastMatchIndex(signalCapture, BUSY_STATUS_LINE_MATCH_RE),
     lastMatchIndex(signalCapture, BUSY_TIMED_STATUS_LINE_MATCH_RE),
-    lastMatchIndex(signalCapture, DYNAMIC_WORKFLOW_WAIT_MATCH_RE)
+    includeWorkflow
+      ? lastMatchIndex(signalCapture, DYNAMIC_WORKFLOW_WAIT_MATCH_RE)
+      : -1
   );
   if (busyIndex === -1) return false;
 
@@ -2551,6 +2593,9 @@ function effortEventFromCapture(capture) {
 export function captureSignals(capture) {
   const recentCapture = lastLines(capture, 80);
   const likelyBusy = likelyBusyFromCapture(recentCapture);
+  const terminalBusy = likelyBusyFromCapture(recentCapture, {
+    includeWorkflow: false,
+  });
   const terminalWorkflowActivity = terminalWorkflowActivityFromCapture(recentCapture);
   const sessionLimitWarning = sessionLimitWarningFromCapture(capture);
   const approvalRequired = approvalRequiredFromCapture(capture);
@@ -2564,15 +2609,16 @@ export function captureSignals(capture) {
   const permissionModeIndicator = permissionModeFromCapture(capture);
   const activeInputHasText = activeInputFirstLine(capture).trim().length > 0;
   const exited = /^\[managed session exited,/m.test(capture);
-  let state = "idle";
-  if (exited) state = "exited";
-  else if (approvalRequired) state = "approval_required";
-  else if (interruptedPrompt) state = "interrupted";
-  else if (workspaceTrustPrompt) state = "workspace_trust_required";
-  else if (sessionLimitWarning) state = "limit_warning";
-  else if (pastePlaceholder) state = "paste_pending";
-  else if (activeInputHasText) state = "awaiting_input";
-  else if (likelyBusy) state = "busy";
+  let terminalState = "idle";
+  if (exited) terminalState = "exited";
+  else if (approvalRequired) terminalState = "approval_required";
+  else if (interruptedPrompt) terminalState = "interrupted";
+  else if (workspaceTrustPrompt) terminalState = "workspace_trust_required";
+  else if (sessionLimitWarning) terminalState = "limit_warning";
+  else if (pastePlaceholder) terminalState = "paste_pending";
+  else if (activeInputHasText) terminalState = "awaiting_input";
+  else if (terminalBusy) terminalState = "busy";
+  const state = terminalState === "idle" && likelyBusy ? "busy" : terminalState;
   return {
     remoteUrl: remoteUrlFromCapture(capture),
     likelyBusy,
@@ -2592,6 +2638,7 @@ export function captureSignals(capture) {
     workflowPendingCount: terminalWorkflowActivity.pendingCount,
     workflowPendingEvidence: terminalWorkflowActivity.evidence,
     workflowPendingObservedAt: "",
+    terminalState,
     state,
   };
 }
@@ -2608,9 +2655,7 @@ export function signalsWithWorkflowActivity(signals = {}, workflowActivity = {})
     ? workflowActivity.evidence || "claude_session_log"
     : terminalPending
       ? signals.workflowPendingEvidence || "terminal_heuristic"
-      : logPendingCount !== null
-        ? workflowActivity.evidence || "claude_session_log"
-        : "";
+      : "";
   const workflowPendingCount = logPending
     ? logPendingCount
     : terminalPending
@@ -2622,9 +2667,21 @@ export function signalsWithWorkflowActivity(signals = {}, workflowActivity = {})
     workflowPending,
     workflowPendingCount,
     workflowPendingEvidence,
-    workflowPendingObservedAt: logPendingCount !== null
-      ? workflowActivity.pendingObservedAt || workflowActivity.lastObservedAt || ""
-      : signals.workflowPendingObservedAt || "",
+    workflowPendingObservedAt: workflowPending
+      ? logPending
+        ? workflowActivity.pendingObservedAt || workflowActivity.lastObservedAt || ""
+        : signals.workflowPendingObservedAt || ""
+      : "",
+    workflowObservationCoverage:
+      workflowActivity.observationCoverage ||
+      signals.workflowObservationCoverage ||
+      "none",
+    workflowObservationSkippedBytes: Number.isInteger(
+      workflowActivity.observationSkippedBytes
+    )
+      ? workflowActivity.observationSkippedBytes
+      : signals.workflowObservationSkippedBytes ?? 0,
+    terminalState: signals.terminalState || baseState,
     state:
       workflowPending && baseState === "idle"
         ? "busy"
@@ -2865,8 +2922,9 @@ export function submitPreflightReason(signals) {
 }
 
 export function lifecycleBlockReason(signals) {
-  if (signals.workflowPending) return "workflow_pending";
-  return signals.state === "idle" ? "" : signals.state;
+  const terminalState = signals.terminalState || signals.state || "idle";
+  if (terminalState !== "idle") return terminalState;
+  return signals.workflowPending ? "workflow_pending" : "";
 }
 
 export function submitResultStatus(signals, capture, promptText, { wasBusyBeforeSubmit = false } = {}) {
@@ -3243,7 +3301,10 @@ function addRuntimeObservationRecord(state, record, metadata = {}) {
   addSessionRecord(state, record, metadata?.resolvedSessionId, false);
 }
 
-function runtimeObservationFromState(state) {
+function runtimeObservationFromState(
+  state,
+  { coverage = "full", skippedBytes = 0 } = {}
+) {
   const ultracodeObserved = state.effort === "ultracode" ? true : null;
   const workflowActivityObserved =
     state.workflowLaunchObserved || state.pendingWorkflowCount !== null;
@@ -3271,6 +3332,8 @@ function runtimeObservationFromState(state) {
         state.pendingWorkflowUpdatedAt || state.workflowLaunchUpdatedAt || "",
       evidence: workflowActivityObserved ? "claude_session_log" : "",
       triggerAttribution: "unknown",
+      observationCoverage: coverage,
+      observationSkippedBytes: skippedBytes,
     },
     evidence: {
       permissionMode: state.permissionMode ? "claude_session_log" : "",
@@ -3285,6 +3348,10 @@ const runtimeObservationCache = new Map();
 const runtimeObservationLoads = new Map();
 const MAX_RUNTIME_OBSERVATION_CACHE_ENTRIES = 128;
 const RUNTIME_OBSERVATION_READ_BYTES = 256 * 1024;
+const RUNTIME_OBSERVATION_HEAD_BYTES = 256 * 1024;
+const RUNTIME_OBSERVATION_TAIL_BYTES = 2 * 1024 * 1024;
+const RUNTIME_OBSERVATION_INITIAL_SCAN_BYTES =
+  RUNTIME_OBSERVATION_HEAD_BYTES + RUNTIME_OBSERVATION_TAIL_BYTES;
 
 function runtimeObservationLogFile(metadata) {
   if (!metadata?.cwd || !metadata?.resolvedSessionId) return "";
@@ -3308,7 +3375,45 @@ function newRuntimeObservationCacheEntry(stat) {
     remainder: "",
     decoder: new StringDecoder("utf8"),
     state: createSessionSummaryState(),
+    discardUntilNewline: false,
+    coverage: "full",
+    skippedBytes: 0,
   };
+}
+
+function addRuntimeObservationLines(state, lines, metadata) {
+  for (const line of lines) {
+    if (!line) continue;
+    try {
+      addRuntimeObservationRecord(state, JSON.parse(line), metadata);
+    } catch {
+      // Ignore malformed records without discarding later append-only evidence.
+    }
+  }
+}
+
+function consumeRuntimeObservationText(entry, text, metadata) {
+  let value = entry.remainder + text;
+  entry.remainder = "";
+  if (entry.discardUntilNewline) {
+    const newline = value.indexOf("\n");
+    if (newline < 0) return;
+    value = value.slice(newline + 1);
+    entry.discardUntilNewline = false;
+  }
+  const lines = value.split(/\r?\n/);
+  entry.remainder = lines.pop() ?? "";
+  addRuntimeObservationLines(entry.state, lines, metadata);
+}
+
+function resetRuntimeObservationWorkflowState(state) {
+  state.workflowLaunchObserved = false;
+  state.workflowLaunchStatus = "";
+  state.workflowLaunchUpdatedAt = "";
+  state.pendingWorkflowCount = null;
+  state.pendingWorkflowUpdatedAt = "";
+  state.activeWorkflowTaskIds.clear();
+  state.unidentifiedPendingWorkflowCount = 0;
 }
 
 async function loadRuntimeObservation(metadata, file, key) {
@@ -3316,11 +3421,17 @@ async function loadRuntimeObservation(metadata, file, key) {
   try {
     stat = await fs.promises.lstat(file);
   } catch (error) {
-    if (error.code === "ENOENT") return runtimeObservationFromState(createSessionSummaryState());
+    if (error.code === "ENOENT") {
+      return runtimeObservationFromState(createSessionSummaryState(), {
+        coverage: "none",
+      });
+    }
     throw error;
   }
   if (!stat.isFile() || stat.isSymbolicLink()) {
-    return runtimeObservationFromState(createSessionSummaryState());
+    return runtimeObservationFromState(createSessionSummaryState(), {
+      coverage: "none",
+    });
   }
 
   const fileIdentity = `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
@@ -3336,6 +3447,25 @@ async function loadRuntimeObservation(metadata, file, key) {
   const handle = await fs.promises.open(file, "r");
   try {
     const buffer = Buffer.alloc(RUNTIME_OBSERVATION_READ_BYTES);
+    if (entry.offset === 0 && stat.size > RUNTIME_OBSERVATION_INITIAL_SCAN_BYTES) {
+      const headBytes = Math.min(RUNTIME_OBSERVATION_HEAD_BYTES, stat.size);
+      const headBuffer = Buffer.alloc(headBytes);
+      const headRead = await handle.read(headBuffer, 0, headBytes, 0);
+      const headText = headBuffer.subarray(0, headRead.bytesRead).toString("utf8");
+      const lastNewline = headText.lastIndexOf("\n");
+      if (lastNewline >= 0) {
+        addRuntimeObservationLines(
+          entry.state,
+          headText.slice(0, lastNewline + 1).split(/\r?\n/),
+          metadata
+        );
+      }
+      resetRuntimeObservationWorkflowState(entry.state);
+      entry.offset = Math.max(headRead.bytesRead, stat.size - RUNTIME_OBSERVATION_TAIL_BYTES);
+      entry.discardUntilNewline = entry.offset > headRead.bytesRead;
+      entry.coverage = "head_tail";
+      entry.skippedBytes = Math.max(0, entry.offset - headRead.bytesRead);
+    }
     while (entry.offset < stat.size) {
       const requestedBytes = Math.min(buffer.length, stat.size - entry.offset);
       const { bytesRead } = await handle.read(
@@ -3346,17 +3476,11 @@ async function loadRuntimeObservation(metadata, file, key) {
       );
       if (bytesRead <= 0) break;
       entry.offset += bytesRead;
-      entry.remainder += entry.decoder.write(buffer.subarray(0, bytesRead));
-      const lines = entry.remainder.split(/\r?\n/);
-      entry.remainder = lines.pop() ?? "";
-      for (const line of lines) {
-        if (!line) continue;
-        try {
-          addRuntimeObservationRecord(entry.state, JSON.parse(line), metadata);
-        } catch {
-          // Ignore malformed records without discarding later append-only evidence.
-        }
-      }
+      consumeRuntimeObservationText(
+        entry,
+        entry.decoder.write(buffer.subarray(0, bytesRead)),
+        metadata
+      );
     }
   } finally {
     await handle.close();
@@ -3367,12 +3491,19 @@ async function loadRuntimeObservation(metadata, file, key) {
   while (runtimeObservationCache.size > MAX_RUNTIME_OBSERVATION_CACHE_ENTRIES) {
     runtimeObservationCache.delete(runtimeObservationCache.keys().next().value);
   }
-  return runtimeObservationFromState(entry.state);
+  return runtimeObservationFromState(entry.state, {
+    coverage: entry.coverage,
+    skippedBytes: entry.skippedBytes,
+  });
 }
 
 export async function sessionRuntimeObservation(metadata) {
   const file = runtimeObservationLogFile(metadata);
-  if (!file) return runtimeObservationFromState(createSessionSummaryState());
+  if (!file) {
+    return runtimeObservationFromState(createSessionSummaryState(), {
+      coverage: "none",
+    });
+  }
   const key = runtimeObservationCacheKey(metadata, file);
   const prior = runtimeObservationLoads.get(key) ?? Promise.resolve();
   const current = prior.catch(() => {}).then(() => loadRuntimeObservation(metadata, file, key));
@@ -3943,7 +4074,7 @@ function ultracodeProbeStatus(probe = {}) {
     controlOutput,
     "rail-invalid-probe"
   );
-  const rejected = validOutcome.rejected;
+  const rejected = validOutcome.rejected && rejectionTextMatched;
   const controlAttempted = controlOutcome.attempted;
   const controlRejected = controlOutcome.rejected;
   const accepted = validOutcome.accepted && controlRejected;
@@ -3968,7 +4099,11 @@ function ultracodeProbeStatus(probe = {}) {
     controlTerminated: controlOutcome.terminated,
     rejectionTextMatched,
     controlRejectionTextMatched,
-    evidenceBasis: "exit_status_calibrated",
+    evidenceBasis: accepted
+      ? "exit_status_calibrated"
+      : rejected
+        ? "parser_specific_rejection_text"
+        : "insufficient_calibration",
     result: !attempted
       ? "not_run"
       : excluded
@@ -4316,7 +4451,11 @@ async function inspectClaudeCapabilities(command = resolveClaudeCommand()) {
   return promise;
 }
 
-export function resolveLaunchOptionsFromCapabilities(options, capabilities) {
+export function resolveLaunchOptionsFromCapabilities(
+  options,
+  capabilities,
+  { enforceEnvironmentCompatibility = true } = {}
+) {
   const needsUltracodeInspection = options.ultracode && !options.ultracodeMechanism;
   const needsEffortInspection = Boolean(options.effort);
   if (capabilities.available === false) {
@@ -4324,6 +4463,7 @@ export function resolveLaunchOptionsFromCapabilities(options, capabilities) {
   }
   if (
     needsUltracodeInspection &&
+    enforceEnvironmentCompatibility &&
     capabilities.ultracode?.environment?.status === "blocking"
   ) {
     throw new Error(
@@ -4361,9 +4501,13 @@ export function resolveLaunchOptionsFromCapabilities(options, capabilities) {
   return { ...resolved, ultracodeMechanism };
 }
 
-async function prepareLaunchOptions(options, claudeCommand) {
+async function prepareLaunchOptions(options, claudeCommand, resolveOptions = {}) {
   return {
-    ...resolveLaunchOptionsFromCapabilities(options, await inspectClaudeCapabilities(claudeCommand)),
+    ...resolveLaunchOptionsFromCapabilities(
+      options,
+      await inspectClaudeCapabilities(claudeCommand),
+      resolveOptions
+    ),
     claudeCommand,
   };
 }
@@ -4380,8 +4524,17 @@ async function backendStartUnlocked({
     fs.realpathSync.native?.(resolvedCwd) ?? fs.realpathSync(resolvedCwd);
   assertBypassPolicy(launchOptions.permissionMode);
   const claudeCommand = resolveClaudeCommand();
-  const preparedLaunchOptions = await prepareLaunchOptions(launchOptions, claudeCommand);
   const rawSessionExists = IS_NATIVE_WINDOWS ? await backendExists(sessionName) : await tmuxExists(sessionName);
+  const preparedLaunchOptions = await prepareLaunchOptions(
+    launchOptions,
+    claudeCommand,
+    {
+      enforceEnvironmentCompatibility: !rawSessionExists || killExisting,
+    }
+  );
+  if (!IS_NATIVE_WINDOWS && (!rawSessionExists || killExisting)) {
+    await requireSupportedTmuxVersion();
+  }
   let windowsReplacement = null;
   let replacementAudit = {
     forceUsed: false,
@@ -5851,6 +6004,9 @@ server.registerTool(
   },
   async ({ includeAgentDetails }) => {
     const tmuxVersion = IS_NATIVE_WINDOWS ? { ok: true, stdout: "", stderr: "" } : await tmux(["-V"], { timeoutMs: 5000 });
+    const tmuxCompatibility = IS_NATIVE_WINDOWS || !tmuxVersion.ok
+      ? null
+      : tmuxVersionStatus(tmuxVersion.stdout);
     let brokerStatus = null;
     let brokerProbeError = null;
     if (IS_NATIVE_WINDOWS) {
@@ -5975,6 +6131,7 @@ server.registerTool(
       },
       bypassPolicy: bypassPolicyStatus(),
       tmuxVersion: tmuxVersion.ok ? tmuxVersion.stdout.trim() : "",
+      tmuxCompatibility,
       tmuxError: tmuxVersion.ok ? "" : tmuxVersion.stderr,
       claudeProcesses: await processStatus(managedSessions.map((session) => session.pid)),
       activeClaudeAgents: includeAgentDetails ? await activeClaudeAgents() : undefined,

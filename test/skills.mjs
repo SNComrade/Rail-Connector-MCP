@@ -90,6 +90,7 @@ for (const skill of expectedSkills) {
   assert.match(combined, /awaiting_input/i, `${skill} must preserve protected composer drafts`);
   assert.match(combined, /workflowPending/i, `${skill} must honor structured pending-workflow state`);
   assert.match(combined, /workflow_pending/i, `${skill} must document the pending-workflow block reason`);
+  assert.match(combined, /terminalState/, `${skill} must separate terminal and workflow state`);
   assert.match(combined, /launchEnvironment/, `${skill} must preserve child launch provenance`);
   assert.match(combined, /currentMcpEnvironment/, `${skill} must separate refreshed MCP diagnostics`);
   assert.match(combined, /timeout|termination/i, `${skill} must treat incomplete probes cautiously`);
@@ -118,6 +119,7 @@ assert.match(operatorGuidance, /claude-fable-5/);
 assert.match(operatorGuidance, /claude-opus-5/);
 assert.match(operatorGuidance, /conflicting_effort_evidence/);
 assert.match(operatorGuidance, /effort other than `xhigh` or `ultracode`/i);
+assert.match(operatorGuidance, /Rename `force` bypasses only/i);
 
 const debuggerGuidance = read(
   path.join(
@@ -130,6 +132,8 @@ const debuggerGuidance = read(
 assert.match(debuggerGuidance, /CLAUDE_CODE_EFFORT_LEVEL/);
 assert.match(debuggerGuidance, /workflow trigger\s+unknown/i);
 assert.match(debuggerGuidance, /effort other than `xhigh` or `ultracode`/i);
+assert.match(debuggerGuidance, /workflowObservationCoverage/);
+assert.match(debuggerGuidance, /tmux 3\.2 or newer/i);
 
 const reviewerGuidance = [
   path.join(skillsRoot, "rail-reviewer", "SKILL.md"),

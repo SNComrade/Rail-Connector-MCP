@@ -42,6 +42,10 @@ is a fallback; back up the file before edits and validate it afterward.
 - Inspect `exited_during_startup` capture and exit code.
 - Handle `needs_workspace_trust` only after confirming the folder.
 - Verify explicit elevated permission modes appear in advertised capabilities.
+- On Unix, inspect `status.tmuxCompatibility`; tmux 3.2 or newer is required
+  because managed launch uses `new-session -e`. An older tmux may still expose
+  an already-running session for read-only reconnection, but cannot create or
+  replace one.
 - Semantic `default` should resolve to the installed `default` or `manual`
   alias.
 
@@ -178,9 +182,14 @@ session is busy, replacement should be blocked unless
   A matching JSONL completion can supersede stale terminal status text.
 - A matching assistant completion cannot supersede `workflowPending: true`.
   Inspect `workflowPendingEvidence`, `workflowPendingCount`, and
-  `workflowPendingObservedAt`; a matching workflow task result or explicit zero
-  count should release session-log evidence. A bound interruption record also
-  clears tracked workflow tasks. If evidence remains stale, inspect before
+  `workflowPendingObservedAt`; when pending is false, the evidence and observed
+  time should be empty rather than retaining a historical task. Also inspect
+  `terminalState`, `workflowObservationCoverage`, and
+  `workflowObservationSkippedBytes`. `head_tail` means the first cold read
+  bounded a large log while preserving launch posture from the head and current
+  workflow lifecycle from the tail. A matching workflow task result or explicit
+  zero count should release session-log evidence. A bound interruption record
+  also clears tracked workflow tasks. If evidence remains stale, inspect before
   using an explicit force recovery and verify its `forceUsed` or
   `workflowInterrupted` result.
 - Check `textLength` and `textTruncated` before diagnosing a large report as
@@ -213,6 +222,8 @@ comparison, not the default repair.
 - `remoteName` is not a title.
 - `sessionTitle` applies only to a new conversation.
 - Rename uses `/rename` and verifies the local log.
+- Rename `force` may bypass only `workflow_pending`; it must remain blocked by
+  approval, trust, draft, paste, exit, or any other non-idle `terminalState`.
 - Title precedence is custom title, agent name, then AI title.
 - `isMeta: true` user reminders must not become titles or prompts.
 - `resumeSessionName` must resolve an exact unique title.

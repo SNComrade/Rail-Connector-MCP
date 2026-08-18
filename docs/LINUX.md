@@ -39,8 +39,9 @@ npm --version
 tmux -V
 ```
 
-Node.js must be major version 22, 24, or 26. Use tmux 2.4 or newer;
-metadata safety targets the original pane ID when updating its containing session.
+Node.js must be major version 22, 24, or 26. Use tmux 3.2 or newer; per-session launch
+environment isolation relies on `new-session -e`, and metadata safety targets
+the original pane ID when updating its containing session.
 
 If `npm ci` reports a native-module build error, confirm the active `node` and
 `npm` are from the same Linux/WSL environment:

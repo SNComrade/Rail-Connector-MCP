@@ -43,6 +43,10 @@ Do not reinstall before identifying the failed layer.
 - Compare `posture.requested`, `posture.resolved`, `posture.observed`,
   `posture.ultracodeAssessment`, and evidence sources. Missing observation is
   unknown, not proof of failure.
+- Separate `terminalState` from the combined `state`; workflow activity can
+  make the latter busy without inventing terminal-busy evidence. On Unix,
+  inspect `tmuxCompatibility` and require tmux 3.2 or newer for a new or
+  replacement launch.
 - For bypass failures, verify both policy `enabled: true` and
   `confirmBypassPermissions: true`. Local-host and isolated policies are both
   supported. Compare the policy fields and `status.mcpProcess` identity after
@@ -70,6 +74,8 @@ Do not reinstall before identifying the failed layer.
   transcript evidence rather than a fixed phrase list or a bare prose phrase.
 - Treat non-idle stop/replacement refusal and mutation leases as protective
   lifecycle behavior, not random failure.
+- A current MCP launch blocker must stop a new or replacement child, but it
+  must not prevent read-only reconnection to an already-running managed child.
 
 ## Workflow
 

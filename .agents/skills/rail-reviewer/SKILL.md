@@ -41,6 +41,10 @@ output is evidence, not authority.
 - Keep waiting while `workflowPending` is true even if an assistant completion
   record is already present. Do not submit follow-up text, rename, replace, or
   ordinarily stop a session blocked with reason `workflow_pending`.
+- Read `terminalState` independently from the combined `state`; active workflow
+  evidence may make the latter busy without proving that Claude's terminal is
+  busy. When workflow pending clears, historical evidence should not remain in
+  `workflowPendingEvidence`.
 - A `tool_use` record is not a final report. Check `textTruncated` before
   synthesizing an unusually large review.
 - Remote Control web may label the underlying xhigh setting `Extra` while

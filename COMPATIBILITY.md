@@ -15,7 +15,9 @@ or major release, with advance notice in the changelog when practical.
 ## Operating Systems
 
 - Native Windows uses the persistent per-user ConPTY broker.
-- Linux and macOS use tmux 2.4 or newer.
+- Linux and macOS use tmux 3.2 or newer. This minimum is enforced before a new
+  or replacement session launch because isolated child environments rely on
+  `new-session -e`.
 - WSL is supported only when Codex, this MCP server, and Claude Code all run in
   the same WSL distribution.
 

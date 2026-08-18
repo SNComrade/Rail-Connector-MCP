@@ -78,6 +78,7 @@ const workflowWaitSignals = captureSignals(
   "✢ Waiting for 1 dynamic workflow to finish\n> "
 );
 assert.equal(workflowWaitSignals.state, "busy");
+assert.equal(workflowWaitSignals.terminalState, "idle");
 assert.equal(workflowWaitSignals.likelyBusy, true);
 assert.equal(workflowWaitSignals.workflowPending, true);
 assert.equal(workflowWaitSignals.workflowPendingCount, 1);
@@ -423,6 +424,8 @@ assert.deepEqual(ultracodeRuntimeObservation.workflowActivity, {
   lastObservedAt: "2026-07-29T12:00:03Z",
   evidence: "claude_session_log",
   triggerAttribution: "unknown",
+  observationCoverage: "full",
+  observationSkippedBytes: 0,
 });
 assert.doesNotMatch(
   JSON.stringify(ultracodeRuntimeObservation),
@@ -433,6 +436,7 @@ const workflowLogSignals = signalsWithWorkflowActivity(
   ultracodeRuntimeObservation.workflowActivity
 );
 assert.equal(workflowLogSignals.state, "busy");
+assert.equal(workflowLogSignals.terminalState, "idle");
 assert.equal(workflowLogSignals.workflowPending, true);
 assert.equal(workflowLogSignals.workflowPendingCount, 1);
 assert.equal(workflowLogSignals.workflowPendingEvidence, "claude_session_log");
@@ -483,6 +487,14 @@ assert.equal(
   completedWorkflowObservation.workflowActivity.pendingObservedAt,
   "2026-07-29T12:03:00Z"
 );
+const completedWorkflowSignals = signalsWithWorkflowActivity(
+  captureSignals("> "),
+  completedWorkflowObservation.workflowActivity
+);
+assert.equal(completedWorkflowSignals.workflowPending, false);
+assert.equal(completedWorkflowSignals.workflowPendingCount, 0);
+assert.equal(completedWorkflowSignals.workflowPendingEvidence, "");
+assert.equal(completedWorkflowSignals.workflowPendingObservedAt, "");
 assert.doesNotMatch(
   JSON.stringify(completedWorkflowObservation),
   /another-private-name|workflow-task-private-id/

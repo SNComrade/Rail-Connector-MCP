@@ -17,6 +17,7 @@ import {
   resolveAllowedCwd,
   textChunks,
   tmuxChildEnvironmentArgs,
+  tmuxVersionStatus,
   upgradeLaunchMetadataToV3,
   upgradeLaunchMetadataToV4,
   validateLaunchMetadata,
@@ -158,6 +159,16 @@ assert.deepEqual(
     "FORCE_COLOR=1",
   ]
 );
+assert.deepEqual(tmuxVersionStatus("tmux 3.2a\n"), {
+  raw: "tmux 3.2a",
+  detectedVersion: "3.2",
+  minimumVersion: "3.2",
+  supported: true,
+  reason: "",
+});
+assert.equal(tmuxVersionStatus("tmux 2.9").supported, false);
+assert.equal(tmuxVersionStatus("tmux 3.1c").reason, "version_too_old");
+assert.equal(tmuxVersionStatus("unexpected").reason, "unrecognized_version");
 const privateLaunchOverride = "private-launch-value-must-not-escape";
 const redactedLaunchEnvironment = claudeChildLaunchEnvironmentStatus({
   CLAUDE_CODE_EFFORT_LEVEL: privateLaunchOverride,

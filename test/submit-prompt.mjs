@@ -33,6 +33,16 @@ const pendingWorkflowSignals = signalsWithWorkflowActivity(captureSignals("> "),
 });
 assert.equal(submitPreflightReason(pendingWorkflowSignals), "workflow_pending");
 assert.equal(lifecycleBlockReason(pendingWorkflowSignals), "workflow_pending");
+const approvalDuringWorkflow = signalsWithWorkflowActivity(
+  captureSignals("Do you want to proceed?\nYes, and don't ask again"),
+  {
+    pendingCount: 1,
+    evidence: "claude_session_log",
+  }
+);
+assert.equal(approvalDuringWorkflow.workflowPending, true);
+assert.equal(approvalDuringWorkflow.terminalState, "approval_required");
+assert.equal(lifecycleBlockReason(approvalDuringWorkflow), "approval_required");
 assert.equal(lifecycleBlockReason(captureSignals("> ")), "");
 assert.equal(lifecycleBlockReason(captureSignals("> unsent draft")), "awaiting_input");
 

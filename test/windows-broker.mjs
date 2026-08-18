@@ -30,11 +30,11 @@ const sessionName = `broker_test_${process.pid}`;
 const tokenA = "a".repeat(64);
 const tokenB = "b".repeat(64);
 const launchEnvironment = {
-  status: "compatible",
+  status: "blocking",
   evidenceScope: "claude_child_launch_environment",
-  effortOverrideStatus: "compatible_xhigh",
-  workflowsDisabled: false,
-  blockers: [],
+  effortOverrideStatus: "blocking_non_xhigh",
+  workflowsDisabled: true,
+  blockers: ["workflows_disabled", "non_xhigh_effort_override"],
   note: "This caller-provided note must not be trusted.",
   rawValue: "private-launch-value-must-not-persist",
 };
@@ -143,14 +143,23 @@ try {
       metadataArgs: [fixture],
       cwd: repoRoot,
       canonicalCwd: canonicalRepoRoot,
-      env: { ...process.env },
+      env: {
+        ...process.env,
+        RAIL_FAKE_CLAUDE_ARGV_DIR: path.join(stateDir, "rejected-launch-records"),
+      },
       launchEnvironment: {
         ...launchEnvironment,
-        status: "blocking",
+        status: "compatible",
       },
       leaseId: "rejected-launch-env-lease",
     }),
     (error) => error?.code === "ELAUNCHENV"
+  );
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(
+    fs.existsSync(path.join(stateDir, "rejected-launch-records")),
+    false,
+    "invalid launch metadata must be rejected before spawning Claude"
   );
 
   const started = await windowsBrokerRequest("start", {
@@ -171,12 +180,12 @@ try {
   });
   assert.equal(started.status, "started");
   assert.deepEqual(started.metadata.launchEnvironment, {
-    status: "compatible",
+    status: "blocking",
     evidenceScope: "claude_child_launch_environment",
-    effortOverrideStatus: "compatible_xhigh",
-    workflowsDisabled: false,
-    blockers: [],
-    note: "No blocking UltraCode override was present in the captured Claude child launch environment. Claude settings can still differ.",
+    effortOverrideStatus: "blocking_non_xhigh",
+    workflowsDisabled: true,
+    blockers: ["non_xhigh_effort_override", "workflows_disabled"],
+    note: "The captured Claude child launch environment contains an override that prevents the requested UltraCode workflow posture.",
   });
   assert.doesNotMatch(
     JSON.stringify(started.metadata),

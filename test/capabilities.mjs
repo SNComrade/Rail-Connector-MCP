@@ -123,6 +123,10 @@ const rejectedByParser = parseClaudeCapabilities(
 assert.equal(rejectedByParser.ultracode.capabilityStatus, "rejected");
 assert.equal(rejectedByParser.ultracode.supportSource, "parser_probe_rejected");
 assert.equal(rejectedByParser.ultracode.argumentProbe.rejected, true);
+assert.equal(
+  rejectedByParser.ultracode.argumentProbe.evidenceBasis,
+  "parser_specific_rejection_text"
+);
 assert.equal(rejectedByParser.ultracode.mcpLaunchRequestAvailable, false);
 assert.equal(rejectedByParser.ultracode.launchMechanism, "experimental_session_settings");
 
@@ -180,6 +184,27 @@ assert.equal(
   adversarialDiagnostics.ultracode.argumentProbe.controlRejectionTextMatched,
   false
 );
+
+const nonParserFailure = parseClaudeCapabilities(
+  "2.1.234 (Claude Code)\n",
+  help,
+  "claude.exe",
+  {
+    attempted: true,
+    succeeded: false,
+    exitCode: 1,
+    stderr: "Authentication unavailable",
+    controlAttempted: true,
+    controlTimedOut: true,
+  }
+);
+assert.equal(nonParserFailure.ultracode.argumentProbe.rejected, false);
+assert.equal(nonParserFailure.ultracode.argumentProbe.result, "inconclusive");
+assert.equal(
+  nonParserFailure.ultracode.argumentProbe.evidenceBasis,
+  "insufficient_calibration"
+);
+assert.notEqual(nonParserFailure.ultracode.supportSource, "parser_probe_rejected");
 
 for (const excludedProbe of [
   { timedOut: true },
@@ -329,6 +354,22 @@ assert.throws(
       }
     ),
   /process environment blocks UltraCode: non_xhigh_effort_override/
+);
+assert.equal(
+  resolveLaunchOptionsFromCapabilities(
+    { permissionMode: "default", ultracode: true },
+    {
+      ...current,
+      ultracode: {
+        ...current.ultracode,
+        environment: ultracodeEnvironmentStatus({
+          CLAUDE_CODE_EFFORT_LEVEL: "high",
+        }),
+      },
+    },
+    { enforceEnvironmentCompatibility: false }
+  ).ultracodeMechanism,
+  "effort"
 );
 
 console.log("capabilities ok");

@@ -48,7 +48,9 @@ function writeSessionBridgeRecord() {
   const configDir = process.env.CLAUDE_CONFIG_DIR;
   const sessionId = argumentValue("--session-id");
   if (!configDir || !/^[0-9a-f-]{36}$/i.test(sessionId)) return;
-  const encodedCwd = process.cwd().replace(/[^A-Za-z0-9]/g, "-");
+  const canonicalCwd =
+    fs.realpathSync.native?.(process.cwd()) ?? fs.realpathSync(process.cwd());
+  const encodedCwd = canonicalCwd.replace(/[^A-Za-z0-9]/g, "-");
   const projectDir = path.join(configDir, "projects", encodedCwd);
   fs.mkdirSync(projectDir, { recursive: true });
   fs.appendFileSync(

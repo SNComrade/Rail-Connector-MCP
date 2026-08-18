@@ -48,7 +48,7 @@ registry. Git tags and GitHub Releases are the public release authority.
 - npm and Git
 - Claude Code CLI installed and authenticated
 - Codex Desktop or Codex CLI with local MCP server support
-- tmux 2.4 or newer on Linux/macOS
+- tmux 3.2 or newer on Linux/macOS
 - Build prerequisites for `node-pty` when a matching prebuilt binary is not
   available; see [Troubleshooting](docs/TROUBLESHOOTING.md)
 

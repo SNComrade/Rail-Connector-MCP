@@ -243,6 +243,10 @@ stale pending evidence, inspect the
 session before using the explicit `force: true` recovery on text, key, or
 rename; report the returned `forceUsed` field. A forced `submit_prompt` also
 returns `forcedPastReason`; preserve that reason in the operator report.
+For rename, force is deliberately narrower: it may cross a verified
+`workflow_pending` gate, but it must not cross approval, trust, draft, paste,
+exit, or another non-idle `terminalState`. If both workflow and terminal
+attention are present, resolve the terminal attention state first.
 
 ## Reconnect After Windows Refresh
 

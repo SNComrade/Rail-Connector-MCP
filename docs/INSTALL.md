@@ -15,7 +15,7 @@ without `--branch` only when intentionally evaluating mutable `main`.
 - npm
 - Claude Code installed and authenticated
 - Codex Desktop or Codex CLI
-- tmux 2.4 or newer on Linux/macOS
+- tmux 3.2 or newer on Linux/macOS
 - Git
 
 ## Native Install

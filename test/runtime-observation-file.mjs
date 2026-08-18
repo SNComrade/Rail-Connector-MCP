@@ -81,8 +81,10 @@ try {
   assert.equal(initial.permissionMode, "bypassPermissions");
   assert.equal(initial.model, "claude-fable-5");
   assert.equal(initial.effort, "xhigh");
-  assert.equal(initial.workflowActivity.state, "launch_observed");
-  assert.equal(initial.workflowActivity.launchStatus, "async_launched");
+  assert.equal(initial.workflowActivity.state, "not_observed");
+  assert.equal(initial.workflowActivity.pendingCount, null);
+  assert.equal(initial.workflowActivity.observationCoverage, "head_tail");
+  assert.ok(initial.workflowActivity.observationSkippedBytes > 0);
   assert.doesNotMatch(JSON.stringify(initial), /private-name-must-not-escape/);
 
   fs.appendFileSync(
@@ -104,7 +106,8 @@ try {
   const appended = await sessionRuntimeObservation(metadata);
   assert.equal(appended.permissionMode, "bypassPermissions");
   assert.equal(appended.effort, "max");
-  assert.equal(appended.workflowActivity.launchObserved, true);
+  assert.equal(appended.workflowActivity.launchObserved, false);
+  assert.equal(appended.workflowActivity.observationCoverage, "head_tail");
 
   fs.writeFileSync(
     logFile,
@@ -122,6 +125,8 @@ try {
   assert.equal(truncated.permissionMode, "default");
   assert.equal(truncated.effort, null);
   assert.equal(truncated.workflowActivity.state, "not_observed");
+  assert.equal(truncated.workflowActivity.observationCoverage, "full");
+  assert.equal(truncated.workflowActivity.observationSkippedBytes, 0);
 
   fs.appendFileSync(
     logFile,

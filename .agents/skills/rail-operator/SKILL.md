@@ -29,6 +29,11 @@ task project as `cwd`, even when this skill is loaded from the MCP repo.
   The MCP combines the exact dynamic-workflow wait control line with sanitized
   session-log task lifecycle evidence and blocks submit, low-level text/Enter,
   rename, replacement, and ordinary stop with reason `workflow_pending`.
+- Read `terminalState` separately from the combined `state`. Workflow activity
+  can make `state` busy while `terminalState` remains idle. When
+  `workflowPending` is false, `workflowPendingEvidence` is intentionally empty;
+  use `workflowObservationCoverage` and `workflowObservationSkippedBytes` to
+  tell a full scan from a bounded head/tail recovery of a large session log.
 - Treat `C-m`, `C-j`, `KPEnter`, and other documented Enter equivalents as
   submissions. They use the same pending-workflow gate as `Enter` and `Return`.
 - Do not infer workflow completion from a final assistant record alone. Keep
@@ -116,7 +121,9 @@ comparisons to the same managed name, conversation UUID, generation, and time.
    Enter-equivalent key, rename, submit, replacement, and stop tools expose
    explicit force recovery. Report `forceUsed`, `replacementForceUsed`, or
    `workflowInterrupted` rather than hiding the override. For forced prompt
-   submission, also report `forcedPastReason`. Native Windows rejects
+   submission, also report `forcedPastReason`. Rename `force` bypasses only a
+   verified `workflow_pending` gate; approval, trust, draft, paste, exit, and
+   other non-idle `terminalState` gates remain blocking. Native Windows rejects
    unsupported key names with `EINVAL`; never retry by sending the key name as
    text.
 7. **Finish.** Gracefully stop only an idle session created by this workflow
