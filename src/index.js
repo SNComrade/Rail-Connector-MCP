@@ -327,10 +327,12 @@ function createSessionSummaryState() {
     workflowLaunchObserved: false,
     workflowLaunchStatus: "",
     workflowLaunchUpdatedAt: "",
+    workflowLastObservedAt: "",
     pendingWorkflowCount: null,
     pendingWorkflowUpdatedAt: "",
     activeWorkflowTaskIds: new Set(),
     unidentifiedPendingWorkflowCount: 0,
+    workflowObservationUncertain: false,
     searchTextParts: [],
   };
 }
@@ -371,7 +373,36 @@ function completeTrackedWorkflowTask(state, taskId, timestamp = "") {
     Math.max(0, (state.pendingWorkflowCount ?? 1) - 1)
   );
   state.pendingWorkflowUpdatedAt = timestamp;
+  state.workflowLastObservedAt = timestamp;
   return true;
+}
+
+function workflowReleaseIsCurrent(state, timestamp = "") {
+  const latestTimestampMs = Date.parse(state.workflowLastObservedAt);
+  if (!Number.isFinite(latestTimestampMs)) return true;
+  const candidateTimestampMs = Date.parse(timestamp);
+  return (
+    Number.isFinite(candidateTimestampMs) &&
+    candidateTimestampMs >= latestTimestampMs
+  );
+}
+
+function recordWorkflowObservedAt(state, timestamp = "") {
+  const currentTimestampMs = Date.parse(state.workflowLastObservedAt);
+  const candidateTimestampMs = Date.parse(timestamp);
+  if (
+    !Number.isFinite(currentTimestampMs) ||
+    (Number.isFinite(candidateTimestampMs) &&
+      candidateTimestampMs >= currentTimestampMs)
+  ) {
+    state.workflowLastObservedAt = timestamp;
+  }
+}
+
+function clearObservedPosture(state) {
+  state.permissionMode = "";
+  state.model = "";
+  state.effort = "";
 }
 
 async function withManagedMutationLock(
@@ -588,6 +619,7 @@ function addSessionRecord(
     state.workflowLaunchStatus = workflowResult.status;
     state.workflowLaunchUpdatedAt = record.timestamp ?? "";
     if (WORKFLOW_PENDING_LAUNCH_STATUSES.has(workflowResult.status)) {
+      recordWorkflowObservedAt(state, record.timestamp ?? "");
       if (workflowTaskId) state.activeWorkflowTaskIds.add(workflowTaskId);
       else state.unidentifiedPendingWorkflowCount += 1;
       state.pendingWorkflowCount = Math.max(
@@ -600,7 +632,8 @@ function addSessionRecord(
   }
   if (
     workflowResult?.taskType === "local_workflow" &&
-    WORKFLOW_TERMINAL_TASK_STATUSES.has(workflowResult.status)
+    WORKFLOW_TERMINAL_TASK_STATUSES.has(workflowResult.status) &&
+    workflowReleaseIsCurrent(state, record.timestamp ?? "")
   ) {
     completeTrackedWorkflowTask(
       state,
@@ -610,13 +643,44 @@ function addSessionRecord(
   }
   const pendingWorkflowCount =
     record.pendingWorkflowCount ?? workflowResult?.pendingWorkflowCount;
-  if (Number.isInteger(pendingWorkflowCount) && pendingWorkflowCount >= 0) {
+  if (
+    Number.isInteger(pendingWorkflowCount) &&
+    pendingWorkflowCount >= 0 &&
+    workflowReleaseIsCurrent(state, record.timestamp ?? "")
+  ) {
+    const previousPendingWorkflowCount = state.pendingWorkflowCount;
+    const mixedIdentityPopulation =
+      state.activeWorkflowTaskIds.size > 0 &&
+      state.unidentifiedPendingWorkflowCount > 0;
+    const mixedPopulationShrank =
+      mixedIdentityPopulation &&
+      Number.isInteger(previousPendingWorkflowCount) &&
+      pendingWorkflowCount < previousPendingWorkflowCount;
     state.pendingWorkflowCount = pendingWorkflowCount;
     state.pendingWorkflowUpdatedAt = record.timestamp ?? "";
-    if (pendingWorkflowCount === 0) {
+    recordWorkflowObservedAt(state, record.timestamp ?? "");
+    state.workflowObservationUncertain = false;
+    if (
+      mixedPopulationShrank ||
+      state.activeWorkflowTaskIds.size > pendingWorkflowCount
+    ) {
       state.activeWorkflowTaskIds.clear();
-      state.unidentifiedPendingWorkflowCount = 0;
+      state.unidentifiedPendingWorkflowCount = pendingWorkflowCount;
+    } else {
+      state.unidentifiedPendingWorkflowCount = Math.max(
+        0,
+        pendingWorkflowCount - state.activeWorkflowTaskIds.size
+      );
     }
+  } else if (
+    Number.isInteger(pendingWorkflowCount) &&
+    pendingWorkflowCount > (state.pendingWorkflowCount ?? 0)
+  ) {
+    state.pendingWorkflowCount = pendingWorkflowCount;
+    state.unidentifiedPendingWorkflowCount = Math.max(
+      state.unidentifiedPendingWorkflowCount,
+      pendingWorkflowCount - state.activeWorkflowTaskIds.size
+    );
   }
   const retrievedWorkflowTaskId =
     typeof workflowResult?.task?.task_id === "string"
@@ -630,7 +694,8 @@ function addSessionRecord(
     retrievedWorkflowTaskId &&
     WORKFLOW_TERMINAL_RETRIEVAL_STATUSES.has(workflowResult.retrieval_status) &&
     (!retrievedWorkflowTaskStatus ||
-      WORKFLOW_TERMINAL_TASK_STATUSES.has(retrievedWorkflowTaskStatus))
+      WORKFLOW_TERMINAL_TASK_STATUSES.has(retrievedWorkflowTaskStatus)) &&
+    workflowReleaseIsCurrent(state, record.timestamp ?? "")
   ) {
     completeTrackedWorkflowTask(
       state,
@@ -640,7 +705,9 @@ function addSessionRecord(
   }
   if (
     record.interruptedMessageId &&
-    (state.pendingWorkflowCount > 0 ||
+    workflowReleaseIsCurrent(state, record.timestamp ?? "") &&
+    (state.workflowObservationUncertain ||
+      state.pendingWorkflowCount > 0 ||
       state.activeWorkflowTaskIds.size > 0 ||
       state.unidentifiedPendingWorkflowCount > 0)
   ) {
@@ -648,6 +715,8 @@ function addSessionRecord(
     state.unidentifiedPendingWorkflowCount = 0;
     state.pendingWorkflowCount = 0;
     state.pendingWorkflowUpdatedAt = record.timestamp ?? "";
+    recordWorkflowObservedAt(state, record.timestamp ?? "");
+    state.workflowObservationUncertain = false;
   }
   if (!includeConversationText) return;
   const conversationMessage = conversationMessageFromRecord(record);
@@ -748,7 +817,8 @@ async function summarizeSessionMetadata(metadata, includeSnippets, maxBytes, inc
   const state = createSessionSummaryState();
   let lineCount = 0;
 
-  for (const segment of readResult.segments) {
+  for (const [segmentIndex, segment] of readResult.segments.entries()) {
+    if (readResult.truncated && segmentIndex > 0) clearObservedPosture(state);
     let offset = 0;
     while (offset <= segment.length) {
       let end = segment.indexOf("\n", offset);
@@ -812,7 +882,8 @@ export async function inspectSessionFile(file, maxMessages) {
   const readResult = await readSessionSummarySegments(file, stat, MAX_SESSION_SUMMARY_BYTES);
   const state = createSessionSummaryState();
   const messages = [];
-  for (const segment of readResult.segments) {
+  for (const [segmentIndex, segment] of readResult.segments.entries()) {
+    if (readResult.truncated && segmentIndex > 0) clearObservedPosture(state);
     for (let line of segment.split("\n")) {
       if (line.endsWith("\r")) line = line.slice(0, -1);
       if (!line) continue;
@@ -2661,33 +2732,40 @@ export function captureSignals(capture) {
 
 export function signalsWithWorkflowActivity(signals = {}, workflowActivity = {}) {
   const baseState = signals.state || "idle";
+  const logUncertain = workflowActivity.observationUncertain === true;
   const logPendingCount = Number.isInteger(workflowActivity.pendingCount)
     ? workflowActivity.pendingCount
     : null;
-  const logPending = logPendingCount !== null && logPendingCount > 0;
+  const logPending =
+    !logUncertain && logPendingCount !== null && logPendingCount > 0;
   const terminalPending = signals.workflowPending === true;
-  const workflowPending = logPending || terminalPending;
+  const workflowPending = logPending || terminalPending || logUncertain;
   const workflowPendingEvidence = logPending
     ? workflowActivity.evidence || "claude_session_log"
     : terminalPending
       ? signals.workflowPendingEvidence || "terminal_heuristic"
-      : "";
+      : logUncertain
+        ? workflowActivity.evidence || "claude_session_log_incomplete"
+        : "";
   const workflowPendingCount = logPending
     ? logPendingCount
     : terminalPending
       ? signals.workflowPendingCount
-      : logPendingCount;
+      : logUncertain
+        ? null
+        : logPendingCount;
   return {
     ...signals,
     likelyBusy: Boolean(signals.likelyBusy || workflowPending),
     workflowPending,
     workflowPendingCount,
     workflowPendingEvidence,
-    workflowPendingObservedAt: workflowPending
-      ? logPending
-        ? workflowActivity.pendingObservedAt || workflowActivity.lastObservedAt || ""
-        : signals.workflowPendingObservedAt || ""
-      : "",
+    workflowPendingObservedAt: logPending
+      ? workflowActivity.pendingObservedAt || workflowActivity.lastObservedAt || ""
+      : terminalPending
+        ? signals.workflowPendingObservedAt || ""
+        : "",
+    workflowObservationUncertain: logUncertain,
     workflowObservationCoverage:
       workflowActivity.observationCoverage ||
       signals.workflowObservationCoverage ||
@@ -2711,10 +2789,34 @@ function emptyWorkflowActivity() {
     launchObserved: false,
     launchStatus: null,
     pendingCount: null,
+    lastKnownPendingCount: null,
     pendingObservedAt: "",
     lastObservedAt: "",
     evidence: "",
     triggerAttribution: "unknown",
+    observationUncertain: false,
+  };
+}
+
+export function workflowObservationStatusFields(
+  workflowActivity = emptyWorkflowActivity(),
+  available = true
+) {
+  if (!available) {
+    return {
+      workflowPending: null,
+      workflowObservationStatus: "unavailable",
+    };
+  }
+  return {
+    workflowPending:
+      workflowActivity.observationUncertain === true ||
+      workflowActivity.pendingCount > 0,
+    workflowObservationStatus: workflowActivity.observationUncertain
+      ? "incomplete"
+      : workflowActivity.evidence
+        ? "observed"
+        : "not_observed",
   };
 }
 
@@ -2781,7 +2883,9 @@ function assessUltracodePosture(
       note = "Terminal output resembles an explicit UltraCode indicator, but terminal evidence is heuristic and does not authenticate runtime state.";
     } else if (workflowActivity.launchObserved || workflowActivity.pendingCount > 0) {
       status = "workflow_activity_observed";
-      note = "Claude workflow activity was observed, but the session log does not attribute that activity specifically to UltraCode.";
+      note = workflowActivity.observationUncertain
+        ? "Claude workflow activity was observed, but a skipped session-log range leaves the current lifecycle incomplete and does not attribute the activity specifically to UltraCode."
+        : "Claude workflow activity was observed, but the session log does not attribute that activity specifically to UltraCode.";
     } else if (runtimeEffort === "xhigh" || terminalEffort === "xhigh") {
       status = "xhigh_correlated_unconfirmed";
       note = "xhigh effort is consistent with UltraCode, but xhigh alone does not prove that UltraCode workflow orchestration is active.";
@@ -3319,42 +3423,65 @@ function addRuntimeObservationRecord(state, record, metadata = {}) {
 
 function runtimeObservationFromState(
   state,
-  { coverage = "full", skippedBytes = 0 } = {}
+  {
+    coverage = "full",
+    skippedBytes = 0,
+    trailingRecordIncomplete = false,
+  } = {}
 ) {
-  const ultracodeObserved = state.effort === "ultracode" ? true : null;
+  const permissionMode = trailingRecordIncomplete ? "" : state.permissionMode;
+  const model = trailingRecordIncomplete ? "" : state.model;
+  const effort = trailingRecordIncomplete ? "" : state.effort;
+  const ultracodeObserved = effort === "ultracode" ? true : null;
+  const observationUncertain =
+    state.workflowObservationUncertain === true || trailingRecordIncomplete;
   const workflowActivityObserved =
-    state.workflowLaunchObserved || state.pendingWorkflowCount !== null;
-  const workflowState = state.workflowLaunchObserved
-    ? state.pendingWorkflowCount > 0
-      ? "pending"
-      : "launch_observed"
-    : state.pendingWorkflowCount > 0
-      ? "pending_without_launch_record"
-      : state.pendingWorkflowCount === 0
-        ? "idle_count_observed"
-        : "not_observed";
+    observationUncertain ||
+    state.workflowLaunchObserved ||
+    state.pendingWorkflowCount !== null;
+  const workflowState = observationUncertain
+    ? "unknown_due_to_gap"
+    : state.workflowLaunchObserved
+      ? state.pendingWorkflowCount > 0
+        ? "pending"
+        : "launch_observed"
+      : state.pendingWorkflowCount > 0
+        ? "pending_without_launch_record"
+        : state.pendingWorkflowCount === 0
+          ? "idle_count_observed"
+          : "not_observed";
   return {
-    permissionMode: state.permissionMode || null,
-    model: state.model || null,
-    effort: state.effort || null,
+    permissionMode: permissionMode || null,
+    model: model || null,
+    effort: effort || null,
     ultracode: ultracodeObserved,
     workflowActivity: {
       state: workflowState,
       launchObserved: state.workflowLaunchObserved,
       launchStatus: state.workflowLaunchStatus || null,
-      pendingCount: state.pendingWorkflowCount,
-      pendingObservedAt: state.pendingWorkflowUpdatedAt || "",
-      lastObservedAt:
-        state.pendingWorkflowUpdatedAt || state.workflowLaunchUpdatedAt || "",
-      evidence: workflowActivityObserved ? "claude_session_log" : "",
+      pendingCount: observationUncertain ? null : state.pendingWorkflowCount,
+      lastKnownPendingCount:
+        observationUncertain && Number.isInteger(state.pendingWorkflowCount)
+          ? state.pendingWorkflowCount
+          : null,
+      pendingObservedAt: observationUncertain
+        ? ""
+        : state.pendingWorkflowUpdatedAt || "",
+      lastObservedAt: state.workflowLastObservedAt || "",
+      evidence: observationUncertain
+        ? "claude_session_log_incomplete"
+        : workflowActivityObserved
+          ? "claude_session_log"
+          : "",
       triggerAttribution: "unknown",
+      observationUncertain,
       observationCoverage: coverage,
       observationSkippedBytes: skippedBytes,
     },
     evidence: {
-      permissionMode: state.permissionMode ? "claude_session_log" : "",
-      model: state.model ? "claude_session_log" : "",
-      effort: state.effort ? "claude_session_log" : "",
+      permissionMode: permissionMode ? "claude_session_log" : "",
+      model: model ? "claude_session_log" : "",
+      effort: effort ? "claude_session_log" : "",
       ultracode: ultracodeObserved === true ? "claude_session_log" : "",
     },
   };
@@ -3362,12 +3489,18 @@ function runtimeObservationFromState(
 
 const runtimeObservationCache = new Map();
 const runtimeObservationLoads = new Map();
+let runtimeObservationBufferedRecordBytes = 0;
 const MAX_RUNTIME_OBSERVATION_CACHE_ENTRIES = 128;
 const RUNTIME_OBSERVATION_READ_BYTES = 256 * 1024;
 const RUNTIME_OBSERVATION_HEAD_BYTES = 256 * 1024;
 const RUNTIME_OBSERVATION_TAIL_BYTES = 2 * 1024 * 1024;
+const RUNTIME_OBSERVATION_CACHE_GUARD_BYTES = 4096;
 const RUNTIME_OBSERVATION_INITIAL_SCAN_BYTES =
   RUNTIME_OBSERVATION_HEAD_BYTES + RUNTIME_OBSERVATION_TAIL_BYTES;
+const RUNTIME_OBSERVATION_FULL_GUARD_BYTES =
+  RUNTIME_OBSERVATION_INITIAL_SCAN_BYTES;
+const RUNTIME_OBSERVATION_MAX_TRAILING_RECORD_BYTES = 8 * 1024 * 1024;
+const MAX_RUNTIME_OBSERVATION_BUFFERED_RECORD_BYTES = 32 * 1024 * 1024;
 
 function runtimeObservationLogFile(metadata) {
   if (!metadata?.cwd || !metadata?.resolvedSessionId) return "";
@@ -3388,13 +3521,183 @@ function newRuntimeObservationCacheEntry(stat) {
   return {
     fileIdentity: `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`,
     offset: 0,
-    remainder: "",
+    remainderParts: [],
+    remainderBytes: 0,
+    remainderParseAttemptBytes: -1,
+    recordOverflowed: false,
     decoder: new StringDecoder("utf8"),
     state: createSessionSummaryState(),
     discardUntilNewline: false,
     coverage: "full",
     skippedBytes: 0,
+    mtimeMs: stat.mtimeMs,
+    prefixGuard: Buffer.alloc(0),
+    anchorGuardStart: 0,
+    anchorGuard: Buffer.alloc(0),
+    fullGuardSize: 0,
+    fullGuardDigest: "",
+    ctimeMs: stat.ctimeMs,
   };
+}
+
+async function readRuntimeObservationGuard(handle, start, length) {
+  if (length <= 0) return Buffer.alloc(0);
+  const buffer = Buffer.alloc(length);
+  const { bytesRead } = await handle.read(buffer, 0, length, start);
+  return buffer.subarray(0, bytesRead);
+}
+
+async function runtimeObservationRangeHash(handle, length) {
+  const hash = createHash("sha256");
+  const buffer = Buffer.alloc(RUNTIME_OBSERVATION_READ_BYTES);
+  let offset = 0;
+  while (offset < length) {
+    const requestedBytes = Math.min(buffer.length, length - offset);
+    const { bytesRead } = await handle.read(
+      buffer,
+      0,
+      requestedBytes,
+      offset
+    );
+    if (bytesRead <= 0) return null;
+    hash.update(buffer.subarray(0, bytesRead));
+    offset += bytesRead;
+  }
+  return {
+    hash,
+    digest: hash.copy().digest("hex"),
+  };
+}
+
+async function validateRuntimeObservationCache(handle, entry, stat) {
+  const metadataUnchanged =
+    stat.size === entry.offset &&
+    stat.mtimeMs === entry.mtimeMs &&
+    stat.ctimeMs === entry.ctimeMs;
+  if (entry.offset > 0 && stat.size === entry.offset && !metadataUnchanged) {
+    return {
+      matches: false,
+      historyHash: null,
+      preserveFullGuard: false,
+      preserveBoundaryGuards: false,
+    };
+  }
+  let historyHash = null;
+  if (
+    !metadataUnchanged &&
+    entry.fullGuardDigest &&
+    entry.fullGuardSize === entry.offset
+  ) {
+    const result = await runtimeObservationRangeHash(
+      handle,
+      entry.fullGuardSize
+    );
+    if (!result || result.digest !== entry.fullGuardDigest) {
+      return {
+        matches: false,
+        historyHash: null,
+        preserveFullGuard: false,
+        preserveBoundaryGuards: false,
+      };
+    }
+    historyHash = result.hash;
+  }
+  if (entry.prefixGuard.length > 0) {
+    const prefix = await readRuntimeObservationGuard(
+      handle,
+      0,
+      entry.prefixGuard.length
+    );
+    if (!prefix.equals(entry.prefixGuard)) {
+      return {
+        matches: false,
+        historyHash: null,
+        preserveFullGuard: false,
+        preserveBoundaryGuards: false,
+      };
+    }
+  }
+  if (entry.anchorGuard.length > 0) {
+    if (stat.size < entry.anchorGuardStart + entry.anchorGuard.length) {
+      return {
+        matches: false,
+        historyHash: null,
+        preserveFullGuard: false,
+        preserveBoundaryGuards: false,
+      };
+    }
+    const anchor = await readRuntimeObservationGuard(
+      handle,
+      entry.anchorGuardStart,
+      entry.anchorGuard.length
+    );
+    if (!anchor.equals(entry.anchorGuard)) {
+      return {
+        matches: false,
+        historyHash: null,
+        preserveFullGuard: false,
+        preserveBoundaryGuards: false,
+      };
+    }
+  }
+  return {
+    matches: true,
+    historyHash,
+    preserveFullGuard: metadataUnchanged,
+    preserveBoundaryGuards: metadataUnchanged,
+  };
+}
+
+async function updateRuntimeObservationCacheGuards(
+  handle,
+  entry,
+  stat,
+  {
+    historyHash = null,
+    preserveFullGuard = false,
+    preserveBoundaryGuards = false,
+  } = {}
+) {
+  if (!preserveBoundaryGuards) {
+    const prefixLength = Math.min(
+      stat.size,
+      RUNTIME_OBSERVATION_CACHE_GUARD_BYTES
+    );
+    entry.prefixGuard = await readRuntimeObservationGuard(handle, 0, prefixLength);
+    const anchorEnd = Math.min(entry.offset, stat.size);
+    entry.anchorGuardStart = Math.max(
+      0,
+      anchorEnd - RUNTIME_OBSERVATION_CACHE_GUARD_BYTES
+    );
+    entry.anchorGuard = await readRuntimeObservationGuard(
+      handle,
+      entry.anchorGuardStart,
+      anchorEnd - entry.anchorGuardStart
+    );
+  }
+  if (
+    !entry.state.workflowObservationUncertain &&
+    !entry.recordOverflowed &&
+    entry.offset <= RUNTIME_OBSERVATION_FULL_GUARD_BYTES
+  ) {
+    if (historyHash) {
+      entry.fullGuardSize = entry.offset;
+      entry.fullGuardDigest = historyHash.digest("hex");
+    } else if (
+      !preserveFullGuard ||
+      entry.fullGuardSize !== entry.offset ||
+      !entry.fullGuardDigest
+    ) {
+      const result = await runtimeObservationRangeHash(handle, entry.offset);
+      entry.fullGuardSize = result ? entry.offset : 0;
+      entry.fullGuardDigest = result?.digest || "";
+    }
+  } else {
+    entry.fullGuardSize = 0;
+    entry.fullGuardDigest = "";
+  }
+  entry.mtimeMs = stat.mtimeMs;
+  entry.ctimeMs = stat.ctimeMs;
 }
 
 function addRuntimeObservationLines(state, lines, metadata) {
@@ -3408,28 +3711,153 @@ function addRuntimeObservationLines(state, lines, metadata) {
   }
 }
 
+function runtimeObservationHasRemainder(entry) {
+  return entry.remainderBytes > 0;
+}
+
+function resetRuntimeObservationRemainder(entry) {
+  runtimeObservationBufferedRecordBytes = Math.max(
+    0,
+    runtimeObservationBufferedRecordBytes - entry.remainderBytes
+  );
+  entry.remainderParts = [];
+  entry.remainderBytes = 0;
+  entry.remainderParseAttemptBytes = -1;
+}
+
+function markRuntimeObservationRecordOverflow(entry) {
+  resetRuntimeObservationRemainder(entry);
+  entry.recordOverflowed = true;
+  markRuntimeObservationGap(entry.state);
+}
+
+function appendRuntimeObservationRemainder(entry, value) {
+  if (!value) return true;
+  const valueBytes = Buffer.byteLength(value);
+  const recordLimitExceeded =
+    entry.remainderBytes + valueBytes >
+    RUNTIME_OBSERVATION_MAX_TRAILING_RECORD_BYTES;
+  const processLimitExceeded =
+    runtimeObservationBufferedRecordBytes + valueBytes >
+    MAX_RUNTIME_OBSERVATION_BUFFERED_RECORD_BYTES;
+  if (recordLimitExceeded || processLimitExceeded) {
+    markRuntimeObservationRecordOverflow(entry);
+    return false;
+  }
+  entry.remainderParts.push(value);
+  entry.remainderBytes += valueBytes;
+  runtimeObservationBufferedRecordBytes += valueBytes;
+  return true;
+}
+
+function disposeRuntimeObservationCacheEntry(entry) {
+  if (!entry) return;
+  resetRuntimeObservationRemainder(entry);
+}
+
+function deleteRuntimeObservationCacheEntry(key) {
+  const entry = runtimeObservationCache.get(key);
+  runtimeObservationCache.delete(key);
+  disposeRuntimeObservationCacheEntry(entry);
+}
+
+function takeRuntimeObservationRemainder(entry) {
+  const value =
+    entry.remainderParts.length === 1
+      ? entry.remainderParts[0]
+      : entry.remainderParts.join("");
+  resetRuntimeObservationRemainder(entry);
+  return value;
+}
+
 function consumeRuntimeObservationText(entry, text, metadata) {
-  let value = entry.remainder + text;
-  entry.remainder = "";
+  let value = text;
   if (entry.discardUntilNewline) {
     const newline = value.indexOf("\n");
     if (newline < 0) return;
     value = value.slice(newline + 1);
     entry.discardUntilNewline = false;
   }
-  const lines = value.split(/\r?\n/);
-  entry.remainder = lines.pop() ?? "";
-  addRuntimeObservationLines(entry.state, lines, metadata);
+  let start = 0;
+  for (;;) {
+    const newline = value.indexOf("\n", start);
+    if (newline < 0) break;
+    const segment = value.slice(start, newline);
+    if (appendRuntimeObservationRemainder(entry, segment)) {
+      const line = takeRuntimeObservationRemainder(entry);
+      addRuntimeObservationLines(entry.state, [line], metadata);
+    }
+    entry.discardUntilNewline = false;
+    start = newline + 1;
+  }
+  const trailing = value.slice(start);
+  if (trailing && !appendRuntimeObservationRemainder(entry, trailing)) {
+    entry.discardUntilNewline = true;
+  }
 }
 
-function resetRuntimeObservationWorkflowState(state) {
-  state.workflowLaunchObserved = false;
-  state.workflowLaunchStatus = "";
-  state.workflowLaunchUpdatedAt = "";
-  state.pendingWorkflowCount = null;
-  state.pendingWorkflowUpdatedAt = "";
+function consumeCompleteRuntimeObservationRemainder(entry, metadata) {
+  if (
+    !runtimeObservationHasRemainder(entry) ||
+    entry.remainderParseAttemptBytes === entry.remainderBytes
+  ) {
+    return;
+  }
+  entry.remainderParseAttemptBytes = entry.remainderBytes;
+  const value =
+    entry.remainderParts.length === 1
+      ? entry.remainderParts[0]
+      : entry.remainderParts.join("");
+  try {
+    addRuntimeObservationRecord(
+      entry.state,
+      JSON.parse(value),
+      metadata
+    );
+    resetRuntimeObservationRemainder(entry);
+  } catch {
+    // A genuinely partial record remains fail-closed until more bytes arrive.
+  }
+}
+
+function markRuntimeObservationGap(state) {
+  clearObservedPosture(state);
   state.activeWorkflowTaskIds.clear();
-  state.unidentifiedPendingWorkflowCount = 0;
+  state.unidentifiedPendingWorkflowCount = Math.max(
+    0,
+    state.pendingWorkflowCount ?? 0
+  );
+  state.workflowObservationUncertain = true;
+}
+
+async function consumeRuntimeObservationBytes(
+  handle,
+  entry,
+  stat,
+  metadata,
+  historyHash = null
+) {
+  const buffer = Buffer.alloc(RUNTIME_OBSERVATION_READ_BYTES);
+  while (entry.offset < stat.size) {
+    const requestedBytes = Math.min(buffer.length, stat.size - entry.offset);
+    const { bytesRead } = await handle.read(
+      buffer,
+      0,
+      requestedBytes,
+      entry.offset
+    );
+    if (bytesRead <= 0) break;
+    const bytes = buffer.subarray(0, bytesRead);
+    entry.offset += bytesRead;
+    if (historyHash) historyHash.update(bytes);
+    consumeRuntimeObservationText(
+      entry,
+      entry.decoder.write(bytes),
+      metadata
+    );
+  }
+  consumeCompleteRuntimeObservationRemainder(entry, metadata);
+  return historyHash;
 }
 
 async function loadRuntimeObservation(metadata, file, key) {
@@ -3437,6 +3865,7 @@ async function loadRuntimeObservation(metadata, file, key) {
   try {
     stat = await fs.promises.lstat(file);
   } catch (error) {
+    deleteRuntimeObservationCacheEntry(key);
     if (error.code === "ENOENT") {
       return runtimeObservationFromState(createSessionSummaryState(), {
         coverage: "none",
@@ -3445,6 +3874,7 @@ async function loadRuntimeObservation(metadata, file, key) {
     throw error;
   }
   if (!stat.isFile() || stat.isSymbolicLink()) {
+    deleteRuntimeObservationCacheEntry(key);
     return runtimeObservationFromState(createSessionSummaryState(), {
       coverage: "none",
     });
@@ -3452,65 +3882,118 @@ async function loadRuntimeObservation(metadata, file, key) {
 
   const fileIdentity = `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
   let entry = runtimeObservationCache.get(key);
-  if (
-    !entry ||
-    entry.fileIdentity !== fileIdentity ||
-    stat.size < entry.offset
-  ) {
-    entry = newRuntimeObservationCacheEntry(stat);
-  }
+  runtimeObservationCache.delete(key);
+  let cacheCommitted = false;
 
-  const handle = await fs.promises.open(file, "r");
   try {
-    const buffer = Buffer.alloc(RUNTIME_OBSERVATION_READ_BYTES);
-    if (entry.offset === 0 && stat.size > RUNTIME_OBSERVATION_INITIAL_SCAN_BYTES) {
-      const headBytes = Math.min(RUNTIME_OBSERVATION_HEAD_BYTES, stat.size);
-      const headBuffer = Buffer.alloc(headBytes);
-      const headRead = await handle.read(headBuffer, 0, headBytes, 0);
-      const headText = headBuffer.subarray(0, headRead.bytesRead).toString("utf8");
-      const lastNewline = headText.lastIndexOf("\n");
-      if (lastNewline >= 0) {
-        addRuntimeObservationLines(
-          entry.state,
-          headText.slice(0, lastNewline + 1).split(/\r?\n/),
+    const handle = await fs.promises.open(file, "r");
+    try {
+      let historyHash = null;
+      let preserveFullGuard = false;
+      let preserveBoundaryGuards = false;
+      let cacheMatches = Boolean(
+        entry &&
+        entry.fileIdentity === fileIdentity &&
+        stat.size >= entry.offset
+      );
+      if (cacheMatches) {
+        const validation = await validateRuntimeObservationCache(
+          handle,
+          entry,
+          stat
+        );
+        cacheMatches = validation.matches;
+        historyHash = validation.historyHash;
+        preserveFullGuard = validation.preserveFullGuard;
+        preserveBoundaryGuards = validation.preserveBoundaryGuards;
+      }
+      if (!cacheMatches) {
+        disposeRuntimeObservationCacheEntry(entry);
+        entry = newRuntimeObservationCacheEntry(stat);
+        if (stat.size <= RUNTIME_OBSERVATION_FULL_GUARD_BYTES) {
+          historyHash = createHash("sha256");
+        }
+      }
+      if (entry.offset === 0 && stat.size > RUNTIME_OBSERVATION_INITIAL_SCAN_BYTES) {
+        const headBytes = Math.min(RUNTIME_OBSERVATION_HEAD_BYTES, stat.size);
+        const headBuffer = Buffer.alloc(headBytes);
+        const headRead = await handle.read(headBuffer, 0, headBytes, 0);
+        const headText = headBuffer.subarray(0, headRead.bytesRead).toString("utf8");
+        const lastNewline = headText.lastIndexOf("\n");
+        if (lastNewline >= 0) {
+          addRuntimeObservationLines(
+            entry.state,
+            headText.slice(0, lastNewline + 1).split(/\r?\n/),
+            metadata
+          );
+        }
+        markRuntimeObservationGap(entry.state);
+        entry.offset = Math.max(
+          headRead.bytesRead,
+          stat.size - RUNTIME_OBSERVATION_TAIL_BYTES
+        );
+        entry.discardUntilNewline = entry.offset > headRead.bytesRead;
+        entry.coverage = "head_tail";
+        entry.skippedBytes = Math.max(0, entry.offset - headRead.bytesRead);
+      }
+      historyHash = await consumeRuntimeObservationBytes(
+        handle,
+        entry,
+        stat,
+        metadata,
+        historyHash
+      );
+      if (
+        entry.coverage === "head_tail" &&
+        !entry.state.workflowObservationUncertain &&
+        !runtimeObservationHasRemainder(entry) &&
+        !entry.recordOverflowed
+      ) {
+        disposeRuntimeObservationCacheEntry(entry);
+        entry = newRuntimeObservationCacheEntry(stat);
+        historyHash = await consumeRuntimeObservationBytes(
+          handle,
+          entry,
+          stat,
           metadata
         );
+        preserveFullGuard = false;
+        preserveBoundaryGuards = false;
       }
-      resetRuntimeObservationWorkflowState(entry.state);
-      entry.offset = Math.max(headRead.bytesRead, stat.size - RUNTIME_OBSERVATION_TAIL_BYTES);
-      entry.discardUntilNewline = entry.offset > headRead.bytesRead;
-      entry.coverage = "head_tail";
-      entry.skippedBytes = Math.max(0, entry.offset - headRead.bytesRead);
+      await updateRuntimeObservationCacheGuards(handle, entry, stat, {
+        historyHash,
+        preserveFullGuard,
+        preserveBoundaryGuards,
+      });
+    } finally {
+      await handle.close();
     }
-    while (entry.offset < stat.size) {
-      const requestedBytes = Math.min(buffer.length, stat.size - entry.offset);
-      const { bytesRead } = await handle.read(
-        buffer,
-        0,
-        requestedBytes,
-        entry.offset
-      );
-      if (bytesRead <= 0) break;
-      entry.offset += bytesRead;
-      consumeRuntimeObservationText(
-        entry,
-        entry.decoder.write(buffer.subarray(0, bytesRead)),
-        metadata
-      );
+    runtimeObservationCache.set(key, entry);
+    while (runtimeObservationCache.size > MAX_RUNTIME_OBSERVATION_CACHE_ENTRIES) {
+      const oldestKey = runtimeObservationCache.keys().next().value;
+      const oldestEntry = runtimeObservationCache.get(oldestKey);
+      runtimeObservationCache.delete(oldestKey);
+      disposeRuntimeObservationCacheEntry(oldestEntry);
     }
+    const result = runtimeObservationFromState(entry.state, {
+      coverage: entry.coverage,
+      skippedBytes: entry.skippedBytes,
+      trailingRecordIncomplete: Boolean(
+        runtimeObservationHasRemainder(entry) ||
+        entry.discardUntilNewline ||
+        entry.recordOverflowed
+      ),
+    });
+    cacheCommitted = true;
+    return result;
   } finally {
-    await handle.close();
+    if (!cacheCommitted) {
+      if (runtimeObservationCache.get(key) === entry) {
+        runtimeObservationCache.delete(key);
+      }
+      disposeRuntimeObservationCacheEntry(entry);
+    }
   }
-
-  runtimeObservationCache.delete(key);
-  runtimeObservationCache.set(key, entry);
-  while (runtimeObservationCache.size > MAX_RUNTIME_OBSERVATION_CACHE_ENTRIES) {
-    runtimeObservationCache.delete(runtimeObservationCache.keys().next().value);
-  }
-  return runtimeObservationFromState(entry.state, {
-    coverage: entry.coverage,
-    skippedBytes: entry.skippedBytes,
-  });
 }
 
 export async function sessionRuntimeObservation(metadata) {
@@ -5611,7 +6094,7 @@ server.registerTool(
       const currentMetadata = await backendLaunchMetadata(sessionName);
       const currentObservation = await sessionRuntimeObservation(currentMetadata);
       const currentSignals = signalsWithWorkflowActivity(
-        result.signals,
+        captureSignals(result.capture || ""),
         currentObservation.workflowActivity
       );
       return text({
@@ -6052,26 +6535,22 @@ server.registerTool(
             ...publicSession
           } = session;
           let workflowActivity = emptyWorkflowActivity();
-          let workflowObservationStatus = "not_observed";
+          let workflowObservationAvailable = true;
           try {
             workflowActivity = (
               await sessionRuntimeObservation({ ...session, cwd })
             ).workflowActivity;
-            workflowObservationStatus = workflowActivity.evidence
-              ? "observed"
-              : "not_observed";
           } catch {
-            workflowObservationStatus = "unavailable";
+            workflowObservationAvailable = false;
           }
           managedSessions.push({
             ...publicSession,
             cwd,
             workflowActivity,
-            workflowPending:
-              workflowObservationStatus === "unavailable"
-                ? null
-                : workflowActivity.pendingCount > 0,
-            workflowObservationStatus,
+            ...workflowObservationStatusFields(
+              workflowActivity,
+              workflowObservationAvailable
+            ),
           });
         } catch {
           try {
@@ -6098,25 +6577,21 @@ server.registerTool(
       for (const session of await tmuxManagedSessions()) {
         const publicSession = publicLaunchMetadata(session);
         let workflowActivity = emptyWorkflowActivity();
-        let workflowObservationStatus = "not_observed";
+        let workflowObservationAvailable = true;
         try {
           workflowActivity = (
             await sessionRuntimeObservation(session)
           ).workflowActivity;
-          workflowObservationStatus = workflowActivity.evidence
-            ? "observed"
-            : "not_observed";
         } catch {
-          workflowObservationStatus = "unavailable";
+          workflowObservationAvailable = false;
         }
         managedSessions.push({
           ...publicSession,
           workflowActivity,
-          workflowPending:
-            workflowObservationStatus === "unavailable"
-              ? null
-              : workflowActivity.pendingCount > 0,
-          workflowObservationStatus,
+          ...workflowObservationStatusFields(
+            workflowActivity,
+            workflowObservationAvailable
+          ),
         });
       }
     }

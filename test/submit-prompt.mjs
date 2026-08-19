@@ -33,6 +33,42 @@ const pendingWorkflowSignals = signalsWithWorkflowActivity(captureSignals("> "),
 });
 assert.equal(submitPreflightReason(pendingWorkflowSignals), "workflow_pending");
 assert.equal(lifecycleBlockReason(pendingWorkflowSignals), "workflow_pending");
+const uncertainWorkflowSignals = signalsWithWorkflowActivity(captureSignals("> "), {
+  pendingCount: null,
+  lastKnownPendingCount: 1,
+  evidence: "claude_session_log_incomplete",
+  observationUncertain: true,
+  observationCoverage: "head_tail",
+  observationSkippedBytes: 4096,
+});
+assert.equal(uncertainWorkflowSignals.workflowPending, true);
+assert.equal(uncertainWorkflowSignals.workflowPendingCount, null);
+assert.equal(
+  uncertainWorkflowSignals.workflowPendingEvidence,
+  "claude_session_log_incomplete"
+);
+assert.equal(uncertainWorkflowSignals.workflowPendingObservedAt, "");
+assert.equal(uncertainWorkflowSignals.workflowObservationUncertain, true);
+assert.equal(submitPreflightReason(uncertainWorkflowSignals), "workflow_pending");
+assert.equal(lifecycleBlockReason(uncertainWorkflowSignals), "workflow_pending");
+const mixedUncertainWorkflowSignals = signalsWithWorkflowActivity(
+  captureSignals("✢ Waiting for 2 dynamic workflows to finish\n> "),
+  {
+    pendingCount: null,
+    lastKnownPendingCount: 1,
+    evidence: "claude_session_log_incomplete",
+    observationUncertain: true,
+    observationCoverage: "head_tail",
+    observationSkippedBytes: 4096,
+  }
+);
+assert.equal(mixedUncertainWorkflowSignals.workflowPending, true);
+assert.equal(mixedUncertainWorkflowSignals.workflowPendingCount, 2);
+assert.equal(
+  mixedUncertainWorkflowSignals.workflowPendingEvidence,
+  "terminal_heuristic"
+);
+assert.equal(mixedUncertainWorkflowSignals.workflowObservationUncertain, true);
 const approvalDuringWorkflow = signalsWithWorkflowActivity(
   captureSignals("Do you want to proceed?\nYes, and don't ask again"),
   {

@@ -4,16 +4,18 @@ import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const scriptPath = fileURLToPath(import.meta.url);
+const root = path.resolve(path.dirname(scriptPath), "..");
 const ignoredDirectories = new Set([".git", "node_modules"]);
 const ignoredFiles = new Set([".rail-export-state.json"]);
 const blockedArtifactExtensions = new Set([".tgz", ".zip", ".7z", ".rar", ".jsonl"]);
-const allowedUuids = new Set([
+export const allowedUuids = new Set([
   "00000000-0000-0000-0000-000000000000",
   "00000000-0000-4000-8000-000000000000",
   "11111111-1111-1111-1111-111111111111",
   "11111111-1111-4111-8111-111111111111",
   "12121212-1212-4121-8121-121212121212",
+  "12121212-1212-4212-8212-121212121212",
   "22222222-2222-4222-8222-222222222222",
   "33333333-3333-4333-8333-333333333333",
   "34343434-3434-4343-8343-343434343434",
@@ -24,10 +26,20 @@ const allowedUuids = new Set([
   "66666666-6666-4666-8666-666666666661",
   "66666666-6666-4666-8666-666666666662",
   "66666666-6666-4666-8666-666666666663",
+  "67676767-6767-4676-8676-676767676767",
+  "78787878-7878-4787-8787-787878787878",
   "88888888-8888-4888-8888-888888888888",
+  "89898989-8989-4898-8989-898989898989",
+  "90909090-9090-4909-8909-909090909090",
+  "91919191-9191-4919-8919-919191919191",
+  "92929292-9292-4929-8929-929292929292",
+  "93939393-9393-4939-8939-939393939393",
+  "94949494-9494-4949-8949-949494949494",
+  "95959595-9595-4959-8959-959595959595",
+  "96969696-9696-4969-8969-969696969696",
   "99999999-9999-4999-8999-999999999999",
 ]);
-const allowedRemoteIds = new Set([
+export const allowedRemoteIds = new Set([
   "fake_tui",
   "fork_binding_test",
   "session_abc123",
@@ -37,6 +49,12 @@ const allowedRemoteIds = new Set([
   "session_test",
   "session_tmux_integration",
 ]);
+
+export function isDirectExecution(entryPath = process.argv[1], modulePath = scriptPath) {
+  if (!entryPath) return false;
+  return fs.realpathSync.native(path.resolve(entryPath)) === fs.realpathSync.native(path.resolve(modulePath));
+}
+
 function walk(directory, relative = "") {
   const result = [];
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
@@ -115,38 +133,40 @@ function inspect(file, text, findings) {
   }
 }
 
-const findings = [];
-const files = new Set([...walk(root), ...trackedFiles()]);
-for (const file of files) {
-  if (ignoredFiles.has(file)) continue;
-  if (blockedArtifactExtensions.has(path.extname(file).toLowerCase())) {
-    findings.push(`${file}: generated archive or session artifact`);
-    continue;
+if (isDirectExecution()) {
+  const findings = [];
+  const files = new Set([...walk(root), ...trackedFiles()]);
+  for (const file of files) {
+    if (ignoredFiles.has(file)) continue;
+    if (blockedArtifactExtensions.has(path.extname(file).toLowerCase())) {
+      findings.push(`${file}: generated archive or session artifact`);
+      continue;
+    }
+    const source = path.join(root, ...file.split("/"));
+    if (fs.existsSync(source) && fs.statSync(source).isFile()) {
+      inspect(file, fs.readFileSync(source, "utf8"), findings);
+    }
   }
-  const source = path.join(root, ...file.split("/"));
-  if (fs.existsSync(source) && fs.statSync(source).isFile()) {
-    inspect(file, fs.readFileSync(source, "utf8"), findings);
-  }
-}
 
-const packed = new Set(packageFiles());
-for (const file of packed) {
-  if (
-    file.startsWith("test/") ||
-    file.startsWith(".github/") ||
-    ["install.sh", "install-windows.ps1", "provenance.json", ".rail-export-state.json"].includes(file)
-  ) {
-    findings.push(`npm package unexpectedly contains ${file}`);
+  const packed = new Set(packageFiles());
+  for (const file of packed) {
+    if (
+      file.startsWith("test/") ||
+      file.startsWith(".github/") ||
+      ["install.sh", "install-windows.ps1", "provenance.json", ".rail-export-state.json"].includes(file)
+    ) {
+      findings.push(`npm package unexpectedly contains ${file}`);
+    }
+    const source = path.join(root, ...file.split("/"));
+    if (fs.existsSync(source) && fs.statSync(source).isFile()) {
+      inspect(`npm:${file}`, fs.readFileSync(source, "utf8"), findings);
+    }
   }
-  const source = path.join(root, ...file.split("/"));
-  if (fs.existsSync(source) && fs.statSync(source).isFile()) {
-    inspect(`npm:${file}`, fs.readFileSync(source, "utf8"), findings);
+
+  if (findings.length) {
+    console.error([...new Set(findings)].join("\n"));
+    process.exit(1);
   }
-}
 
-if (findings.length) {
-  console.error([...new Set(findings)].join("\n"));
-  process.exit(1);
+  console.log(`privacy scan ok (${files.size} files, ${packed.size} packaged files)`);
 }
-
-console.log(`privacy scan ok (${files.size} files, ${packed.size} packaged files)`);

@@ -74,6 +74,23 @@ assert.equal(forcedBusyResult.forceUsed, true);
 assert.equal(forcedBusyResult.forcedPastReason, "busy");
 assert.equal(forcedBusy.calls.sendText.length, 1);
 
+const forcedUncertain = scriptedBackend(["> ", "> ", "> "]);
+forcedUncertain.dependencies.runtimeObservation = async () => ({
+  workflowActivity: {
+    pendingCount: null,
+    lastKnownPendingCount: 1,
+    evidence: "claude_session_log_incomplete",
+    observationUncertain: true,
+  },
+});
+const forcedUncertainResult = await runSubmitPrompt(
+  { ...input, force: true, submitRetries: 0 },
+  forcedUncertain.dependencies
+);
+assert.equal(forcedUncertainResult.forceUsed, true);
+assert.equal(forcedUncertainResult.forcedPastReason, "workflow_pending");
+assert.equal(forcedUncertain.calls.sendText.length, 1);
+
 const recovered = scriptedBackend(["> ", `> ${prompt}`, `> ${prompt}`, "Misting...   ( 1s  ·  1 tokens )\n> "]);
 const recoveredResult = await runSubmitPrompt(input, recovered.dependencies);
 assert.equal(recoveredResult.status, "submitted");

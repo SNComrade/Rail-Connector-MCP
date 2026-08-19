@@ -9,6 +9,7 @@ import {
   runtimeObservationFromRecords,
   signalsWithWorkflowActivity,
   trustedSessionLogPosture,
+  workflowObservationStatusFields,
 } from "../src/index.js";
 
 const cursorStyleProbe = "\x1b[>0q\x1b]0;claude\x07\x1b[38;2;215;119;87mHello";
@@ -420,10 +421,12 @@ assert.deepEqual(ultracodeRuntimeObservation.workflowActivity, {
   launchObserved: true,
   launchStatus: "async_launched",
   pendingCount: 1,
+  lastKnownPendingCount: null,
   pendingObservedAt: "2026-07-29T12:00:03Z",
   lastObservedAt: "2026-07-29T12:00:03Z",
   evidence: "claude_session_log",
   triggerAttribution: "unknown",
+  observationUncertain: false,
   observationCoverage: "full",
   observationSkippedBytes: 0,
 });
@@ -495,6 +498,21 @@ assert.equal(completedWorkflowSignals.workflowPending, false);
 assert.equal(completedWorkflowSignals.workflowPendingCount, 0);
 assert.equal(completedWorkflowSignals.workflowPendingEvidence, "");
 assert.equal(completedWorkflowSignals.workflowPendingObservedAt, "");
+assert.deepEqual(
+  workflowObservationStatusFields({
+    pendingCount: null,
+    evidence: "claude_session_log_incomplete",
+    observationUncertain: true,
+  }),
+  {
+    workflowPending: true,
+    workflowObservationStatus: "incomplete",
+  }
+);
+assert.deepEqual(workflowObservationStatusFields({}, false), {
+  workflowPending: null,
+  workflowObservationStatus: "unavailable",
+});
 assert.doesNotMatch(
   JSON.stringify(completedWorkflowObservation),
   /another-private-name|workflow-task-private-id/

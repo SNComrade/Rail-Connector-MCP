@@ -186,12 +186,21 @@ session is busy, replacement should be blocked unless
   time should be empty rather than retaining a historical task. Also inspect
   `terminalState`, `workflowObservationCoverage`, and
   `workflowObservationSkippedBytes`. `head_tail` means the first cold read
-  bounded a large log while preserving launch posture from the head and current
-  workflow lifecycle from the tail. A matching workflow task result or explicit
-  zero count should release session-log evidence. A bound interruption record
-  also clears tracked workflow tasks. If evidence remains stale, inspect before
-  using an explicit force recovery and verify its `forceUsed` or
-  `workflowInterrupted` result.
+  bounded a large log. If `workflowObservationUncertain` is true, the skipped
+  middle prevents proof of current workflow completion: head-only posture is
+  discarded, the log-derived current pending count is null, and ordinary
+  mutations fail closed. The same incomplete state can follow a trailing JSONL
+  fragment that exceeds the bounded record buffer; a later counter does not
+  erase that skipped record. If the terminal independently exposes the exact
+  workflow wait control line, its count and evidence take precedence while
+  `workflowObservationUncertain` remains true.
+  An explicit global workflow count or bound interruption in the observed tail
+  starts a complete replay before certainty is restored. Confirm coverage
+  becomes `full`; newer workflow evidence found in the skipped middle can keep
+  the session pending. A matching workflow task result alone may leave
+  uncertainty because an unseen middle record could have launched another
+  task. Inspect before using an explicit force recovery and verify its
+  `forceUsed` or `workflowInterrupted` result.
 - Check `textLength` and `textTruncated` before diagnosing a large report as
   incomplete.
 - `needs_attention` is expected for approval, trust, limit, interruption,

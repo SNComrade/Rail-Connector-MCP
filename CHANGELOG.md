@@ -62,6 +62,31 @@ Semantic Versioning after the first stable release.
   tasks instead of leaving `workflowPending` stuck after completion
 - Linux and macOS status output now removes legacy persisted
   `observedPosture` metadata before reporting current managed-session evidence
+- Bounded large-log recovery now preserves unresolved head workflow evidence,
+  fails closed across skipped lifecycle records, and does not report head-only
+  model, effort, or permission posture as current
+- Runtime-observation caches now reject truncate/regrow rewrites and fail
+  closed while an appended JSONL record is incomplete
+- Fully read cached history is whole-digest verified within the bounded read
+  window before accepting appends; unchanged observations avoid full rehashing
+  and oversized uncertain logs retain boundary guards until release replay
+- Valid final JSON records no longer require a trailing newline, while genuine
+  partial records still fail closed
+- Timestamp-regressing release records cannot clear newer workflow activity,
+  untracked historical completions do not advance the release watermark, and
+  repeated global counters conservatively reconcile mixed task populations
+- A tail checkpoint cannot clear a skipped-middle gap until one complete replay
+  confirms that no newer hidden workflow evidence remains pending
+- Trailing JSON records are assembled without quadratic copying and bounded per
+  record and across cached or concurrent loads; overflow remains fail-closed
+  across later counters
+- Cached state now compares stored boundary guards even when size and timestamps
+  appear unchanged, with change-time drift resetting same-length entries
+
+Migration: consumers should treat the additive `unknown_due_to_gap` workflow
+state and `incomplete` observation status as pending/unknown, use
+`workflowObservationUncertain` instead of exhaustive string matching, and not
+interpret `lastKnownPendingCount` as a current count.
 
 ### Security
 

@@ -493,6 +493,52 @@ try {
   assert.equal(boundedBytes.sessions[1].summarySkipped, true);
   assert.equal(boundedBytes.sessions[1].summarySkipReason, "scan_byte_budget_exhausted");
 
+  const boundedPostureDir = path.join(root, "bounded-posture");
+  const boundedPostureId = "12121212-1212-4212-8212-121212121212";
+  writeSession(
+    boundedPostureDir,
+    boundedPostureId,
+    [
+      {
+        sessionId: boundedPostureId,
+        timestamp: "2026-02-02T00:00:00Z",
+        type: "permission-mode",
+        permissionMode: "bypassPermissions",
+      },
+      {
+        sessionId: boundedPostureId,
+        timestamp: "2026-02-02T00:00:01Z",
+        effort: "high",
+        message: {
+          role: "assistant",
+          model: "claude-head-only",
+          content: [{ type: "text", text: "head posture" }],
+        },
+      },
+      ...Array.from({ length: 40 }, (_, index) => ({
+        sessionId: boundedPostureId,
+        timestamp: `2026-02-02T00:01:${String(index).padStart(2, "0")}Z`,
+        isSidechain: true,
+        message: {
+          role: "assistant",
+          model: "<synthetic>",
+          content: [{ type: "text", text: "p".repeat(256) }],
+        },
+      })),
+    ],
+    30
+  );
+  const boundedPosture = await listClaudeSessionSummaries(boundedPostureDir, {
+    limit: 1,
+    includeSnippets: false,
+    maxSummaryBytes: 4096,
+    byteBudget: 4096,
+  });
+  assert.equal(boundedPosture.sessions[0].summaryTruncated, true);
+  assert.equal(boundedPosture.sessions[0].observedPermissionMode, null);
+  assert.equal(boundedPosture.sessions[0].observedModel, null);
+  assert.equal(boundedPosture.sessions[0].observedEffort, null);
+
   const lifecycleDir = path.join(root, "lifecycle");
   const stateDir = path.join(root, "state");
   const lifecycleId = "22222222-2222-4222-8222-222222222222";

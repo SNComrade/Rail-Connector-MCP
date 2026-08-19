@@ -120,6 +120,7 @@ assert.match(operatorGuidance, /claude-opus-5/);
 assert.match(operatorGuidance, /conflicting_effort_evidence/);
 assert.match(operatorGuidance, /effort other than `xhigh` or `ultracode`/i);
 assert.match(operatorGuidance, /Rename `force` bypasses only/i);
+assert.match(operatorGuidance, /workflowObservationUncertain/);
 
 const debuggerGuidance = read(
   path.join(
@@ -133,6 +134,7 @@ assert.match(debuggerGuidance, /CLAUDE_CODE_EFFORT_LEVEL/);
 assert.match(debuggerGuidance, /workflow trigger\s+unknown/i);
 assert.match(debuggerGuidance, /effort other than `xhigh` or `ultracode`/i);
 assert.match(debuggerGuidance, /workflowObservationCoverage/);
+assert.match(debuggerGuidance, /workflowObservationUncertain/);
 assert.match(debuggerGuidance, /tmux 3\.2 or newer/i);
 
 const reviewerGuidance = [
@@ -151,5 +153,6 @@ assert.match(reviewerGuidance, /no recursive delegation/i);
 assert.match(reviewerGuidance, /5 findings/i);
 assert.match(reviewerGuidance, /10 minutes/i);
 assert.match(reviewerGuidance, /200k aggregate tokens/i);
+assert.match(reviewerGuidance, /workflowObservationUncertain/);
 
 console.log(`skills ok (${expectedSkills.length})`);

@@ -186,10 +186,28 @@ cannot prove one. Failed, cancelled, rejected, and unknown workflow statuses
 do not become successful launch evidence.
 Current session-log evidence is recomputed for each posture report so stale
 persisted correlation cannot hide a newer conflict. The MCP incrementally
-reduces the complete append-only log for each bound launch, so direct evidence
-does not disappear when a conversation grows beyond the transcript tail
-window. This cache is process-local, bounded, and reset when the log is
-replaced or truncated; it is not broker or tmux posture persistence.
+reduces append-only records observed for each bound launch. A first cold read
+of an oversized log uses bounded head/tail recovery; skipped-middle workflow
+state and trailing partial records fail closed, and head-only permission,
+model, and effort are not reported as current. Fully read logs retain a
+whole-history digest within the same bounded read window and verify it before
+accepting appended bytes. The digest is extended while appended bytes are
+parsed, and an unchanged observation does not hash the complete history again.
+Stored prefix and offset-anchor guards are still compared before unchanged
+metadata can reuse cached state; change-time drift resets same-length entries.
+Oversized logs retain prefix and offset-anchor guards without rehashing the
+skipped middle on each observation. An explicit workflow checkpoint in the
+observed tail is only a candidate release: the MCP performs one complete replay
+before restoring certainty, so newer hidden-middle evidence cannot be erased by
+an older tail record. This bounded design treats Claude's session log as
+append-only; it does not claim to authenticate against another local process
+deliberately rewriting an oversized skipped middle while preserving both
+boundary guards. Trailing JSON records are buffered in chunks with an 8 MiB
+per-record and 32 MiB process-wide bound shared by cached and concurrently
+loading fragments. An overflow is discarded to the next record boundary but
+remains fail-closed because its workflow content was not observed; a later
+counter cannot silently clear that evidence gap.
+The cache is bounded and is not broker or tmux posture persistence.
 Terminal-only posture
 heuristics are returned for the current capture but are not persisted as
 durable observation. Legacy broker or tmux `observedPosture` metadata remains

@@ -296,8 +296,42 @@ The first session-log observation is bounded. Small logs are read fully; large
 logs use a 256 KiB head plus a 2 MiB tail and then continue incrementally from
 that checkpoint. `workflowObservationCoverage` reports `full`, `head_tail`, or
 `none`, and `workflowObservationSkippedBytes` reports any skipped middle bytes.
-When the middle was skipped, workflow state is rebuilt only from the recent
-tail so old head records cannot masquerade as current pending work.
+When the middle was skipped, head-only model, effort, and permission posture is
+discarded rather than presented as current. Any workflow launch or pending
+state from the head remains historical evidence, but current workflow state is
+reported as `unknown_due_to_gap` with `workflowObservationUncertain: true`, a
+null `workflowPendingCount`, and `claude_session_log_incomplete` evidence until
+the tail supplies an explicit global counter or bound interruption as a
+candidate release. Before reporting certainty, the MCP replays the complete log
+once and validates releases against the newest observed workflow timestamp; a
+newer launch hidden in the skipped middle therefore keeps the session pending.
+Successful replay changes coverage to `full` and clears the skipped-byte count.
+This uncertainty fails
+closed as `workflowPending: true`, so ordinary submit, text, Enter, rename,
+replacement, and stop operations remain blocked. Inspect before using an
+explicit force recovery. `lastKnownPendingCount` preserves the most recent
+historical count without presenting it as current. The `status` tool reports
+`workflowObservationStatus: "incomplete"` and `workflowPending: true` for this
+state. If the terminal independently shows Claude's exact workflow wait control
+line, its current count and `terminal_heuristic` evidence take precedence while
+`workflowObservationUncertain` remains true. A trailing partial JSONL record is
+assembled in chunks and treated with the same fail-closed uncertainty until the
+record is complete or the log is replaced. A single trailing record is bounded
+to 8 MiB and all cached plus in-flight fragments to 32 MiB; overflow is
+discarded through its next newline but remains incomplete for that cache entry
+so a later counter cannot erase unobserved evidence. Bounded session listings
+likewise discard head-only permission, model, and effort rather than presenting
+stale posture as current.
+Fully read cached history is digest-verified within the same bounded read
+window before appended records are accepted; the digest is extended during the
+incremental read instead of re-reading the file, and unchanged observations do
+not rehash it. Unchanged file metadata is never trusted by itself: stored
+boundary guards are still compared before cached state is reused. Oversized
+uncertain logs keep boundary guards until a candidate release requires the
+one-time full replay. A valid final JSON object is accepted without requiring a
+trailing newline, while a genuinely partial record remains uncertain.
+Timestamp-regressing release records and untracked completions cannot release
+newer workflow evidence.
 
 Use `waitAfterCursor` returned by `submit_prompt` when waiting:
 

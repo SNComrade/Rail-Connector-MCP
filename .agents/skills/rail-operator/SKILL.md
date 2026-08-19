@@ -34,6 +34,10 @@ task project as `cwd`, even when this skill is loaded from the MCP repo.
   `workflowPending` is false, `workflowPendingEvidence` is intentionally empty;
   use `workflowObservationCoverage` and `workflowObservationSkippedBytes` to
   tell a full scan from a bounded head/tail recovery of a large session log.
+  Treat `workflowObservationUncertain: true` as a fail-closed pending state:
+  skipped-middle history cannot prove current workflow completion or current
+  model, effort, or permission posture. A tail checkpoint must complete a full
+  replay before the MCP reports restored certainty.
 - Treat `C-m`, `C-j`, `KPEnter`, and other documented Enter equivalents as
   submissions. They use the same pending-workflow gate as `Enter` and `Return`.
 - Do not infer workflow completion from a final assistant record alone. Keep
