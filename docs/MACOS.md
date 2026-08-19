@@ -22,8 +22,10 @@ command -v node
 command -v claude
 ```
 
-Supported Node majors are 22, 24, and 26. Install and authenticate Claude Code
-using Anthropic's current instructions before registering this MCP.
+Supported Node majors are 22, 24, and 26. Rail Connector requires tmux 3.2 or
+newer and checks it before launching or replacing a managed session. Install
+and authenticate Claude Code using Anthropic's current instructions before
+registering this MCP.
 
 `node-pty` normally selects a compatible prebuilt binary. If `npm ci` reports a
 native-module build failure, install Apple's Command Line Tools with
@@ -32,7 +34,7 @@ native-module build failure, install Apple's Command Line Tools with
 ## Install A Tagged Release
 
 ```bash
-git clone --branch v1.0.0-beta.1 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 ./install.sh
 ```

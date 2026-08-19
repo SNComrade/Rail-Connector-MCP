@@ -32,6 +32,11 @@ Constraints:
 - Prefer file and line references for every actionable finding.
 - If you are blocked by missing tools, auth, session limits, or unclear scope,
   report the blocker plainly.
+- Do not delegate or launch a dynamic workflow unless this prompt explicitly
+  authorizes it. If parallel review is authorized without caller-supplied
+  bounds, use at most 3 workflow agents, one pass, no recursive delegation, at
+  most 5 findings, 10 minutes, and 200k aggregate tokens. Stop and synthesize
+  when any bound is reached.
 
 Return this structure:
 1. Findings

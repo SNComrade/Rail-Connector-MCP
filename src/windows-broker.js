@@ -94,6 +94,12 @@ function keySequence(key) {
   const keys = {
     Enter: "\r",
     Return: "\r",
+    "C-m": "\r",
+    "Ctrl-M": "\r",
+    "C-j": "\r",
+    "Ctrl-J": "\r",
+    KPEnter: "\r",
+    NumpadEnter: "\r",
     Escape: "\x1b",
     Esc: "\x1b",
     "C-c": "\x03",
@@ -107,7 +113,10 @@ function keySequence(key) {
     Right: "\x1b[C",
     Left: "\x1b[D",
   };
-  return keys[key] ?? String(key);
+  if (Object.hasOwn(keys, key)) return keys[key];
+  const error = new Error(`Unsupported native Windows key name: ${key}`);
+  error.code = "EINVAL";
+  throw error;
 }
 
 async function withOperationLock(sessionName, operation) {
@@ -193,6 +202,62 @@ function validatedLaunchCwd(payload) {
 
 function windowsCommandLineValue(value) {
   return `"${String(value).replaceAll('"', '""')}"`;
+}
+
+function validatedLaunchEnvironment(value) {
+  if (value === null || value === undefined) return null;
+  const validStatus = ["compatible", "blocking"].includes(value.status);
+  const validEffort = [
+    "unset",
+    "compatible_xhigh",
+    "blocking_non_xhigh",
+  ].includes(value.effortOverrideStatus);
+  const validBlockers =
+    Array.isArray(value.blockers) &&
+    value.blockers.length <= 2 &&
+    value.blockers.every((blocker) =>
+      ["non_xhigh_effort_override", "workflows_disabled"].includes(blocker)
+    );
+  if (
+    !validStatus ||
+    value.evidenceScope !== "claude_child_launch_environment" ||
+    !validEffort ||
+    typeof value.workflowsDisabled !== "boolean" ||
+    !validBlockers
+  ) {
+    const error = new Error("Invalid Claude child launch environment metadata.");
+    error.code = "ELAUNCHENV";
+    throw error;
+  }
+  const launchSnapshot = {
+    status: value.status,
+    evidenceScope: "claude_child_launch_environment",
+    effortOverrideStatus: value.effortOverrideStatus,
+    workflowsDisabled: value.workflowsDisabled,
+    blockers: [...new Set(value.blockers)].sort(),
+    note:
+      value.status === "blocking"
+        ? "The captured Claude child launch environment contains an override that prevents the requested UltraCode workflow posture."
+        : "No blocking UltraCode override was present in the captured Claude child launch environment. Claude settings can still differ.",
+  };
+  const expectedBlockers = [];
+  if (launchSnapshot.effortOverrideStatus === "blocking_non_xhigh") {
+    expectedBlockers.push("non_xhigh_effort_override");
+  }
+  if (launchSnapshot.workflowsDisabled) {
+    expectedBlockers.push("workflows_disabled");
+  }
+  if (
+    launchSnapshot.blockers.length !== value.blockers.length ||
+    JSON.stringify(launchSnapshot.blockers) !== JSON.stringify(expectedBlockers) ||
+    launchSnapshot.status !==
+      (expectedBlockers.length ? "blocking" : "compatible")
+  ) {
+    const error = new Error("Inconsistent Claude child launch environment metadata.");
+    error.code = "ELAUNCHENV";
+    throw error;
+  }
+  return launchSnapshot;
 }
 
 function validatedPtyLaunch(payload) {
@@ -282,6 +347,7 @@ function sessionMetadata(sessionName, session) {
     args: session.args,
     requestedPosture: session.requestedPosture ?? null,
     resolvedPosture: session.resolvedPosture ?? null,
+    launchEnvironment: session.launchEnvironment ?? null,
     resolvedSessionId: session.resolvedSessionId ?? null,
     observedPosture: session.observedPosture ?? null,
     exited: session.exited,
@@ -407,6 +473,7 @@ async function startSession(
     throw error;
   }
   const { requestedCwd, canonicalCwd } = launchCwd;
+  const launchEnvironment = validatedLaunchEnvironment(payload.launchEnvironment);
   const renderer = createTerminalRenderer({
     cols: clampInteger(payload.cols, 140, 40, 400),
     rows: clampInteger(payload.rows, 40, 10, 200),
@@ -441,6 +508,7 @@ async function startSession(
     args: launch.metadataArgs,
     requestedPosture: payload.requestedPosture ?? null,
     resolvedPosture: payload.resolvedPosture ?? null,
+    launchEnvironment,
     resolvedSessionId: payload.resolvedSessionId ?? null,
     observedPosture: payload.observedPosture ?? null,
     lease: {
@@ -726,6 +794,11 @@ async function handleOperation(operation, payload) {
       if (payload.resolvedSessionId) session.resolvedSessionId = String(payload.resolvedSessionId);
       if (payload.requestedPosture) session.requestedPosture = payload.requestedPosture;
       if (payload.resolvedPosture) session.resolvedPosture = payload.resolvedPosture;
+      if (payload.launchEnvironment) {
+        session.launchEnvironment = validatedLaunchEnvironment(
+          payload.launchEnvironment
+        );
+      }
       if (payload.observedPosture) session.observedPosture = payload.observedPosture;
       return { status: "updated", metadata: sessionMetadata(sessionName, session) };
     }

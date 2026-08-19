@@ -14,7 +14,11 @@ Before launch, determine:
 
 Call `get_claude_capabilities` before relying on version-sensitive controls.
 The MCP resolves semantic requests against the installed Claude CLI and reports
-requested, resolved, and observed posture separately.
+requested, resolved, and observed posture separately. Probe exit status is
+calibrated against an invalid control; timeout and termination are
+inconclusive. For an existing session, use the persisted sanitized
+`launchEnvironment` rather than substituting the environment of a refreshed
+MCP process.
 
 ## Review Workflow
 
@@ -44,7 +48,8 @@ transcript result over scraping the animated terminal. Use
 interruption, or terminal-state diagnosis. Treat `tool_use` as in progress,
 and check `textTruncated` before treating an unusually large answer as complete.
 A completed turn can also carry an additive `attention` warning; preserve the
-answer and handle that weaker warning separately.
+answer and handle that weaker warning separately. `workflowPending: true`
+keeps the wait active even if an assistant completion record is present.
 
 The cursor is opaque but portable across a Codex task refresh. It binds the
 prior user/assistant records, submission time, conversation UUID, and managed
@@ -109,10 +114,19 @@ compatible.
 For a shared managed session:
 
 1. Inspect `status` and capture.
-2. Wait until Claude is idle.
+2. Wait until Claude is idle and `workflowPending` is false.
 3. Submit one complete prompt.
 4. Wait for that turn's new transcript cursor.
 5. Rename, replace, or stop only while idle unless interruption is intentional.
+
+The `workflow_pending` block reason protects a dynamic workflow between MCP
+operations. Do not bypass it merely because the composer looks empty; inspect
+the evidence and use an explicit force control only when interruption is the
+operator's intent. Enter aliases such as `C-m`, `C-j`, and `KPEnter` are
+submission-equivalent and receive the same guard. If an interruption leaves
+stale evidence, text, Enter-equivalent key, rename, submit, replacement, and
+stop operations provide explicit recovery controls and report whether force was
+used.
 
 ## Avoid Hanging Interactive Commands
 
@@ -162,6 +176,11 @@ To change them:
 3. Stop the idle managed terminal gracefully.
 4. Start it again with that `sessionId` and the new posture.
 5. Verify resolved and observed posture.
+
+When inspecting after a refresh, compare
+`posture.ultracodeAssessment.launchEnvironment` with
+`currentMcpEnvironment`. A difference describes process provenance; it does
+not by itself prove that Claude changed posture.
 
 `killExisting: true` automates replacement only for an idle session.
 `forceKillExisting: true` may interrupt in-flight work and must be deliberate.

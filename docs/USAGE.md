@@ -22,9 +22,16 @@ cannot interleave prompt text, keys, rename commands, or stop requests.
 ## Inspect Capabilities
 
 `get_claude_capabilities` runs bounded `claude --version`, `claude --help`, and
-related probes without starting an interactive session. Call it before using
-permission or effort controls because Claude CLI help and accepted values can
-change between releases.
+paired `--effort=ultracode --version` plus invalid-effort control probes without
+starting an interactive session. Call it before using permission or effort controls because
+Claude CLI help and accepted values can change between releases. The UltraCode
+result uses completed child exit status as its primary evidence: the requested
+value must exit zero and the invalid control must exit nonzero. Error wording is
+corroborative only; a timeout or signal termination is inconclusive. Successful
+inspection is cached for at most 60 seconds per resolved executable identity,
+file fingerprint, policy mode, and sanitized environment category. The result
+also reports blockers visible in the current MCP process environment. It does
+not authenticate account or server-side policy state.
 
 The MCP treats `permissionMode: "default"` as a semantic request. At launch it
 resolves that request to the installed CLI's advertised `default` or `manual`
@@ -35,7 +42,9 @@ For current Claude builds that support it, `ultracode: true` resolves to
 `--effort=ultracode`. The older generic settings request remains only as a
 capability-reported compatibility fallback. Capability inspection reports the
 chosen mechanism; launch and capture responses report requested, resolved, and
-observed posture separately.
+observed posture separately. Anthropic's current settings reference documents
+the direct launch form for Claude Code v2.1.203 and later:
+[Claude Code settings](https://code.claude.com/docs/en/settings#available-settings).
 
 ## List And Inspect Conversations
 
@@ -105,7 +114,9 @@ of guessing that a concurrent new log belongs to this process.
 Use `killExisting: true` to replace an idle managed terminal. Every non-idle
 state, including trust, approval, interruption, pasted input, and a non-empty
 composer, is protected unless `forceKillExisting: true` is also explicitly
-passed. Forced replacement never types `/exit` into a non-idle composer.
+passed. A pending dynamic workflow is protected with the distinct
+`workflow_pending` reason even when the composer otherwise appears idle.
+Forced replacement never types `/exit` into a non-idle composer.
 
 ## Permission Modes
 
@@ -192,13 +203,40 @@ Start and capture responses contain a `posture` object:
 - `resolved` records the exact CLI values and launch mechanism.
 - `observed` records session-log or terminal evidence.
 - `evidence` identifies the source for each observed field.
+- `ultracodeAssessment` separates launch acceptance, runtime effort, sanitized
+  workflow activity, environment blockers, conflicts, and unknowns.
+- `ultracodeAssessment.launchEnvironment` is the sanitized snapshot captured
+  from the environment actually supplied to the Claude child.
+- `ultracodeAssessment.currentMcpEnvironment` describes the inspecting MCP
+  process. `environmentComparison` is `match`, `different`, or
+  `launch_not_recorded` for an older session.
 
 Treat missing observation as unknown, not as a failed request. Session-log
 evidence is stronger than terminal heuristics, but neither is a privileged
-Anthropic state API. Current Claude logs record direct Ultracode turns as
-`effort: "xhigh"`; when that is correlated with the resolved
-`--effort=ultracode` launch, the field is labeled
-`claude_session_log_correlated_with_resolved_launch`.
+Anthropic state API. Claude can record `effort: "xhigh"` for an UltraCode
+request because UltraCode uses xhigh underneath. The MCP reports that as
+`xhigh_correlated_unconfirmed`; it does not promote xhigh alone to confirmed
+UltraCode. Sanitized successful local-workflow launch records or a pending
+count greater than zero produce `workflow_activity_observed`, while
+`workflowTriggerAttribution` remains `unknown` because the log does not prove
+what triggered the workflow. Failed, cancelled, rejected, and unknown workflow
+statuses do not become successful launch evidence.
+
+After a Codex or MCP refresh, use `launchEnvironment` for launch provenance and
+the current field only as present-process diagnostics. A current blocker does
+not retroactively prove that an already-running child launched with that
+blocker. Raw environment values are never persisted or returned.
+
+Remote Control web may label the underlying xhigh setting `Extra` while
+UltraCode is active. A session-bound web `Extra` is compatible UI presentation,
+not confirmation, conflict, or workflow evidence; context-free terminal text
+remains unmapped. Any effort other than `xhigh` or `ultracode`, such as `high`
+or `max`, bound to the same managed session is conflicting evidence. On an
+idle, empty composer, `/effort ultracode` returning the explicit UltraCode
+setting is current-setting evidence, but the command can change posture and
+does not prove launch provenance. Use a substantive turn when validating
+workflow activity. Bind visual comparisons to the same managed name,
+conversation UUID, generation, and time window.
 
 ## Submit And Wait
 
@@ -213,6 +251,11 @@ Use `submit_prompt` for complete, multiline prompts:
   "force": false
 }
 ```
+
+Default review prompts should not delegate. When parallel review is explicitly
+authorized but no budget is supplied, bound Claude to at most 3 workflow
+agents, one pass, no recursive delegation, 5 findings, 10 minutes, and 200k
+aggregate tokens. Stop and synthesize when any bound is reached.
 
 The tool uses Unicode-safe chunks, bracketed paste only when the terminal
 reports that mode enabled, a short Windows paste-settle delay, JSONL prompt
@@ -234,6 +277,61 @@ not lock an idle composer. Fixed approval, trust, limit, interruption, and
 paste markers are scoped to the active TUI phase after the latest spinner or
 completion boundary, so an assistant report quoting a complete terminal screen
 does not become a live control prompt.
+
+Claude's exact `Waiting for N dynamic workflow(s) to finish` control line is
+also a busy marker. The MCP combines that terminal heuristic with sanitized
+session-log task lifecycle evidence and returns `workflowPending`,
+`workflowPendingCount`, `workflowPendingEvidence`, and
+`workflowPendingObservedAt`. Workflow names, task IDs, prompts, and results are
+not exposed through these fields. A later matching task result, explicit zero
+counter, bound interruption record, or newer terminal completion marker
+releases its corresponding session-log or terminal evidence. An unidentified
+launch remains fail-closed until one of those explicit release events arrives.
+`workflowPendingEvidence` and `workflowPendingObservedAt` are empty whenever no
+workflow is currently pending. `terminalState` preserves a simultaneous
+approval, trust, draft, or other terminal state so workflow-only force controls
+cannot bypass it.
+
+The first session-log observation is bounded. Small logs are read fully; large
+logs use a 256 KiB head plus a 2 MiB tail and then continue incrementally from
+that checkpoint. `workflowObservationCoverage` reports `full`, `head_tail`, or
+`none`, and `workflowObservationSkippedBytes` reports any skipped middle bytes.
+When the middle was skipped, head-only model, effort, and permission posture is
+discarded rather than presented as current. Any workflow launch or pending
+state from the head remains historical evidence, but current workflow state is
+reported as `unknown_due_to_gap` with `workflowObservationUncertain: true`, a
+null `workflowPendingCount`, and `claude_session_log_incomplete` evidence until
+the tail supplies an explicit global counter or bound interruption as a
+candidate release. Before reporting certainty, the MCP replays the complete log
+once and validates releases against the newest observed workflow timestamp; a
+newer launch hidden in the skipped middle therefore keeps the session pending.
+Successful replay changes coverage to `full` and clears the skipped-byte count.
+This uncertainty fails
+closed as `workflowPending: true`, so ordinary submit, text, Enter, rename,
+replacement, and stop operations remain blocked. Inspect before using an
+explicit force recovery. `lastKnownPendingCount` preserves the most recent
+historical count without presenting it as current. The `status` tool reports
+`workflowObservationStatus: "incomplete"` and `workflowPending: true` for this
+state. If the terminal independently shows Claude's exact workflow wait control
+line, its current count and `terminal_heuristic` evidence take precedence while
+`workflowObservationUncertain` remains true. A trailing partial JSONL record is
+assembled in chunks and treated with the same fail-closed uncertainty until the
+record is complete or the log is replaced. A single trailing record is bounded
+to 8 MiB and all cached plus in-flight fragments to 32 MiB; overflow is
+discarded through its next newline but remains incomplete for that cache entry
+so a later counter cannot erase unobserved evidence. Bounded session listings
+likewise discard head-only permission, model, and effort rather than presenting
+stale posture as current.
+Fully read cached history is digest-verified within the same bounded read
+window before appended records are accepted; the digest is extended during the
+incremental read instead of re-reading the file, and unchanged observations do
+not rehash it. Unchanged file metadata is never trusted by itself: stored
+boundary guards are still compared before cached state is reused. Oversized
+uncertain logs keep boundary guards until a candidate release requires the
+one-time full replay. A valid final JSON object is accepted without requiring a
+trailing newline, while a genuinely partial record remains uncertain.
+Timestamp-regressing release records and untracked completions cannot release
+newer workflow evidence.
 
 Use `waitAfterCursor` returned by `submit_prompt` when waiting:
 
@@ -259,7 +357,9 @@ interruption, and exit states take priority over completion and return
 `needs_attention`. A completed transcript can be returned with an additive
 `attention` value for a weaker stale limit or paste banner. The tool returns
 `timeout` when the bounded wait expires. A `tool_use` stop reason is not a
-completed turn.
+completed turn. A terminal assistant record also does not complete the wait
+while `workflowPending` remains true; the wait resumes only after the workflow
+lifecycle reaches zero or a bounded timeout is returned.
 Final assistant text is returned up to 128 KiB with `textLength` and
 `textTruncated`, so callers can detect the uncommon larger response.
 
@@ -269,6 +369,18 @@ through `send_text` can submit early; prefer `submit_prompt` for real prompts.
 return a non-empty `waitAfterCursor`. Their `submitted` field is true only when
 the session log or composer transition provides evidence that a Claude turn
 started, so pressing Enter on a menu does not create a false in-process anchor.
+Low-level text and Enter submission return `send_blocked` with reason
+`workflow_pending` instead of typing into an active dynamic workflow. This
+includes Enter aliases such as `C-m`, `C-j`, and `KPEnter`. Escape and
+cancellation keys remain available for deliberate operator control. The
+native Windows backend accepts only its documented key names and returns
+`EINVAL` for an unsupported name instead of typing that name into Claude's
+composer. If an interruption leaves stale pending evidence, inspect the
+capture first;
+`send_text`, Enter-equivalent `send_key`, and rename each accept an explicit
+`force: true` recovery and report `forceUsed` when it bypasses this one gate.
+`submit_prompt` also reports `forcedPastReason` when its inspected force
+override crosses a busy or non-idle preflight gate.
 
 ## Rename And Archive
 
@@ -280,6 +392,10 @@ Rename the conversation attached to a running, idle terminal:
   "title": "Feature review complete"
 }
 ```
+
+Rename is also blocked with `workflow_pending`. Use its `force: true` recovery
+only after confirming that pending evidence is stale; it does not bypass other
+non-idle attention or composer states.
 
 `rename_claude_session` sends Claude's `/rename` command and verifies the exact
 title in the local session log. Repeating the same title returns
@@ -318,7 +434,14 @@ Stop defaults to a graceful exit and refuses a non-idle session:
 ```
 
 Use `force: true` only after inspecting the capture and deciding that in-flight
-work may be interrupted.
+work may be interrupted. If stop reports `awaiting_input`, preserve the unsent
+draft: submit it only with authorization, explicitly discard and recapture only
+with authorization, or leave the session running. Never force-stop a draft as
+routine cleanup. A pending dynamic workflow returns `stop_blocked` with reason
+`workflow_pending`; wait for it to finish or use `force: true` only after
+accepting that the in-flight workflow will be interrupted. A forced stop returns
+`forceUsed` and `workflowInterrupted`; forced replacement reports the matching
+`replacementForceUsed` and `workflowInterrupted` fields on the new launch.
 
 ## Windows Broker
 

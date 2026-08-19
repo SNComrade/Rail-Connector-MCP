@@ -1,7 +1,27 @@
 import assert from "node:assert/strict";
-import { startupReadiness, withSessionOperationLock } from "../src/index.js";
+import {
+  keySubmitsComposer,
+  startupReadiness,
+  withSessionOperationLock,
+} from "../src/index.js";
 
 const idleSignals = { state: "idle", ultracodeUnavailable: false };
+
+for (const key of [
+  "Enter",
+  "Return",
+  "C-m",
+  "Ctrl-M",
+  "C-j",
+  "Ctrl-J",
+  "KPEnter",
+  "NumpadEnter",
+]) {
+  assert.equal(keySubmitsComposer(key), true, `${key} must be submission-equivalent`);
+}
+for (const key of ["Escape", "C-c", "Tab", "Up", "Down"]) {
+  assert.equal(keySubmitsComposer(key), false, `${key} must remain a control key`);
+}
 
 assert.deepEqual(
   startupReadiness({

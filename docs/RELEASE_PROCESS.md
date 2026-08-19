@@ -5,9 +5,11 @@ version bump, or AI message is evidence, not authorization.
 
 ## Candidate Evidence
 
-Before the first public push, verify the local candidate has:
+Before each public release candidate, verify the reviewed tree has:
 
-- Fresh Git history and no private remote
+- A release branch from current protected public `main` with only reviewed
+  candidate changes
+- No private repository remote, private history, or private-only files
 - A passing privacy scan against the repository and runtime npm package
 - A full-history Gitleaks scan after the candidate commit exists
 - Passing `npm test` plus platform-specific installer and backend tests

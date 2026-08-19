@@ -21,7 +21,7 @@ only to describe interoperability. See [NOTICE](NOTICE).
 
 ## Status
 
-The current version is `1.0.0-beta.1`, the first public beta candidate. Treat
+The current version is `1.0.0-beta.2`, the second public beta. Treat
 the MCP tool schemas and response fields as prerelease interfaces until a stable
 release is published. See [Compatibility](COMPATIBILITY.md).
 
@@ -48,7 +48,7 @@ registry. Git tags and GitHub Releases are the public release authority.
 - npm and Git
 - Claude Code CLI installed and authenticated
 - Codex Desktop or Codex CLI with local MCP server support
-- tmux 2.4 or newer on Linux/macOS
+- tmux 3.2 or newer on Linux/macOS
 - Build prerequisites for `node-pty` when a matching prebuilt binary is not
   available; see [Troubleshooting](docs/TROUBLESHOOTING.md)
 
@@ -76,7 +76,7 @@ For a published release, clone the immutable tag:
 Linux:
 
 ```bash
-git clone --branch v1.0.0-beta.1 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 ./install.sh
 ```
@@ -87,7 +87,7 @@ macOS uses the same installer after the prerequisites in
 Native Windows PowerShell:
 
 ```powershell
-git clone --branch v1.0.0-beta.1 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 .\install-windows.ps1
 ```

@@ -6,7 +6,7 @@ Install the MCP in the same OS context as Codex and Claude Code.
 - [Linux/WSL Install](LINUX.md)
 - [macOS Install](MACOS.md)
 
-Tagged release instructions use the immutable `v1.0.0-beta.1` source. Clone
+Tagged release instructions use the immutable `v1.0.0-beta.2` source. Clone
 without `--branch` only when intentionally evaluating mutable `main`.
 
 ## Requirements
@@ -15,7 +15,7 @@ without `--branch` only when intentionally evaluating mutable `main`.
 - npm
 - Claude Code installed and authenticated
 - Codex Desktop or Codex CLI
-- tmux 2.4 or newer on Linux/macOS
+- tmux 3.2 or newer on Linux/macOS
 - Git
 
 ## Native Install
@@ -23,7 +23,7 @@ without `--branch` only when intentionally evaluating mutable `main`.
 Linux/macOS:
 
 ```bash
-git clone --branch v1.0.0-beta.1 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 ./install.sh
 ```
@@ -31,7 +31,7 @@ cd Rail-Connector-MCP
 Windows:
 
 ```powershell
-git clone --branch v1.0.0-beta.1 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 .\install-windows.ps1
 ```

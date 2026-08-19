@@ -4,9 +4,12 @@ import {
   captureSignals,
   launchPostureReport,
   mergeObservedPosture,
+  publicLaunchMetadata,
   renderCapture,
   runtimeObservationFromRecords,
+  signalsWithWorkflowActivity,
   trustedSessionLogPosture,
+  workflowObservationStatusFields,
 } from "../src/index.js";
 
 const cursorStyleProbe = "\x1b[>0q\x1b]0;claude\x07\x1b[38;2;215;119;87mHello";
@@ -72,6 +75,55 @@ assert.equal(captureSignals("> Review how esc to interrupt is detected").likelyB
 assert.equal(captureSignals("> Review how esc to interrupt is detected").state, "awaiting_input");
 assert.equal(captureSignals("✻ Sock-hopping...\n> ").likelyBusy, true);
 assert.equal(captureSignals("✽ Billowing...\n> ").likelyBusy, true);
+const workflowWaitSignals = captureSignals(
+  "✢ Waiting for 1 dynamic workflow to finish\n> "
+);
+assert.equal(workflowWaitSignals.state, "busy");
+assert.equal(workflowWaitSignals.terminalState, "idle");
+assert.equal(workflowWaitSignals.likelyBusy, true);
+assert.equal(workflowWaitSignals.workflowPending, true);
+assert.equal(workflowWaitSignals.workflowPendingCount, 1);
+assert.equal(workflowWaitSignals.workflowPendingEvidence, "terminal_heuristic");
+const combinedWorkflowWaitSignals = captureSignals(
+  "✢ Waiting for 2 background agents and 3 dynamic workflows to finish\n> "
+);
+assert.equal(combinedWorkflowWaitSignals.workflowPending, true);
+assert.equal(combinedWorkflowWaitSignals.workflowPendingCount, 3);
+assert.equal(
+  captureSignals("Waiting for 0 dynamic workflows to finish\n> ").workflowPending,
+  false
+);
+assert.equal(
+  captureSignals("The report says Waiting for 1 dynamic workflow to finish.\n> ")
+    .workflowPending,
+  false
+);
+assert.equal(
+  captureSignals("> Waiting for 1 dynamic workflow to finish").workflowPending,
+  false
+);
+assert.equal(
+  captureSignals("> Waiting for 1 dynamic workflow to finish").state,
+  "awaiting_input"
+);
+const completedWorkflowWaitSignals = captureSignals(
+  "✢ Waiting for 1 dynamic workflow to finish\n✻ Worked for 2s\n> "
+);
+assert.equal(completedWorkflowWaitSignals.workflowPending, false);
+assert.equal(completedWorkflowWaitSignals.state, "idle");
+assert.equal(
+  captureSignals(
+    "✻ Worked for 2s\n✢ Waiting for 1 dynamic workflow to finish\n> "
+  ).workflowPending,
+  true
+);
+assert.equal(captureSignals("11/11 workflow agents complete\n> ").state, "idle");
+assert.equal(
+  captureSignals(
+    "✢ Waiting for 1 dynamic workflow to finish\n✻ Worked for 2s\n✢ Consulting the rubber ducky…\n> "
+  ).state,
+  "busy"
+);
 assert.equal(captureSignals("assistant text\n> unsent prompt").state, "awaiting_input");
 assert.equal(captureSignals("Usage limit reached soon\n> ").state, "limit_warning");
 assert.equal(
@@ -178,24 +230,31 @@ assert.equal(posture.resolved.permissionMode, "manual");
 assert.equal(posture.observed.effort, "ultracode");
 assert.equal(posture.observed.ultracode, true);
 assert.equal(posture.verification, "ultracode_observed_terminal_heuristic");
+assert.equal(posture.ultracodeAssessment.status, "terminal_indicator_heuristic");
 const sessionLogPosture = launchPostureReport(
   { permissionMode: "bypassPermissions", effort: "xhigh", ultracode: true },
   { permissionMode: "bypassPermissions", effort: "xhigh", ultracode: true },
   captureSignals("manual mode on\nCurrent effort level: medium\n> "),
   {
     permissionMode: "bypassPermissions",
-    effort: "ultracode",
-    ultracode: true,
+    effort: "xhigh",
+    ultracode: null,
     evidence: {
       permissionMode: "claude_session_log",
       effort: "claude_session_log",
-      ultracode: "claude_session_log_correlated_with_resolved_launch",
+      ultracode: "",
     },
   }
 );
 assert.equal(sessionLogPosture.observed.permissionMode, "bypassPermissions");
-assert.equal(sessionLogPosture.observed.effort, "ultracode");
+assert.equal(sessionLogPosture.observed.effort, "xhigh");
+assert.equal(sessionLogPosture.observed.ultracode, null);
 assert.equal(sessionLogPosture.verification, "session_log_observed");
+assert.equal(sessionLogPosture.verificationByField.ultracode, "requested_only");
+assert.equal(sessionLogPosture.ultracodeAssessment.status, "conflicting_effort_evidence");
+assert.deepEqual(sessionLogPosture.ultracodeAssessment.conflictSources, [
+  { source: "terminal_heuristic", effort: "medium" },
+]);
 const persistedObservation = {
   permissionMode: "bypassPermissions",
   model: "claude-opus-5",
@@ -269,10 +328,9 @@ assert.deepEqual(
     permissionMode: null,
     model: "claude-opus-5",
     effort: null,
-    ultracode: true,
+    ultracode: null,
     evidence: {
       model: "claude_session_log",
-      ultracode: "claude_session_log_correlated_with_resolved_launch",
     },
   }
 );
@@ -321,11 +379,320 @@ assert.equal(currentLaunchObservation.permissionMode, "default");
 assert.equal(currentLaunchObservation.model, "claude-current");
 assert.equal(currentLaunchObservation.effort, "high");
 assert.equal(currentLaunchObservation.ultracode, null);
+assert.equal(currentLaunchObservation.workflowActivity.state, "not_observed");
+const ultracodeRuntimeObservation = runtimeObservationFromRecords(
+  [
+    {
+      timestamp: "2026-07-29T12:00:01Z",
+      sessionId: postureSessionId,
+      effort: "xhigh",
+      message: {
+        role: "assistant",
+        model: "claude-fable-5",
+        content: [{ type: "text", text: "working" }],
+      },
+    },
+    {
+      timestamp: "2026-07-29T12:00:02Z",
+      sessionId: postureSessionId,
+      toolUseResult: {
+        status: "async_launched",
+        taskType: "local_workflow",
+        workflowName: "private-workflow-name-must-not-escape",
+      },
+    },
+    {
+      timestamp: "2026-07-29T12:00:03Z",
+      sessionId: postureSessionId,
+      pendingWorkflowCount: 1,
+    },
+  ],
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+    resolvedPosture: { ultracode: true, ultracodeMechanism: "effort" },
+  }
+);
+assert.equal(ultracodeRuntimeObservation.effort, "xhigh");
+assert.equal(ultracodeRuntimeObservation.ultracode, null);
+assert.equal(ultracodeRuntimeObservation.evidence.ultracode, "");
+assert.deepEqual(ultracodeRuntimeObservation.workflowActivity, {
+  state: "pending",
+  launchObserved: true,
+  launchStatus: "async_launched",
+  pendingCount: 1,
+  lastKnownPendingCount: null,
+  pendingObservedAt: "2026-07-29T12:00:03Z",
+  lastObservedAt: "2026-07-29T12:00:03Z",
+  evidence: "claude_session_log",
+  triggerAttribution: "unknown",
+  observationUncertain: false,
+  observationCoverage: "full",
+  observationSkippedBytes: 0,
+});
+assert.doesNotMatch(
+  JSON.stringify(ultracodeRuntimeObservation),
+  /private-workflow-name-must-not-escape/
+);
+const workflowLogSignals = signalsWithWorkflowActivity(
+  captureSignals("> "),
+  ultracodeRuntimeObservation.workflowActivity
+);
+assert.equal(workflowLogSignals.state, "busy");
+assert.equal(workflowLogSignals.terminalState, "idle");
+assert.equal(workflowLogSignals.workflowPending, true);
+assert.equal(workflowLogSignals.workflowPendingCount, 1);
+assert.equal(workflowLogSignals.workflowPendingEvidence, "claude_session_log");
+assert.equal(
+  workflowLogSignals.workflowPendingObservedAt,
+  "2026-07-29T12:00:03Z"
+);
+const completedWorkflowObservation = runtimeObservationFromRecords(
+  [
+    {
+      timestamp: "2026-07-29T12:01:00Z",
+      sessionId: postureSessionId,
+      toolUseResult: {
+        status: "async_launched",
+        taskType: "local_workflow",
+        workflowName: "another-private-name",
+        taskId: "workflow-task-private-id",
+      },
+    },
+    {
+      timestamp: "2026-07-29T12:02:00Z",
+      sessionId: postureSessionId,
+      toolUseResult: {
+        retrieval_status: "timeout",
+        task: { task_id: "workflow-task-private-id" },
+      },
+    },
+    {
+      timestamp: "2026-07-29T12:03:00Z",
+      sessionId: postureSessionId,
+      toolUseResult: {
+        retrieval_status: "success",
+        task: {
+          task_id: "workflow-task-private-id",
+          status: "completed",
+        },
+      },
+    },
+  ],
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+  }
+);
+assert.equal(completedWorkflowObservation.workflowActivity.pendingCount, 0);
+assert.equal(completedWorkflowObservation.workflowActivity.state, "launch_observed");
+assert.equal(
+  completedWorkflowObservation.workflowActivity.pendingObservedAt,
+  "2026-07-29T12:03:00Z"
+);
+const completedWorkflowSignals = signalsWithWorkflowActivity(
+  captureSignals("> "),
+  completedWorkflowObservation.workflowActivity
+);
+assert.equal(completedWorkflowSignals.workflowPending, false);
+assert.equal(completedWorkflowSignals.workflowPendingCount, 0);
+assert.equal(completedWorkflowSignals.workflowPendingEvidence, "");
+assert.equal(completedWorkflowSignals.workflowPendingObservedAt, "");
+assert.deepEqual(
+  workflowObservationStatusFields({
+    pendingCount: null,
+    evidence: "claude_session_log_incomplete",
+    observationUncertain: true,
+  }),
+  {
+    workflowPending: true,
+    workflowObservationStatus: "incomplete",
+  }
+);
+assert.deepEqual(workflowObservationStatusFields({}, false), {
+  workflowPending: null,
+  workflowObservationStatus: "unavailable",
+});
+assert.doesNotMatch(
+  JSON.stringify(completedWorkflowObservation),
+  /another-private-name|workflow-task-private-id/
+);
+const mixedIdentityWorkflowObservation = runtimeObservationFromRecords(
+  [
+    {
+      timestamp: "2026-07-29T12:10:00Z",
+      sessionId: postureSessionId,
+      toolUseResult: {
+        status: "async_launched",
+        taskType: "local_workflow",
+        workflowName: "unidentified-private-workflow",
+      },
+    },
+    {
+      timestamp: "2026-07-29T12:10:01Z",
+      sessionId: postureSessionId,
+      toolUseResult: {
+        status: "async_launched",
+        taskType: "local_workflow",
+        workflowName: "identified-private-workflow",
+        taskId: "identified-private-task",
+      },
+    },
+    {
+      timestamp: "2026-07-29T12:10:02Z",
+      sessionId: postureSessionId,
+      toolUseResult: {
+        retrieval_status: "success",
+        task: {
+          task_id: "identified-private-task",
+          status: "completed",
+        },
+      },
+    },
+  ],
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+  }
+);
+assert.equal(mixedIdentityWorkflowObservation.workflowActivity.state, "pending");
+assert.equal(mixedIdentityWorkflowObservation.workflowActivity.pendingCount, 1);
+assert.doesNotMatch(
+  JSON.stringify(mixedIdentityWorkflowObservation),
+  /unidentified-private-workflow|identified-private-workflow|identified-private-task/
+);
+const interruptedWorkflowObservation = runtimeObservationFromRecords(
+  [
+    {
+      timestamp: "2026-07-29T12:20:00Z",
+      sessionId: postureSessionId,
+      toolUseResult: {
+        status: "async_launched",
+        taskType: "local_workflow",
+        workflowName: "interrupted-private-workflow",
+        taskId: "interrupted-private-task",
+      },
+    },
+    {
+      timestamp: "2026-07-29T12:20:01Z",
+      sessionId: postureSessionId,
+      interruptedMessageId: "private-message-id",
+      message: { role: "user", content: "" },
+    },
+  ],
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+  }
+);
+assert.equal(interruptedWorkflowObservation.workflowActivity.pendingCount, 0);
+assert.equal(interruptedWorkflowObservation.workflowActivity.state, "launch_observed");
+assert.doesNotMatch(
+  JSON.stringify(interruptedWorkflowObservation),
+  /interrupted-private-workflow|interrupted-private-task|private-message-id/
+);
+const workflowPosture = launchPostureReport(
+  { effort: "xhigh", ultracode: true, ultracodeMechanism: "effort" },
+  { effort: "xhigh", ultracode: true, ultracodeMechanism: "effort" },
+  captureSignals("> "),
+  ultracodeRuntimeObservation
+);
+assert.equal(workflowPosture.ultracodeAssessment.status, "workflow_activity_observed");
+assert.equal(workflowPosture.observed.ultracode, null);
+const failedWorkflowObservation = runtimeObservationFromRecords(
+  [
+    {
+      timestamp: "2026-07-29T12:00:02Z",
+      sessionId: postureSessionId,
+      toolUseResult: {
+        status: "failed",
+        taskType: "local_workflow",
+        workflowName: "failed-private-workflow",
+      },
+    },
+  ],
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+    resolvedPosture: { ultracode: true, ultracodeMechanism: "effort" },
+  }
+);
+assert.equal(failedWorkflowObservation.workflowActivity.state, "not_observed");
+assert.equal(failedWorkflowObservation.workflowActivity.launchObserved, false);
+assert.doesNotMatch(JSON.stringify(failedWorkflowObservation), /failed-private-workflow/);
+const xhighOnlyPosture = launchPostureReport(
+  { effort: "xhigh", ultracode: true, ultracodeMechanism: "effort" },
+  { effort: "xhigh", ultracode: true, ultracodeMechanism: "effort" },
+  captureSignals("> "),
+  {
+    effort: "xhigh",
+    ultracode: null,
+    workflowActivity: {
+      state: "not_observed",
+      launchObserved: false,
+      launchStatus: null,
+      pendingCount: null,
+      evidence: "",
+      triggerAttribution: "unknown",
+    },
+    evidence: { effort: "claude_session_log", ultracode: "" },
+  }
+);
+assert.equal(xhighOnlyPosture.ultracodeAssessment.status, "xhigh_correlated_unconfirmed");
+assert.equal(xhighOnlyPosture.verificationByField.ultracode, "requested_only");
+const maxConflictPosture = launchPostureReport(
+  { effort: "xhigh", ultracode: true, ultracodeMechanism: "effort" },
+  { effort: "xhigh", ultracode: true, ultracodeMechanism: "effort" },
+  captureSignals("Current effort level: max\n> ")
+);
+assert.equal(maxConflictPosture.ultracodeAssessment.status, "conflicting_effort_evidence");
+assert.deepEqual(maxConflictPosture.ultracodeAssessment.conflictSources, [
+  { source: "terminal_heuristic", effort: "max" },
+]);
+assert.equal(captureSignals("Fable 5  Extra").effortIndicator, "");
 const unavailableUltracodeSignals = captureSignals("Ultracode needs dynamic workflows enabled (see /config).\n> ");
 assert.equal(unavailableUltracodeSignals.ultracodeUnavailable, true);
 assert.equal(
   launchPostureReport({ ultracode: true }, { ultracode: true }, unavailableUltracodeSignals).verification,
   "ultracode_rejected_terminal_heuristic"
+);
+assert.equal(
+  launchPostureReport({ ultracode: true }, { ultracode: true }, unavailableUltracodeSignals)
+    .ultracodeAssessment.status,
+  "rejected_terminal_heuristic"
+);
+const sessionEvidenceOutranksTerminalRejection = launchPostureReport(
+  { ultracode: true },
+  { ultracode: true },
+  unavailableUltracodeSignals,
+  {
+    ultracode: true,
+    workflowActivity: {
+      state: "not_observed",
+      launchObserved: false,
+      launchStatus: null,
+      pendingCount: null,
+      evidence: "",
+      triggerAttribution: "unknown",
+    },
+    evidence: { ultracode: "claude_session_log" },
+  }
+);
+assert.equal(
+  sessionEvidenceOutranksTerminalRejection.ultracodeAssessment.status,
+  "runtime_setting_observed"
+);
+assert.equal(sessionEvidenceOutranksTerminalRejection.observed.ultracode, true);
+assert.deepEqual(
+  publicLaunchMetadata({
+    schemaVersion: 3,
+    cwd: "C:\\review",
+    observedPosture: {
+      ultracode: true,
+      evidence: { ultracode: "claude_session_log_correlated_with_resolved_launch" },
+    },
+  }),
+  { schemaVersion: 3, cwd: "C:\\review" }
 );
 assert.equal(captureSignals("> Current effort level: ultracode").ultracodeActive, false);
 assert.equal(captureSignals("> Ultracode needs dynamic workflows enabled (see /config).").ultracodeUnavailable, false);

@@ -39,8 +39,9 @@ npm --version
 tmux -V
 ```
 
-Node.js must be major version 22, 24, or 26. Use tmux 2.4 or newer;
-metadata safety targets the original pane ID when updating its containing session.
+Node.js must be major version 22, 24, or 26. Use tmux 3.2 or newer; per-session launch
+environment isolation relies on `new-session -e`, and metadata safety targets
+the original pane ID when updating its containing session.
 
 If `npm ci` reports a native-module build error, confirm the active `node` and
 `npm` are from the same Linux/WSL environment:
@@ -72,7 +73,7 @@ that login; those are separate OS profiles and separate Claude log folders.
 ## 3. Clone And Install
 
 ```bash
-git clone --branch v1.0.0-beta.1 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 ./install.sh
 ```
@@ -317,6 +318,12 @@ adopted.
 Metadata updates also compare the recorded `startedAtMs` generation and target
 the original pane ID. A delayed update cannot be written onto a same-name
 replacement session.
+
+New launches also store only sanitized UltraCode-relevant child environment
+categories. The tmux session receives explicit `CLAUDE_CONFIG_DIR`, effort,
+workflow-disable, and color values from the launching MCP, so an older tmux
+server environment cannot silently replace those launch inputs. Raw values are
+not returned in posture metadata.
 
 For a managed Rail session, capture it:
 

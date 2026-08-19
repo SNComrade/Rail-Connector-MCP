@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { activeInputContainsText, captureSignals, submitPreflightReason, submitResultStatus } from "../src/index.js";
+import {
+  activeInputContainsText,
+  captureSignals,
+  lifecycleBlockReason,
+  signalsWithWorkflowActivity,
+  submitPreflightReason,
+  submitResultStatus,
+} from "../src/index.js";
 
 const prompt = "Please review the repo and return a concise report.";
 
@@ -19,6 +26,61 @@ assert.equal(
 assert.equal(submitPreflightReason(captureSignals(`> ${prompt}`)), "active_input_not_empty");
 assert.equal(submitPreflightReason(captureSignals("> 1. keep this numbered draft")), "active_input_not_empty");
 assert.equal(submitPreflightReason(captureSignals('> Try "review the repository"')), "active_input_not_empty");
+const pendingWorkflowSignals = signalsWithWorkflowActivity(captureSignals("> "), {
+  pendingCount: 2,
+  pendingObservedAt: "2026-08-18T12:00:00Z",
+  evidence: "claude_session_log",
+});
+assert.equal(submitPreflightReason(pendingWorkflowSignals), "workflow_pending");
+assert.equal(lifecycleBlockReason(pendingWorkflowSignals), "workflow_pending");
+const uncertainWorkflowSignals = signalsWithWorkflowActivity(captureSignals("> "), {
+  pendingCount: null,
+  lastKnownPendingCount: 1,
+  evidence: "claude_session_log_incomplete",
+  observationUncertain: true,
+  observationCoverage: "head_tail",
+  observationSkippedBytes: 4096,
+});
+assert.equal(uncertainWorkflowSignals.workflowPending, true);
+assert.equal(uncertainWorkflowSignals.workflowPendingCount, null);
+assert.equal(
+  uncertainWorkflowSignals.workflowPendingEvidence,
+  "claude_session_log_incomplete"
+);
+assert.equal(uncertainWorkflowSignals.workflowPendingObservedAt, "");
+assert.equal(uncertainWorkflowSignals.workflowObservationUncertain, true);
+assert.equal(submitPreflightReason(uncertainWorkflowSignals), "workflow_pending");
+assert.equal(lifecycleBlockReason(uncertainWorkflowSignals), "workflow_pending");
+const mixedUncertainWorkflowSignals = signalsWithWorkflowActivity(
+  captureSignals("✢ Waiting for 2 dynamic workflows to finish\n> "),
+  {
+    pendingCount: null,
+    lastKnownPendingCount: 1,
+    evidence: "claude_session_log_incomplete",
+    observationUncertain: true,
+    observationCoverage: "head_tail",
+    observationSkippedBytes: 4096,
+  }
+);
+assert.equal(mixedUncertainWorkflowSignals.workflowPending, true);
+assert.equal(mixedUncertainWorkflowSignals.workflowPendingCount, 2);
+assert.equal(
+  mixedUncertainWorkflowSignals.workflowPendingEvidence,
+  "terminal_heuristic"
+);
+assert.equal(mixedUncertainWorkflowSignals.workflowObservationUncertain, true);
+const approvalDuringWorkflow = signalsWithWorkflowActivity(
+  captureSignals("Do you want to proceed?\nYes, and don't ask again"),
+  {
+    pendingCount: 1,
+    evidence: "claude_session_log",
+  }
+);
+assert.equal(approvalDuringWorkflow.workflowPending, true);
+assert.equal(approvalDuringWorkflow.terminalState, "approval_required");
+assert.equal(lifecycleBlockReason(approvalDuringWorkflow), "approval_required");
+assert.equal(lifecycleBlockReason(captureSignals("> ")), "");
+assert.equal(lifecycleBlockReason(captureSignals("> unsent draft")), "awaiting_input");
 
 assert.equal(activeInputContainsText(`assistant transcript kept the words ${prompt}\n> `, prompt), false);
 assert.equal(activeInputContainsText(`> ${prompt}`, prompt), true);

@@ -42,6 +42,10 @@ The skills teach agents to:
 - serialize shared-session mutations and avoid typing over busy work
 - use local archive sidecars without changing Claude transcripts
 - report requested, resolved, and observed posture accurately
+- distinguish UltraCode parser acceptance, xhigh correlation, workflow
+  activity, conflicts, and unknown trigger attribution
+- use explicit Fable 5 and Opus 5 bypass-plus-UltraCode launch recipes only
+  when the user requests that posture
 
 ## Validation
 

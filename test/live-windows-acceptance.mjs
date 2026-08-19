@@ -116,6 +116,8 @@ try {
   assert.equal(capabilities.mcp.bypassPermissionsEnabled, true);
   assert.equal(capabilities.mcp.bypassPermissionsPolicyMode, "local_host_acknowledged");
   assert.equal(capabilities.ultracode.launchMechanism, "effort_flag");
+  assert.equal(capabilities.ultracode.argumentProbe.accepted, true);
+  assert.equal(capabilities.ultracode.environment.status, "compatible");
 
   const started = await call(
     firstClient.client,
@@ -178,7 +180,17 @@ try {
   assert.match(completed.transcript.lastAssistant.text, new RegExp(proofText));
   assert.equal(fs.readFileSync(proofFile, "utf8").trim(), proofText);
   assert.equal(completed.posture.observed.permissionMode, "bypassPermissions");
-  assert.equal(completed.posture.observed.ultracode, true);
+  assert.equal(completed.posture.ultracodeAssessment.requested, true);
+  assert.equal(completed.posture.ultracodeAssessment.conflict, false);
+  assert.ok(
+    [
+      "runtime_setting_observed",
+      "terminal_indicator_heuristic",
+      "workflow_activity_observed",
+      "xhigh_correlated_unconfirmed",
+      "requested_unconfirmed",
+    ].includes(completed.posture.ultracodeAssessment.status)
+  );
 
   const lowLevelText = await call(secondClient.client, "send_text", {
     managedSession,

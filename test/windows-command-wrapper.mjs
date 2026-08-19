@@ -36,20 +36,9 @@ fs.writeFileSync(
   claudeWrapper,
   [
     "@echo off",
-    'if "%~1"=="--version" goto version',
-    'if "%~1"=="--help" goto help',
     `cd /d "${root}"`,
-    `"${process.execPath}" "${fixture}"`,
+    `"${process.execPath}" "${fixture}" %*`,
     "exit /b %ERRORLEVEL%",
-    ":version",
-    "echo 2.1.220 ^(Claude Code^)",
-    "exit /b 0",
-    ":help",
-    "echo Options:",
-    "echo   --effort ^<level^> low, medium, high, xhigh, max, ultracode",
-    "echo   --permission-mode ^<mode^> default, manual, plan, acceptEdits, auto, dontAsk, bypassPermissions",
-    "echo   --remote-control",
-    "exit /b 0",
     "",
   ].join("\r\n")
 );
@@ -203,7 +192,7 @@ try {
     fs.realpathSync.native?.(claudeWrapper) ?? fs.realpathSync(claudeWrapper);
   assert.equal(payload.available, true, JSON.stringify(payload));
   assert.equal(payload.command.toLowerCase(), canonicalWrapper.toLowerCase());
-  assert.match(payload.version, /^2\.1\.220/);
+  assert.match(payload.version, /^2\.1\.234/);
   const started = await client.callTool(
     {
       name: "start_remote_control",
@@ -282,6 +271,150 @@ try {
       { startIfMissing: false, env: mcpEnv }
     );
   }
+
+  const workflowStarted = await client.callTool(
+    {
+      name: "send_text",
+      arguments: {
+        managedSession,
+        text: "/workflow-test",
+        submit: true,
+      },
+    },
+    undefined,
+    { timeout: 30000 }
+  );
+  assert.equal(workflowStarted.isError, undefined, workflowStarted.content?.[0]?.text);
+  const workflowStartedPayload = JSON.parse(
+    workflowStarted.content?.[0]?.text ?? "{}"
+  );
+  assert.equal(workflowStartedPayload.signals.workflowPending, true);
+  assert.equal(workflowStartedPayload.signals.workflowPendingCount, 1);
+  assert.equal(
+    workflowStartedPayload.signals.workflowPendingEvidence,
+    "terminal_heuristic"
+  );
+
+  for (const request of [
+    {
+      name: "submit_prompt",
+      arguments: { managedSession, text: "must not submit", force: false },
+      expectedStatus: "preflight_blocked",
+    },
+    {
+      name: "send_text",
+      arguments: { managedSession, text: "must not type", submit: false },
+      expectedStatus: "send_blocked",
+    },
+    {
+      name: "send_key",
+      arguments: { managedSession, key: "Enter" },
+      expectedStatus: "send_blocked",
+    },
+    {
+      name: "send_key",
+      arguments: { managedSession, key: "C-m" },
+      expectedStatus: "send_blocked",
+    },
+    {
+      name: "send_key",
+      arguments: { managedSession, key: "KPEnter" },
+      expectedStatus: "send_blocked",
+    },
+    {
+      name: "rename_claude_session",
+      arguments: { managedSession, title: "Must Not Rename" },
+      expectedStatus: "rename_blocked",
+    },
+  ]) {
+    const blockedResult = await client.callTool(
+      { name: request.name, arguments: request.arguments },
+      undefined,
+      { timeout: 30000 }
+    );
+    assert.equal(blockedResult.isError, undefined, blockedResult.content?.[0]?.text);
+    const blockedPayload = JSON.parse(blockedResult.content?.[0]?.text ?? "{}");
+    assert.equal(blockedPayload.status, request.expectedStatus);
+    assert.equal(blockedPayload.reason, "workflow_pending");
+  }
+
+  const blockedReplacement = await client.callTool(
+    {
+      name: "start_remote_control",
+      arguments: {
+        cwd: sessionWorkspace,
+        managedSession,
+        remoteName: "Wrapper Test",
+        permissionMode: "plan",
+        killExisting: true,
+        forceKillExisting: false,
+      },
+    },
+    undefined,
+    { timeout: 45000 }
+  );
+  assert.equal(blockedReplacement.isError, true);
+  assert.match(
+    blockedReplacement.content?.[0]?.text ?? "",
+    /workflow_pending/
+  );
+
+  const pendingWait = await client.callTool(
+    {
+      name: "wait_for_claude_turn",
+      arguments: {
+        managedSession,
+        timeoutSeconds: 1,
+        pollIntervalMs: 250,
+      },
+    },
+    undefined,
+    { timeout: 30000 }
+  );
+  assert.equal(pendingWait.isError, undefined, pendingWait.content?.[0]?.text);
+  const pendingWaitPayload = JSON.parse(pendingWait.content?.[0]?.text ?? "{}");
+  assert.equal(pendingWaitPayload.status, "timeout");
+  assert.equal(pendingWaitPayload.signals.workflowPending, true);
+
+  const blockedWorkflowStop = await client.callTool(
+    {
+      name: "stop_remote_control",
+      arguments: { managedSession, graceful: true, force: false },
+    },
+    undefined,
+    { timeout: 30000 }
+  );
+  assert.equal(
+    blockedWorkflowStop.isError,
+    undefined,
+    blockedWorkflowStop.content?.[0]?.text
+  );
+  const blockedWorkflowStopPayload = JSON.parse(
+    blockedWorkflowStop.content?.[0]?.text ?? "{}"
+  );
+  assert.equal(blockedWorkflowStopPayload.status, "stop_blocked");
+  assert.equal(blockedWorkflowStopPayload.reason, "workflow_pending");
+
+  const workflowCleared = await client.callTool(
+    {
+      name: "send_text",
+      arguments: {
+        managedSession,
+        text: "/workflow-clear",
+        submit: true,
+        force: true,
+      },
+    },
+    undefined,
+    { timeout: 30000 }
+  );
+  assert.equal(workflowCleared.isError, undefined, workflowCleared.content?.[0]?.text);
+  const workflowClearedPayload = JSON.parse(
+    workflowCleared.content?.[0]?.text ?? "{}"
+  );
+  assert.equal(workflowClearedPayload.status, "sent");
+  assert.equal(workflowClearedPayload.forceUsed, true);
+  assert.equal(workflowClearedPayload.signals.workflowPending, false);
 
   const restrictedEnv = {
     ...mcpEnv,
