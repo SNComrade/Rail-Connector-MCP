@@ -8,6 +8,8 @@ import {
   listClaudeSessionSummaries,
   parsePortableWaitCursor,
   projectDirFromCwd,
+  readClaudeResultChunkFromFile,
+  readRecentSessionRecordWindowFromFile,
   sessionArchiveInfo,
   setSessionArchiveState,
   recentSessionRecords,
@@ -164,6 +166,57 @@ assert.equal(completedSnapshot.lastAssistant.cursor, "assistant-final");
 assert.equal(completedSnapshot.lastAssistant.textLength, longAnswer.length);
 assert.equal(completedSnapshot.lastAssistant.textTruncated, true);
 assert.equal(completedSnapshot.lastAssistant.text.length, 128 * 1024);
+assert.match(
+  completedSnapshot.lastAssistant.resultId,
+  /^rail:result:v1:[0-9a-f]{64}:[0-9a-f]{64}$/
+);
+assert.match(completedSnapshot.lastAssistant.textSha256, /^sha256:[0-9a-f]{64}$/);
+assert.equal(completedSnapshot.lastAssistant.textUtf8Bytes, longAnswer.length);
+assert.equal(completedSnapshot.lastAssistant.usage, null);
+
+const unicodeBoundaryAnswer = `${"u".repeat(128 * 1024 - 1)}😀tail`;
+const unicodeBoundarySnapshot = transcriptSnapshotFromRecords([
+  {
+    timestamp: "2026-01-01T00:00:04Z",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: unicodeBoundaryAnswer }],
+      stop_reason: "end_turn",
+      usage: {
+        input_tokens: 11,
+        output_tokens: 22,
+        cache_creation_input_tokens: 3,
+        cache_read_input_tokens: 4,
+        iterations: 2,
+        service_tier: "standard",
+        speed: "fast",
+      },
+    },
+  },
+]);
+assert.equal(unicodeBoundarySnapshot.lastAssistant.text.endsWith("\ud83d"), false);
+assert.doesNotMatch(unicodeBoundarySnapshot.lastAssistant.text, /\ufffd/);
+assert.equal(
+  unicodeBoundarySnapshot.lastAssistant.textCharacters,
+  128 * 1024 + 4
+);
+assert.equal(unicodeBoundarySnapshot.lastAssistant.usage.inputTokens, 11);
+assert.equal(
+  unicodeBoundarySnapshot.lastAssistant.usage.delegatedAgentCoverage,
+  "unknown"
+);
+assert.equal(unicodeBoundarySnapshot.lastAssistant.usage.costUsd, null);
+
+const sameTimestampFirst = transcriptSnapshotFromRecords([
+  message("2026-01-01T00:00:05Z", "assistant", "first answer"),
+]);
+const sameTimestampSecond = transcriptSnapshotFromRecords([
+  message("2026-01-01T00:00:05Z", "assistant", "second answer"),
+]);
+assert.notEqual(
+  sameTimestampFirst.lastAssistant.cursor,
+  sameTimestampSecond.lastAssistant.cursor
+);
 const staleAssistantAfterUser = transcriptSnapshotFromRecords([
   {
     uuid: "assistant-before-user",
@@ -384,6 +437,375 @@ assert.equal(
   "wait"
 );
 
+const oversizedDir = path.join(root, "oversized-result");
+const oversizedId = "67676767-6767-4676-8676-676767676767";
+const oversizedAnswer = `${"z".repeat(2 * 1024 * 1024 + 256)}😀END`;
+const oversizedFile = writeSession(
+  oversizedDir,
+  oversizedId,
+  [
+    {
+      ...message("2026-01-01T00:00:06Z", "user", "large report"),
+      sessionId: oversizedId,
+    },
+    {
+      timestamp: "2026-01-01T00:00:07Z",
+      sessionId: oversizedId,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: oversizedAnswer }],
+        stop_reason: "end_turn",
+        model: "claude-test",
+      },
+    },
+  ],
+  8
+);
+const oversizedWindow = await readRecentSessionRecordWindowFromFile(
+  oversizedFile,
+  oversizedId
+);
+assert.equal(oversizedWindow.status, "full");
+assert.equal(oversizedWindow.records.length, 2);
+assert.ok(oversizedWindow.bytesRead > 2 * 1024 * 1024);
+const oversizedSnapshot = transcriptSnapshotFromRecords(
+  oversizedWindow.records,
+  oversizedId
+);
+assert.equal(oversizedSnapshot.turnComplete, true);
+assert.equal(oversizedSnapshot.lastAssistant.textTruncated, true);
+assert.equal(
+  oversizedSnapshot.lastAssistant.textCharacters,
+  2 * 1024 * 1024 + 260
+);
+const oversizedTail = await readClaudeResultChunkFromFile(
+  oversizedFile,
+  oversizedId,
+  oversizedSnapshot.lastAssistant.resultId,
+  oversizedSnapshot.lastAssistant.textCharacters - 4,
+  4
+);
+assert.equal(oversizedTail.text, "😀END");
+assert.equal(oversizedTail.returnedCharacters, 4);
+assert.equal(oversizedTail.hasMore, false);
+assert.equal(oversizedTail.textSha256, oversizedSnapshot.lastAssistant.textSha256);
+assert.equal(oversizedTail.resultIdentityScope, "assistant_record");
+assert.equal(oversizedTail.usageRecordAmbiguous, false);
+
+const buriedResultDir = path.join(root, "buried-large-result");
+const buriedResultId = "78787878-7878-4787-8787-787878787878";
+const buriedAnswer = `${"b".repeat(3 * 1024 * 1024 + 128)}😀DONE`;
+const buriedResultFile = writeSession(
+  buriedResultDir,
+  buriedResultId,
+  [
+    {
+      ...message("2026-01-01T00:01:00Z", "user", "large report"),
+      sessionId: buriedResultId,
+      uuid: "buried-user-1",
+    },
+    {
+      timestamp: "2026-01-01T00:01:01Z",
+      sessionId: buriedResultId,
+      uuid: "buried-assistant-1",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: buriedAnswer }],
+        stop_reason: "end_turn",
+        usage: { output_tokens: 321 },
+      },
+    },
+    {
+      ...message("2026-01-01T00:01:02Z", "user", "small newer prompt"),
+      sessionId: buriedResultId,
+      uuid: "buried-user-2",
+    },
+  ],
+  9
+);
+const buriedWindow = await readRecentSessionRecordWindowFromFile(
+  buriedResultFile,
+  buriedResultId,
+  { minConversationRecords: 3 }
+);
+const buriedSnapshot = transcriptSnapshotFromRecords(
+  buriedWindow.records,
+  buriedResultId
+);
+const buriedFirstChunk = await readClaudeResultChunkFromFile(
+  buriedResultFile,
+  buriedResultId,
+  buriedSnapshot.lastAssistant.resultId,
+  0,
+  64 * 1024
+);
+assert.equal(buriedFirstChunk.resultCache.hit, false);
+assert.equal(buriedFirstChunk.resultCache.retained, true);
+const buriedSecondChunk = await readClaudeResultChunkFromFile(
+  buriedResultFile,
+  buriedResultId,
+  buriedSnapshot.lastAssistant.resultId,
+  buriedFirstChunk.nextOffsetCharacters,
+  64 * 1024
+);
+assert.equal(buriedSecondChunk.resultCache.hit, true);
+assert.equal(buriedSecondChunk.transcriptRead.bytesRead, 0);
+assert.equal(buriedSecondChunk.text, "b".repeat(64 * 1024));
+const buriedChunks = [buriedFirstChunk.text, buriedSecondChunk.text];
+let buriedPage = buriedSecondChunk;
+while (buriedPage.hasMore) {
+  buriedPage = await readClaudeResultChunkFromFile(
+    buriedResultFile,
+    buriedResultId,
+    buriedSnapshot.lastAssistant.resultId,
+    buriedPage.nextOffsetCharacters,
+    64 * 1024
+  );
+  assert.equal(buriedPage.resultCache.hit, true);
+  assert.equal(buriedPage.transcriptRead.bytesRead, 0);
+  buriedChunks.push(buriedPage.text);
+}
+assert.equal(buriedChunks.join(""), buriedAnswer);
+fs.appendFileSync(
+  buriedResultFile,
+  `${JSON.stringify({
+    type: "system",
+    subtype: "cache-invalidation-fixture",
+    sessionId: buriedResultId,
+  })}\n`
+);
+const buriedTail = await readClaudeResultChunkFromFile(
+  buriedResultFile,
+  buriedResultId,
+  buriedSnapshot.lastAssistant.resultId,
+  buriedSnapshot.lastAssistant.textCharacters - 5,
+  5
+);
+assert.equal(buriedTail.text, "😀DONE");
+assert.ok(buriedTail.transcriptRead.bytesRead > 2 * 1024 * 1024);
+assert.equal(buriedTail.usage.outputTokens, 321);
+assert.equal(buriedTail.resultCache.hit, false);
+
+const overBoundDir = path.join(root, "over-bound-record");
+const overBoundId = "89898989-8989-4898-8989-898989898989";
+const overBoundFile = writeSession(
+  overBoundDir,
+  overBoundId,
+  [
+    {
+      ...message("2026-01-01T00:02:00Z", "assistant", "q".repeat(8 * 1024)),
+      sessionId: overBoundId,
+    },
+    { type: "system", subtype: "status", sessionId: overBoundId },
+    { type: "system", subtype: "status", sessionId: overBoundId },
+  ],
+  10
+);
+const overBoundWindow = await readRecentSessionRecordWindowFromFile(
+  overBoundFile,
+  overBoundId,
+  { initialBytes: 4096, maxBytes: 4096, minConversationRecords: 2 }
+);
+assert.equal(overBoundWindow.status, "record_too_large");
+assert.equal(
+  overBoundWindow.attentionReason,
+  "session_record_exceeds_bounded_reader"
+);
+
+function fixedByteAssistantRecord(sessionId, targetBytes, fill) {
+  const record = {
+    timestamp: "2026-01-01T00:02:10Z",
+    sessionId,
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "" }],
+      stop_reason: "end_turn",
+    },
+  };
+  const emptyBytes = Buffer.byteLength(JSON.stringify(record), "utf8");
+  record.message.content[0].text = fill.repeat(targetBytes - emptyBytes);
+  assert.equal(Buffer.byteLength(JSON.stringify(record), "utf8"), targetBytes);
+  return record;
+}
+
+const exactBoundId = "93939393-9393-4939-8939-939393939393";
+const exactBoundFile = writeSession(
+  path.join(root, "exact-bound-record"),
+  exactBoundId,
+  [
+    { type: "system", subtype: "prefix", sessionId: exactBoundId },
+    fixedByteAssistantRecord(exactBoundId, 4096, "e"),
+  ],
+  11
+);
+const exactBoundWindow = await readRecentSessionRecordWindowFromFile(
+  exactBoundFile,
+  exactBoundId,
+  { initialBytes: 4096, maxBytes: 4096, minConversationRecords: 1 }
+);
+assert.equal(exactBoundWindow.status, "tail");
+assert.equal(exactBoundWindow.records.length, 1);
+assert.equal(
+  exactBoundWindow.records[0].message.content[0].text.startsWith("e"),
+  true
+);
+
+const beyondBoundId = "94949494-9494-4949-8949-949494949494";
+const beyondBoundFile = writeSession(
+  path.join(root, "beyond-bound-record"),
+  beyondBoundId,
+  [
+    { type: "system", subtype: "prefix", sessionId: beyondBoundId },
+    fixedByteAssistantRecord(beyondBoundId, 4097, "f"),
+  ],
+  12
+);
+const beyondBoundWindow = await readRecentSessionRecordWindowFromFile(
+  beyondBoundFile,
+  beyondBoundId,
+  { initialBytes: 4096, maxBytes: 4096, minConversationRecords: 1 }
+);
+assert.equal(beyondBoundWindow.status, "record_too_large");
+assert.equal(
+  beyondBoundWindow.attentionReason,
+  "session_record_exceeds_bounded_reader"
+);
+
+const duplicateDir = path.join(root, "duplicate-result-text");
+const duplicateId = "90909090-9090-4909-8909-909090909090";
+const duplicateFile = writeSession(
+  duplicateDir,
+  duplicateId,
+  [
+    {
+      ...message("2026-01-01T00:03:00Z", "assistant", "same answer"),
+      sessionId: duplicateId,
+      uuid: "duplicate-assistant-1",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "same answer" }],
+        stop_reason: "end_turn",
+        usage: { output_tokens: 1 },
+      },
+    },
+    {
+      ...message("2026-01-01T00:03:01Z", "assistant", "same answer"),
+      sessionId: duplicateId,
+      uuid: "duplicate-assistant-2",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "same answer" }],
+        stop_reason: "end_turn",
+        usage: { output_tokens: 2 },
+      },
+    },
+  ],
+  11
+);
+const duplicateInspection = await inspectSessionFile(duplicateFile, 2);
+const [duplicateFirst, duplicateSecond] = duplicateInspection.recentMessages;
+assert.notEqual(duplicateFirst.resultId, duplicateSecond.resultId);
+assert.equal(duplicateFirst.textSha256, duplicateSecond.textSha256);
+const duplicateFirstResult = await readClaudeResultChunkFromFile(
+  duplicateFile,
+  duplicateId,
+  duplicateFirst.resultId
+);
+const duplicateSecondResult = await readClaudeResultChunkFromFile(
+  duplicateFile,
+  duplicateId,
+  duplicateSecond.resultId
+);
+assert.equal(duplicateFirstResult.usage.outputTokens, 1);
+assert.equal(duplicateSecondResult.usage.outputTokens, 2);
+const duplicateLegacyResult = await readClaudeResultChunkFromFile(
+  duplicateFile,
+  duplicateId,
+  duplicateFirst.textSha256
+);
+assert.equal(duplicateLegacyResult.matchingRecordCount, 2);
+assert.equal(duplicateLegacyResult.usageRecordAmbiguous, true);
+assert.equal(duplicateLegacyResult.usage, null);
+assert.equal(duplicateLegacyResult.recordResultId, null);
+const buriedDuplicateId = "92929292-9292-4929-8929-929292929292";
+const buriedDuplicateFile = writeSession(
+  path.join(root, "buried-duplicate-result-text"),
+  buriedDuplicateId,
+  [
+    {
+      ...message("2026-01-01T00:03:10Z", "assistant", "same answer"),
+      sessionId: buriedDuplicateId,
+      uuid: "buried-duplicate-assistant-1",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "same answer" }],
+        stop_reason: "end_turn",
+        usage: { output_tokens: 10 },
+      },
+    },
+    {
+      type: "system",
+      subtype: "large-test-fixture",
+      sessionId: buriedDuplicateId,
+      payload: "m".repeat(2 * 1024 * 1024 + 128),
+    },
+    {
+      ...message("2026-01-01T00:03:11Z", "assistant", "same answer"),
+      sessionId: buriedDuplicateId,
+      uuid: "buried-duplicate-assistant-2",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "same answer" }],
+        stop_reason: "end_turn",
+        usage: { output_tokens: 20 },
+      },
+    },
+  ],
+  12
+);
+const buriedDuplicateLegacyResult = await readClaudeResultChunkFromFile(
+  buriedDuplicateFile,
+  buriedDuplicateId,
+  duplicateFirst.textSha256
+);
+assert.ok(
+  buriedDuplicateLegacyResult.transcriptRead.bytesRead > 2 * 1024 * 1024
+);
+assert.equal(buriedDuplicateLegacyResult.matchingRecordCount, 2);
+assert.equal(buriedDuplicateLegacyResult.usageRecordAmbiguous, true);
+assert.equal(buriedDuplicateLegacyResult.usage, null);
+await assert.rejects(
+  readClaudeResultChunkFromFile(
+    duplicateFile,
+    duplicateId,
+    "sha256:not-a-valid-result"
+  ),
+  (error) => error?.code === "EINVAL"
+);
+
+const inspectDepthDir = path.join(root, "inspect-depth");
+const inspectDepthId = "91919191-9191-4919-8919-919191919191";
+const inspectDepthFile = writeSession(
+  inspectDepthDir,
+  inspectDepthId,
+  Array.from({ length: 4 }, (_, index) => ({
+    ...message(
+      `2026-01-01T00:04:0${index}Z`,
+      "assistant",
+      `${index}:${"d".repeat(600 * 1024)}`
+    ),
+    sessionId: inspectDepthId,
+    uuid: `inspect-depth-${index}`,
+  })),
+  12
+);
+const inspectDepth = await inspectSessionFile(inspectDepthFile, 4);
+assert.equal(inspectDepth.recentMessages.length, 4);
+assert.deepEqual(
+  inspectDepth.recentMessages.map((entry) => entry.text.slice(0, 2)),
+  ["0:", "1:", "2:", "3:"]
+);
+
 try {
   const missing = await listClaudeSessionSummaries(path.join(root, "missing"), { limit: 2 });
   assert.equal(missing.projectDirExists, false);
@@ -492,6 +914,14 @@ try {
   assert.equal(boundedBytes.sessions[0].messageCountIsPartial, true);
   assert.equal(boundedBytes.sessions[1].summarySkipped, true);
   assert.equal(boundedBytes.sessions[1].summarySkipReason, "scan_byte_budget_exhausted");
+  assert.equal(
+    boundedBytes.sessions[1].ultraEffortAttachment.observationCoverage,
+    "none"
+  );
+  assert.equal(
+    boundedBytes.sessions[1].ultraEffortAttachment.observationSkippedBytes,
+    boundedBytes.sessions[1].size
+  );
 
   const boundedPostureDir = path.join(root, "bounded-posture");
   const boundedPostureId = "12121212-1212-4212-8212-121212121212";
@@ -504,6 +934,12 @@ try {
         timestamp: "2026-02-02T00:00:00Z",
         type: "permission-mode",
         permissionMode: "bypassPermissions",
+      },
+      {
+        sessionId: boundedPostureId,
+        timestamp: "2026-02-02T00:00:00.500Z",
+        type: "attachment",
+        attachment: { type: "ultra_effort_enter", reminderType: "full" },
       },
       {
         sessionId: boundedPostureId,
@@ -538,15 +974,45 @@ try {
   assert.equal(boundedPosture.sessions[0].observedPermissionMode, null);
   assert.equal(boundedPosture.sessions[0].observedModel, null);
   assert.equal(boundedPosture.sessions[0].observedEffort, null);
+  assert.equal(boundedPosture.sessions[0].ultraEffortAttachmentObserved, true);
+  assert.equal(boundedPosture.sessions[0].ultraEffortActive, null);
+  assert.equal(boundedPosture.sessions[0].ultraEffortLifecycle, "unknown");
+  assert.equal(boundedPosture.sessions[0].ultraEffortHistoryIncomplete, true);
+  assert.equal(
+    boundedPosture.sessions[0].ultraEffortAttachment.observationCoverage,
+    "head_tail"
+  );
+  assert.equal(
+    boundedPosture.sessions[0].ultraEffortAttachment.observationSkippedBytes,
+    boundedPosture.sessions[0].summaryBytesSkipped
+  );
+  assert.equal(
+    boundedPosture.sessions[0].ultraEffortAttachment.transitionEventsIncluded,
+    false
+  );
+  assert.equal(
+    Object.hasOwn(
+      boundedPosture.sessions[0].ultraEffortAttachment,
+      "transitionEvents"
+    ),
+    false
+  );
 
   const lifecycleDir = path.join(root, "lifecycle");
   const stateDir = path.join(root, "state");
   const lifecycleId = "22222222-2222-4222-8222-222222222222";
-  writeSession(
+  const lifecycleFile = writeSession(
     lifecycleDir,
     lifecycleId,
     [
       { type: "ai-title", aiTitle: "Generated title", sessionId: lifecycleId },
+      {
+        type: "attachment",
+        attachment: { type: "ultra_effort_enter", reminderType: "full" },
+        sessionId: lifecycleId,
+        timestamp: "2026-03-01T00:00:00Z",
+        version: "2.1.251",
+      },
       { type: "agent-name", agentName: "Startup title", sessionId: lifecycleId },
       { type: "custom-title", customTitle: "Renamed session", sessionId: lifecycleId },
       {
@@ -590,6 +1056,13 @@ try {
           content: [{ type: "text", text: "synthetic output must be ignored" }],
         },
       },
+      {
+        type: "attachment",
+        attachment: { type: "ultra_effort_exit", reminderType: "full" },
+        sessionId: lifecycleId,
+        timestamp: "2026-03-01T00:00:04Z",
+        version: "2.1.251",
+      },
     ],
     40
   );
@@ -606,6 +1079,37 @@ try {
   assert.equal(lifecycle.sessions[0].observedPermissionMode, "bypassPermissions");
   assert.equal(lifecycle.sessions[0].observedModel, "claude-opus-5");
   assert.equal(lifecycle.sessions[0].observedEffort, "xhigh");
+  assert.equal(lifecycle.sessions[0].observedClaudeVersion, "2.1.251");
+  assert.equal(lifecycle.sessions[0].ultraEffortAttachmentObserved, true);
+  assert.equal(
+    lifecycle.sessions[0].ultraEffortAttachmentObservedAt,
+    "2026-03-01T00:00:00Z"
+  );
+  assert.equal(lifecycle.sessions[0].ultraEffortActive, false);
+  assert.equal(lifecycle.sessions[0].ultraEffortLifecycle, "inactive_exited");
+  assert.equal(
+    lifecycle.sessions[0].ultraEffortLastExitedAt,
+    "2026-03-01T00:00:04Z"
+  );
+  assert.equal(lifecycle.sessions[0].ultraEffortAttachment.enterCount, 1);
+  assert.equal(lifecycle.sessions[0].ultraEffortAttachment.exitCount, 1);
+  assert.equal(
+    lifecycle.sessions[0].ultraEffortAttachment.transitionEventsIncluded,
+    false
+  );
+  assert.equal(
+    Object.hasOwn(lifecycle.sessions[0].ultraEffortAttachment, "transitionEvents"),
+    false
+  );
+  const lifecycleDetails = await inspectSessionFile(lifecycleFile, 5);
+  assert.equal(
+    lifecycleDetails.ultraEffortAttachment.transitionEventsIncluded,
+    true
+  );
+  assert.deepEqual(lifecycleDetails.ultraEffortAttachment.transitionEvents, [
+    { direction: "enter", at: "2026-03-01T00:00:00Z" },
+    { direction: "exit", at: "2026-03-01T00:00:04Z" },
+  ]);
 
   const privateTitleSearch = await listClaudeSessionSummaries(lifecycleDir, {
     limit: 5,

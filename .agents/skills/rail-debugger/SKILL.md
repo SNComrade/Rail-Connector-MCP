@@ -50,20 +50,43 @@ Do not reinstall before identifying the failed layer.
 - For bypass failures, verify both policy `enabled: true` and
   `confirmBypassPermissions: true`. Local-host and isolated policies are both
   supported. Compare the policy fields and `status.mcpProcess` identity after
-  registration changes. Never silently downgrade an explicit bypass request.
+  registration changes. Inspect `posture.audit.securityBoundary`: isolated is
+  an operator assertion, `osIsolationVerified` remains false, and allowed roots
+  are not a Claude filesystem sandbox. Never silently downgrade an explicit
+  bypass request.
 - For Ultracode failures, verify the dedicated booleans, omitted ordinary
   effort, calibrated probe exit status, MCP-process environment blockers,
   chosen launch mechanism, runtime effort, and sanitized workflow activity.
+  `advertisedAsEffort: false` and `helpListsUltracode: false` mean only that
+  CLI help did not list the literal value; check `supportedByInstalledVersion`,
+  `launchArgument`, and the probe before calling the capability unavailable.
   Timeout or terminated probes are inconclusive. Compare the persisted child
   `launchEnvironment` with `currentMcpEnvironment` after refresh; do not use the
   new process to rewrite an existing session's launch evidence. `xhigh`
   alone is correlated evidence, not confirmed Ultracode. Treat bound `high` or
   `max` as conflicting effort evidence; leave unknown labels unmapped.
+  Inspect the bound attachment lifecycle: current enter is active, a later exit
+  is inactive, and skipped or partial history stays labeled even when a later
+  complete transition restores current state. Inspect `attentionStatus` for a
+  blocking environment, effort conflict, or terminal-rejection conflict. These
+  records prove a client-side transition, not server-side orchestration.
+- For an explicit deep diagnostic, launch with `debug: true` and an optional
+  `debugFilter`. Verify `debugLog.status`, identity, launch binding, and growth
+  without returning its sensitive contents. On Windows,
+  `ready_acl_unverified` is the expected success-with-ACL-caveat state. Debug
+  capture can prove local argv and event timing;
+  it cannot prove Anthropic's effective server-side effort.
+- For report-only posture, remember that built-in tool flags do not remove MCP
+  or connector tools. The current MCP does not provide a verified strict
+  MCP-config roster; inspect the effective roster and use filesystem isolation
+  when connector-level writes must be impossible.
 - Before comparing Claude Desktop or CLI visuals, bind the view to the same
   managed name, conversation UUID, generation, and time window. An unbound
   screenshot cannot prove or disprove the MCP session's posture.
 - Prefer the transcript returned by `wait_for_claude_turn` over animated
-  terminal capture.
+  terminal capture. When `textTruncated` is true, use `get_claude_result` with
+  the returned opaque, record-scoped `resultId` and verify the separate
+  `textSha256` content digest after the last chunk.
 - Distinguish `needs_attention` from a completed result with additive
   `attention`; the latter still contains a valid completed transcript plus a
   weaker warning to surface or resolve.

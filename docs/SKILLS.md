@@ -28,6 +28,11 @@ with each GitHub skill directory, then open a fresh Codex task. Installing the
 MCP does not silently copy user-level skills. In every mode, pass the actual
 task project as `cwd`; Claude's local session logs are grouped by that path.
 
+Installed user-scope copies do not update automatically. Follow [Skill
+Installation](SKILL_INSTALL.md) to reinstall reviewed tagged skill directories,
+then open a fresh Codex task. Skill installation remains separate from MCP
+registration.
+
 ## Current Operating Model
 
 The skills teach agents to:
@@ -37,15 +42,21 @@ The skills teach agents to:
 - use the dedicated Ultracode request and confirmation
 - use explicitly authorized local-host bypass when requested
 - prefer `submit_prompt` plus `wait_for_claude_turn`
+- recover truncated answers with record-scoped `get_claude_result` identities,
+  Unicode character offsets, and separate SHA-256 content verification
 - reconnect to the persistent Windows broker after a Codex task refresh
 - distinguish Remote Control name, managed terminal name, title, and UUID
 - serialize shared-session mutations and avoid typing over busy work
 - use local archive sidecars without changing Claude transcripts
 - report requested, resolved, and observed posture accurately
+- inspect launch audit receipts without treating allowed roots, tool argv, or
+  an isolated policy assertion as verified runtime isolation
 - distinguish UltraCode parser acceptance, xhigh correlation, workflow
   activity, conflicts, and unknown trigger attribution
 - use explicit Fable 5 and Opus 5 bypass-plus-UltraCode launch recipes only
   when the user requests that posture
+- distinguish built-in Claude tool filters from connected MCP and connector
+  tools, whose availability must be assessed separately
 
 ## Validation
 

@@ -94,6 +94,23 @@ for (const skill of expectedSkills) {
   assert.match(combined, /launchEnvironment/, `${skill} must preserve child launch provenance`);
   assert.match(combined, /currentMcpEnvironment/, `${skill} must separate refreshed MCP diagnostics`);
   assert.match(combined, /timeout|termination/i, `${skill} must treat incomplete probes cautiously`);
+  assert.match(combined, /get_claude_result/, `${skill} must recover truncated results`);
+  assert.match(combined, /textSha256/, `${skill} must verify large-result integrity`);
+  assert.match(
+    combined,
+    /MCP and connector tools can remain available|built-in tool flags do not remove MCP\s+or connector tools/i,
+    `${skill} must distinguish built-in and connector tool filtering`
+  );
+  assert.match(
+    combined,
+    /helpListsUltracode/,
+    `${skill} must explain the UltraCode help-advertisement field`
+  );
+  assert.match(
+    combined,
+    /ultraEffortAttachment\.active/,
+    `${skill} must interpret the UltraCode attachment lifecycle`
+  );
 }
 
 const actualSkills = fs
@@ -121,6 +138,12 @@ assert.match(operatorGuidance, /conflicting_effort_evidence/);
 assert.match(operatorGuidance, /effort other than `xhigh` or `ultracode`/i);
 assert.match(operatorGuidance, /Rename `force` bypasses only/i);
 assert.match(operatorGuidance, /workflowObservationUncertain/);
+assert.match(operatorGuidance, /disallowedTools/);
+assert.match(operatorGuidance, /operating-system sandbox/i);
+assert.match(operatorGuidance, /created by this\s+workflow/i);
+assert.match(operatorGuidance, /operator_asserted/);
+assert.match(operatorGuidance, /debugLog\.status/);
+assert.match(operatorGuidance, /windowsAclVerified/);
 
 const debuggerGuidance = read(
   path.join(
@@ -136,6 +159,11 @@ assert.match(debuggerGuidance, /effort other than `xhigh` or `ultracode`/i);
 assert.match(debuggerGuidance, /workflowObservationCoverage/);
 assert.match(debuggerGuidance, /workflowObservationUncertain/);
 assert.match(debuggerGuidance, /tmux 3\.2 or newer/i);
+assert.match(debuggerGuidance, /debugLog\.status/);
+assert.match(
+  read(path.join(skillsRoot, "rail-debugger", "SKILL.md")),
+  /report-only requests as non-mutating/i
+);
 
 const reviewerGuidance = [
   path.join(skillsRoot, "rail-reviewer", "SKILL.md"),
@@ -154,5 +182,29 @@ assert.match(reviewerGuidance, /5 findings/i);
 assert.match(reviewerGuidance, /10 minutes/i);
 assert.match(reviewerGuidance, /200k aggregate tokens/i);
 assert.match(reviewerGuidance, /workflowObservationUncertain/);
+assert.match(reviewerGuidance, /disallowedTools/);
+assert.match(reviewerGuidance, /pre\/post repository evidence/i);
+assert.match(reviewerGuidance, /created by this workflow/i);
+
+const installGuidePath = [
+  path.join(root, "docs", "SKILL_INSTALL_PRIVATE.md"),
+  path.join(root, "docs", "SKILL_INSTALL.md"),
+].find((candidate) => fs.existsSync(candidate));
+assert.ok(installGuidePath, "a private or public skill install guide must exist");
+const installGuide = read(installGuidePath);
+for (const skill of expectedSkills) {
+  assert.match(
+    installGuide,
+    new RegExp(`\\.agents/skills/${skill}`),
+    `skill install guide must include ${skill}`
+  );
+}
+assert.match(installGuide, /MCP\s+registration and skill installation/i);
+assert.match(installGuide, /fresh Codex task/i);
+assert.match(installGuide, /does not update automatically/i);
+assert.match(installGuide, /\$skill-installer/);
+assert.match(installGuide, /immutable tagged GitHub directory/i);
+assert.match(installGuide, /v\d+\.\d+\.\d+-beta\.\d+/);
+assert.ok(installGuide.includes("/tree/main/"));
 
 console.log(`skills ok (${expectedSkills.length})`);

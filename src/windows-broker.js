@@ -303,7 +303,7 @@ function validatedPtyLaunch(payload) {
       windowsCommandLineValue(metadataCommand),
       ...metadataArgs.map(windowsCommandLineValue),
     ].join(" ");
-    const expectedCommandLine = `/d /s /c "${innerCommandLine}"`;
+    const expectedCommandLine = `/d /s /v:off /c "${innerCommandLine}"`;
     if (
       normalizedWindowsPath(command) !== normalizedWindowsPath(commandProcessor) ||
       args.length !== 0 ||

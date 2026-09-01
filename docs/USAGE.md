@@ -33,6 +33,14 @@ file fingerprint, policy mode, and sanitized environment category. The result
 also reports blockers visible in the current MCP process environment. It does
 not authenticate account or server-side policy state.
 
+`ultracode.advertisedAsEffort` and its clearer alias
+`ultracode.helpListsUltracode` answer only whether `claude --help` lists the
+literal `ultracode` effort value. `false` is not an unavailability result. Read
+`supportedByInstalledVersion`, `capabilityStatus`, `supportSource`,
+`launchMechanism`, `launchArgument`, and the calibrated probe together. For a
+supported direct launch, `launchArgument` is `--effort=ultracode`; runtime
+effort and workflow evidence remain separate observations.
+
 The MCP treats `permissionMode: "default"` as a semantic request. At launch it
 resolves that request to the installed CLI's advertised `default` or `manual`
 alias. Explicit elevated modes must be advertised by the installed CLI; they
@@ -66,6 +74,19 @@ observed posture even when sensitive values are omitted from the response.
 Set `includeSnippets` or `includeRemoteUrls` only when the returned content is
 needed. Search and archive-filter scans are bounded by `scanLimit` and report
 separately when results may be incomplete.
+
+Conversation summaries expose `observedClaudeVersion` when the session log
+records it. They also expose the nested `ultraEffortAttachment` lifecycle from
+bound `ultra_effort_enter` and `ultra_effort_exit` records. `active` is `true`
+after the latest enter, `false` after the latest exit, and `null` when a skipped
+or partial range prevents a current conclusion. Transition times, lower-bound
+counts, explicit event omission, history coverage, and the compatibility fields
+`ultraEffortAttachmentObserved` and `ultraEffortAttachmentObservedAt` are
+reported separately. Compact list results omit the event array; detailed
+session inspection and managed-session posture can include up to the latest 64
+`transitionEvents`. An enter authenticates the client-side mode transition; it
+does not independently prove that dynamic workflow orchestration ran on a
+substantive turn.
 
 Inspect one conversation:
 
@@ -124,9 +145,18 @@ For report-only review work, prefer `permissionMode: "dontAsk"` when the
 installed CLI advertises it, pass `disallowedTools: ["Edit", "Write",
 "NotebookEdit"]`, and use a prompt that forbids edits and state-changing
 commands. Verify repository and index state before and after the turn; shell
-inspection means report-only is not an operating-system sandbox. This denies new permission requests while allowing a
-direct final report. Use `plan` only as a compatibility fallback, and never
-approve implementation from a report-only session.
+inspection means report-only is not an operating-system sandbox. This denies
+new permission requests while allowing a direct final report. Use `plan` only
+as a compatibility fallback, and never approve implementation from a
+report-only session.
+
+These tool-list flags constrain Claude's built-in tools. They do not prove that
+connected MCP or connector tools were removed from the session; those tools can
+remain available under their own names. This MCP does not currently offer or
+verify a strict MCP-config launch mode, so the recipe above is an operating
+posture rather than hard tool isolation. Use an isolated review worktree or
+read-only copy when that distinction matters, inspect the effective roster in
+Claude, and keep the before/after repository checks.
 
 For an explicitly authorized development host:
 
@@ -147,9 +177,11 @@ RAIL_CONNECTOR_ALLOW_BYPASS_PERMISSIONS=I_UNDERSTAND_BYPASS_CAN_MODIFY_MY_HOST_W
 RAIL_CONNECTOR_ALLOW_BYPASS_PERMISSIONS=I_UNDERSTAND_THIS_REQUIRES_ISOLATION
 ```
 
-The first value explicitly authorizes a local development host. The second is
-for a disposable isolated environment. The per-call confirmation is still
-required in either case. Bypass mode removes Claude's normal permission prompts
+The first value explicitly authorizes a local development host. The second
+records an operator assertion that the surrounding environment is isolated;
+the MCP does not verify a VM, container, Windows Sandbox, restricted token, or
+filesystem boundary. The per-call confirmation is still required in either
+case. Bypass mode removes Claude's normal permission prompts
 and can modify the host, repository, credentials, services, and external state
 available to Claude. The MCP exposes this capability when the operator opts in;
 it does not infer authorization from team size or folder trust.
@@ -200,16 +232,38 @@ additional compute and behavior; it is not a safety restriction.
 Start and capture responses contain a `posture` object:
 
 - `requested` records the caller's semantic request.
-- `resolved` records the exact CLI values and launch mechanism.
+- `resolved` records validated CLI launch arguments and mechanism. It does not
+  prove model-alias resolution, fallback behavior, or delegated-agent posture.
 - `observed` records session-log or terminal evidence.
+- `observed.claudeVersion` records the CLI version from a bound session-log
+  record when available. Start responses also report the version inspected for
+  that launch as `claudeCliVersion`.
 - `evidence` identifies the source for each observed field.
 - `ultracodeAssessment` separates launch acceptance, runtime effort, sanitized
   workflow activity, environment blockers, conflicts, and unknowns.
+- `ultracodeAssessment.ultraEffortAttachment` reports the bound enter/exit
+  lifecycle. `attachment_lifecycle_active` means the latest complete transition
+  is enter; `exited_after_entry` means a later exit made the client-side mode
+  inactive. A skipped range or partial trailing record produces an unknown
+  current state while retaining explicitly labeled historical evidence.
+- `ultracodeAssessment.attentionStatus` reports a blocking launch environment,
+  conflicting bound effort, or terminal-rejection conflict separately from the
+  attachment lifecycle. Attention takes precedence in `status`; lifecycle
+  evidence remains available for diagnosis.
 - `ultracodeAssessment.launchEnvironment` is the sanitized snapshot captured
   from the environment actually supplied to the Claude child.
 - `ultracodeAssessment.currentMcpEnvironment` describes the inspecting MCP
   process. `environmentComparison` is `match`, `different`, or
   `launch_not_recorded` for an older session.
+- `audit.securityBoundary` states that allowed roots constrain MCP session
+  management, reports bypass isolation as operator-asserted when applicable,
+  and leaves OS/filesystem isolation unverified.
+- `audit.toolPolicy` records requested tool arguments and whether persisted
+  launch argv exists; effective main-session enforcement and delegated-agent
+  coverage remain explicitly unverified or unknown.
+- `audit.subagentTelemetry` is `unavailable` because current upstream evidence
+  does not expose per-subagent model, fallback, permission, tool, token, or cost
+  receipts.
 
 Treat missing observation as unknown, not as a failed request. Session-log
 evidence is stronger than terminal heuristics, but neither is a privileged
@@ -237,6 +291,39 @@ setting is current-setting evidence, but the command can change posture and
 does not prove launch provenance. Use a substantive turn when validating
 workflow activity. Bind visual comparisons to the same managed name,
 conversation UUID, generation, and time window.
+
+## Opt-In Debug Capture
+
+For a narrowly scoped launch investigation, request Claude's own debug log:
+
+```json
+{
+  "cwd": "C:\\work\\project",
+  "managedSession": "claude-debug-investigation",
+  "permissionMode": "default",
+  "debug": true,
+  "debugFilter": "api,!statsig",
+  "trustWorkspace": false
+}
+```
+
+`debugFilter` is optional and requires `debug: true`. Capability inspection
+must advertise `--debug-file`; a filter additionally requires `--debug`.
+The MCP creates a unique file under its state directory, passes it with
+`--debug-file`, and returns `debugLog` provenance, file-identity status,
+launch-argv binding, filter, and byte size. It never returns log contents. The
+generated path is ignored when
+comparing otherwise identical launch posture because each launch receives a
+new file.
+
+Debug logs can contain prompts, paths, tool activity, and other sensitive
+local data. They persist for explicit operator inspection and are not committed
+or automatically deleted. `ready` means identity and launch binding were
+validated on Unix-like systems. Windows reports `ready_acl_unverified` because
+Node file mode bits are not proof of a restrictive ACL; protect the MCP state
+directory at the account boundary. Use debug capture only for a bounded
+diagnostic run and remove the retained log and receipt after evidence handling
+is complete.
 
 ## Submit And Wait
 
@@ -317,19 +404,22 @@ line, its current count and `terminal_heuristic` evidence take precedence while
 `workflowObservationUncertain` remains true. A trailing partial JSONL record is
 assembled in chunks and treated with the same fail-closed uncertainty until the
 record is complete or the log is replaced. A single trailing record is bounded
-to 8 MiB and all cached plus in-flight fragments to 32 MiB; overflow is
-discarded through its next newline but remains incomplete for that cache entry
-so a later counter cannot erase unobserved evidence. Bounded session listings
-likewise discard head-only permission, model, and effort rather than presenting
-stale posture as current.
+to 8 MiB and all cached plus in-flight fragments to 32 MiB. Overflow is
+discarded through its next newline. Historical UltraCode coverage remains
+explicitly partial, while a later complete UltraCode transition or authoritative
+workflow counter can restore the corresponding current state instead of leaving
+the cache permanently poisoned. Bounded session listings likewise discard
+head-only permission, model, and effort rather than presenting stale posture as
+current, while retaining a labeled historical UltraCode summary.
 Fully read cached history is digest-verified within the same bounded read
 window before appended records are accepted; the digest is extended during the
 incremental read instead of re-reading the file, and unchanged observations do
 not rehash it. Unchanged file metadata is never trusted by itself: stored
 boundary guards are still compared before cached state is reused. Oversized
-uncertain logs keep boundary guards until a candidate release requires the
-one-time full replay. A valid final JSON object is accepted without requiring a
-trailing newline, while a genuinely partial record remains uncertain.
+logs remain head/tail-bounded; a later authoritative record may restore current
+state without triggering an unbounded full replay or relabeling skipped history
+as complete. A valid final JSON object is accepted without requiring a trailing
+newline, while a genuinely partial record remains uncertain.
 Timestamp-regressing release records and untracked completions cannot release
 newer workflow evidence.
 
@@ -360,8 +450,30 @@ interruption, and exit states take priority over completion and return
 completed turn. A terminal assistant record also does not complete the wait
 while `workflowPending` remains true; the wait resumes only after the workflow
 lifecycle reaches zero or a bounded timeout is returned.
-Final assistant text is returned up to 128 KiB with `textLength` and
-`textTruncated`, so callers can detect the uncommon larger response.
+Final assistant text is returned up to 128 KiB with an opaque, record-scoped
+`resultId`, plus `textLength`, `textCharacters`, `textUtf8Bytes`, `textSha256`,
+and `textTruncated`. `resultId` distinguishes separate assistant records that
+contain identical text; `textSha256` is the content-integrity hash. The reader
+expands from 2 MiB through a bounded 32 MiB window when the requested JSONL
+record crosses the initial boundary, even when smaller records follow it. A
+required record beyond that bound returns an explicit attention reason instead
+of silently timing out. Use `get_claude_result` with the same project, UUID, and
+`resultId` to retrieve Unicode-safe chunks until `hasMore` is false, then verify
+`textSha256`. Legacy SHA-256 content result IDs remain accepted; when identical
+text occurs in multiple records, their record-specific usage is intentionally
+reported as ambiguous rather than guessed. The returned `usage` is only the
+main assistant record's session-log evidence; delegated-agent coverage and
+dollar or credit cost remain unknown.
+
+The first record-scoped chunk read retains the verified result in a five-minute,
+process-local, memory-bounded cache. Sequential pages reuse the prior Unicode
+position instead of rereading, reparsing, or rehashing the complete result.
+Every cache hit first confirms the session log is still the same regular file
+with unchanged identity, size, and timestamps. An append, rewrite, replacement,
+expiry, eviction, or MCP refresh causes a fresh bounded read. `resultCache` and
+`transcriptRead.cacheHit` report which path supplied each chunk. Legacy
+content-only IDs deliberately use a full bounded scan so duplicate-text usage
+cannot be presented as record-specific evidence.
 
 Use `send_text` and `send_key` only for low-level interaction. Newlines sent
 through `send_text` can submit early; prefer `submit_prompt` for real prompts.

@@ -4,6 +4,7 @@ npm-debug.log*
 .env
 .env.*
 *.log
+*.log.receipt.json
 .DS_Store
 Thumbs.db
 Desktop.ini

@@ -5,6 +5,57 @@ Semantic Versioning after the first stable release.
 
 ## [Unreleased]
 
+## [1.0.0-beta.3] - 2026-08-31
+
+### Added
+
+- Record-scoped result identities, separate SHA-256 content verification,
+  Unicode-safe chunk retrieval, exact text-size metadata, and main-record
+  session-log usage evidence
+- A short-lived, memory-bounded, session-log-validated result cache for
+  efficient sequential paging of large record-scoped answers
+- Launch audit receipts for bypass/isolation boundaries, requested tool argv,
+  resolved-posture semantics, and unavailable delegated-agent telemetry
+- Cross-platform launch-provenance coverage in the public portable test suite
+- Bounded UltraCode attachment lifecycle evidence that records entry, exit,
+  current state, partial-history uncertainty, and attention status
+- Opt-in Claude debug capture with an MCP-owned path plus file, argument, and
+  session binding evidence; debug contents are never returned by the MCP
+- A guarded native-Windows acceptance test for initial UltraCode entry,
+  transition to high effort, re-entry, debug-log growth, clean stop, and exact
+  restoration of compatible Claude effort defaults
+
+### Changed
+
+- Operator, debugger, and reviewer skills recover truncated answers through
+  `get_claude_result` and treat report-only prompts, allowed roots, and isolated
+  policy values as controls with explicit evidence limits
+- Operator and debugger guidance now uses lifecycle and debug provenance when
+  distinguishing requested UltraCode from observed attachment behavior
+
+### Fixed
+
+- Final assistant JSONL records larger than the former 2 MiB tail window no
+  longer disappear and cause a misleading wait timeout
+- Large results remain retrievable when a smaller user or metadata record was
+  appended after them, and oversized partial records are reported explicitly
+- The bounded reader reserves the JSONL delimiter byte, so a payload exactly at
+  the documented record limit remains recoverable
+- Identical assistant text in separate records no longer borrows the wrong
+  main-record usage evidence
+- Legacy tmux metadata without a recorded child-launch environment now reports
+  that boundary as unknown instead of applying current launch behavior
+- Legacy session reconstruction no longer borrows the current MCP bypass policy
+  and presents it as historical launch provenance
+- Runtime-observation overflow recovery reports exact skipped-byte counts,
+  stays bounded, and avoids replaying an entire large log
+- Untimestamped duplicate UltraCode entry records retain the latest known entry
+  time, while precommit cleanup removes a debug sidecar only when it is
+  definitively bound to the failed launch
+- Windows trust-menu navigation follows the selected row, delayed environment
+  expansion is disabled for `cmd.exe` wrappers, and debug readiness remains
+  consistent across platform backends
+
 ## [1.0.0-beta.2] - 2026-08-18
 
 ### Added
@@ -113,6 +164,7 @@ interpret `lastKnownPendingCount` as a current count.
 - Absolute Claude-path registration, optional allowed roots, and tagged-source
   installation guidance
 
-[Unreleased]: https://github.com/SNComrade/Rail-Connector-MCP/compare/v1.0.0-beta.2...HEAD
+[Unreleased]: https://github.com/SNComrade/Rail-Connector-MCP/compare/v1.0.0-beta.3...HEAD
+[1.0.0-beta.3]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.3
 [1.0.0-beta.2]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.1

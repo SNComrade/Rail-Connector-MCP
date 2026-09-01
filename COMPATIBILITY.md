@@ -2,7 +2,7 @@
 
 ## Release Status
 
-`1.0.0-beta.2` is prerelease software. Tool names, input schemas, response
+`1.0.0-beta.3` is prerelease software. Tool names, input schemas, response
 fields, installation behavior, and platform support may change before `1.0.0`.
 
 ## Node.js

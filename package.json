@@ -1,6 +1,6 @@
 {
   "name": "rail-connector-mcp",
-  "version": "1.0.0-beta.2",
+  "version": "1.0.0-beta.3",
   "description": "Local MCP bridge for operating Claude Code Remote Control from Codex.",
   "private": true,
   "repository": {
@@ -62,13 +62,15 @@
     "test:git-modes": "node test/git-modes.mjs",
     "test:package": "node test/package-contents.mjs",
     "test:live:windows": "node test/live-windows-acceptance.mjs",
+    "test:live:ultracode:windows": "node test/live-ultracode-transition.mjs",
     "test:installer:unix": "node test/install-unix.mjs",
     "test:installer:windows": "pwsh -NoProfile -File test/install-windows.ps1",
     "test:tmux": "node test/tmux-integration.mjs",
     "test:wrapper:windows": "node test/windows-command-wrapper.mjs",
+    "test:launch-provenance": "node test/launch-provenance.mjs",
     "check": "node --check src/index.js",
     "check:privacy": "node tools/leak-scan.mjs",
-    "test": "npm run check && npm run test:args && npm run test:capabilities && npm run test:lifecycle && npm run test:submit && npm run test:submit-loop && npm run test:sessions && npm run test:runtime-observation && npm run test:render && npm run test:broker && npm run test:skills && npm run test:public && npm run test:git-modes && npm run test:package && npm run check:privacy && npm run smoke"
+    "test": "npm run check && npm run test:args && npm run test:capabilities && npm run test:lifecycle && npm run test:submit && npm run test:submit-loop && npm run test:sessions && npm run test:runtime-observation && npm run test:render && npm run test:broker && npm run test:skills && npm run test:public && npm run test:git-modes && npm run test:package && npm run test:launch-provenance && npm run check:privacy && npm run smoke"
   },
   "keywords": [
     "mcp",

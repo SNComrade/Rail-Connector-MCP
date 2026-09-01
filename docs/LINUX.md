@@ -73,7 +73,7 @@ that login; those are separate OS profiles and separate Claude log folders.
 ## 3. Clone And Install
 
 ```bash
-git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.3 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 ./install.sh
 ```

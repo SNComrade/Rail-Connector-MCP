@@ -74,6 +74,10 @@ resolved, and observed permission fields.
   `environment`. A non-`xhigh` `CLAUDE_CODE_EFFORT_LEVEL` or
   `CLAUDE_CODE_DISABLE_WORKFLOWS=1` in the MCP process is blocking; correct the
   registration or process environment and start a fresh MCP process.
+- Interpret `advertisedAsEffort: false` and `helpListsUltracode: false` as
+  "not listed by help," not "unavailable." Check
+  `supportedByInstalledVersion`, `launchMechanism`, and `launchArgument` before
+  deciding whether the MCP can make the direct request.
 - Check `argumentProbe.exitCode` and `controlExitCode`. Acceptance requires a
   completed zero/nonzero pair. Treat timeout or termination as inconclusive;
   changed stderr wording alone is not rejection. The documented direct launch
@@ -88,6 +92,15 @@ resolved, and observed permission fields.
   trigger attribution. `xhigh_correlated_unconfirmed` is not confirmed
   UltraCode; `workflow_activity_observed` still leaves the workflow trigger
   unknown.
+- Inspect `ultraEffortAttachment.active`, `lifecycle`, `lastTransition`, and
+  `historyCoverage`. A latest enter produces `attachment_lifecycle_active`; a
+  later exit produces `exited_after_entry`. Treat a skipped or partial range as
+  unknown until a later complete transition restores the current state; keep
+  history coverage partial after that recovery. Attachment transitions
+  authenticate client-side mode changes, not server-side workflow execution.
+- Inspect `attentionStatus` independently. A blocking launch environment,
+  conflicting bound effort, or terminal rejection takes precedence in the
+  primary status without erasing the recorded lifecycle.
 - Compare `launchEnvironment` with `currentMcpEnvironment`. A `different`
   result after refresh can be legitimate; diagnose the original child from its
   persisted sanitized launch snapshot. `launch_not_recorded` means older
@@ -104,6 +117,14 @@ resolved, and observed permission fields.
 - Claude's UI may display the underlying `xhigh` effort while UltraCode is
   requested. Do not require the footer to display the literal word
   `UltraCode`.
+
+For a bounded local transport investigation, start a separate diagnostic
+session with `debug: true` and optionally `debugFilter: "api,!statsig"`. Confirm
+capabilities advertise `--debug-file`, then inspect `debugLog.status`,
+`identityMatch`, `launchBindingMatch`, and `sizeBytes`. The MCP returns no
+contents. The retained log is sensitive. Windows reports
+`ready_acl_unverified` because mode bits are not ACL proof, and debug timing
+cannot authenticate Anthropic's server-side effort state.
 
 ## Windows Session Missing Or Stale
 

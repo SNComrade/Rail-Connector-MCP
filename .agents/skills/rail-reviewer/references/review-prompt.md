@@ -68,6 +68,10 @@ residual risks or test gaps.
 - Pass `disallowedTools: ["Edit", "Write", "NotebookEdit"]`, keep
   `trustWorkspace: false` unless trust was explicitly authorized, and verify the
   repository/index before and after the turn.
+- State that those flags constrain built-in tools only. Connected MCP and
+  connector tools can remain available, so inspect the effective roster when
+  possible and use an isolated worktree or read-only copy for hard write
+  isolation.
 - Prefer `permissionMode: "dontAsk"` for report-only inspection when Claude
   advertises it. If a compatibility fallback uses `plan`, never approve the
   plan or implementation; restart the review in `dontAsk` when possible.

@@ -16,6 +16,9 @@ task project as `cwd`, even when this skill is loaded from the MCP repo.
   context.
 - Call `status` when lifecycle is unclear and `get_claude_capabilities` before
   permission, effort, or Ultracode launch decisions.
+- Use `debug: true` only for an explicit, bounded diagnostic run. Inspect the
+  returned `debugLog` provenance and size; the MCP never returns contents, and
+  the retained file is sensitive local evidence.
 - Give parallel jobs unique `managedSession` names. A Windows broker session
   persists across MCP/Codex task refresh and must be explicitly stopped.
 - Treat managed terminal name, Remote Control `remoteName`, conversation title,
@@ -43,8 +46,9 @@ task project as `cwd`, even when this skill is loaded from the MCP repo.
 - Do not infer workflow completion from a final assistant record alone. Keep
   waiting until `workflowPending` clears, handle a bounded timeout, or inspect
   and deliberately authorize a force action.
-- Treat `tool_use` as in progress. Check `textTruncated` before assuming a large
-  report was returned in full.
+- Treat `tool_use` as in progress. Check `textTruncated`, `textSha256`, and
+  `textCharacters` before assuming a large report was returned in full. Use
+  `get_claude_result` with `resultId` for exact chunks until `hasMore` is false.
 - Never type over a busy or non-empty composer unless the user deliberately
   authorizes an inspected `force` action.
 
@@ -52,9 +56,15 @@ task project as `cwd`, even when this skill is loaded from the MCP repo.
 
 Use `permissionMode: "dontAsk"` for report-only work when the installed CLI
 advertises it, pass `disallowedTools: ["Edit", "Write", "NotebookEdit"]`,
-leave workspace trust false unless explicitly authorized, and verify repository
-and index state before and after the turn. This denies new
-permission requests without turning the review into a plan-approval workflow.
+leave workspace trust false unless explicitly authorized, include explicit
+no-edit prompt constraints, and verify repository/index state before and after.
+This denies new permission requests without turning the review into a
+plan-approval workflow; it is not an operating-system sandbox.
+`tools`, `allowedTools`, and `disallowedTools` constrain built-in Claude tools
+only. Connected MCP and connector tools can remain available, and this MCP does
+not yet provide a verified strict MCP-config roster. Inspect the effective
+roster when possible and use an isolated worktree or read-only copy when hard
+write isolation is required.
 Use `plan` only as a compatibility fallback and never approve implementation
 from a report-only session. Use semantic `default` for normal interactive work;
 the MCP resolves it to the installed CLI's advertised `default` or `manual`
@@ -70,8 +80,11 @@ When the user explicitly asks for bypass:
    do not silently downgrade the request.
 
 The accepted local-host policy acknowledges that bypass can modify the host
-without prompts. An isolated policy value remains supported. Do not infer
-bypass authorization from workspace trust or team size.
+without prompts. An isolated policy value remains supported, but
+`posture.audit.securityBoundary.isolationClaim: "operator_asserted"` is not OS
+isolation proof. Allowed roots constrain MCP session management, not Claude's
+filesystem access. Do not infer bypass authorization from workspace trust or
+team size.
 
 When the user explicitly asks for Ultracode:
 
@@ -79,6 +92,10 @@ When the user explicitly asks for Ultracode:
    `environment`. Probe acceptance requires a zero exit for UltraCode and a
    nonzero invalid control; timeout or termination is inconclusive. A blocking
    process override must be corrected before launch.
+   `advertisedAsEffort: false` and `helpListsUltracode: false` mean only that
+   CLI help omitted the literal value; they are not unavailability results.
+   Read `supportedByInstalledVersion`, `launchMechanism`, and `launchArgument`
+   with the probe evidence.
 2. Pass `ultracode: true` and `confirmUltracode: true`.
 3. Omit ordinary `effort` and `safeMode`.
 4. Inspect `posture.ultracodeAssessment` after start and after the turn. Current
@@ -86,6 +103,16 @@ When the user explicitly asks for Ultracode:
    persisted `launchEnvironment` with `currentMcpEnvironment`; after a refresh,
    the latter is diagnostics for the new MCP process, not retroactive launch
    evidence for the existing Claude child.
+   Read `ultraEffortAttachment.active`, `lifecycle`, `lastTransition`, and
+   `historyCoverage`. A current enter produces
+   `attachment_lifecycle_active`; a later exit produces
+   `exited_after_entry`. An unknown lifecycle after a skipped or partial range
+   must not be promoted to active unless a later complete transition restores
+   current state; historical coverage remains partial. Inspect
+   `attentionStatus` before trusting an active lifecycle because a blocking
+   environment, conflicting effort, or terminal rejection can coexist with the
+   attachment. Enter/exit records authenticate client-side mode transitions,
+   not server-side workflow execution.
 
 Do not claim an unobserved posture is confirmed. Use each field's evidence
 source; session-log evidence is stronger than terminal heuristics. `xhigh` is
@@ -112,7 +139,7 @@ comparisons to the same managed name, conversation UUID, generation, and time.
    `permissionMode`, and `trustWorkspace`. Use `sessionTitle` only for a new
    conversation. Start with `killExisting: false`.
 4. **Submit.** Use `submit_prompt` with `force: false`. Read `status`, `reason`,
-   signals, `waitAfterCursor`, transcript, and posture.
+   signals, `waitAfterCursor`, transcript, posture, and `posture.audit`.
 5. **Wait.** Call `wait_for_claude_turn` with the returned non-empty
    `waitAfterCursor` verbatim. Handle `needs_attention` before sending more
    work. A `completed` result may also carry an additive `attention` warning;
@@ -130,9 +157,9 @@ comparisons to the same managed name, conversation UUID, generation, and time.
    other non-idle `terminalState` gates remain blocking. Native Windows rejects
    unsupported key names with `EINVAL`; never retry by sending the key name as
    text.
-7. **Finish.** Gracefully stop only an idle session created by this workflow
-   with an empty composer, unless the user explicitly asks to stop or retain
-   another known session. If stop reports
+7. **Finish.** Gracefully stop only an idle managed session created by this
+   workflow with an empty composer, unless the user explicitly asks to stop or
+   retain another known session. If stop reports
    `awaiting_input`, preserve the draft: submit it only with authorization,
    explicitly discard and recapture only with authorization, or leave the
    session running. Never force-stop an unsent draft as routine cleanup. Report

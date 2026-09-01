@@ -209,6 +209,7 @@ try {
   assert.equal(started.isError, undefined, started.content?.[0]?.text);
   const startPayload = JSON.parse(started.content[0].text);
   assert.equal(startPayload.status, "started", JSON.stringify(startPayload));
+  assert.match(startPayload.claudeCliVersion, /^2\.1\.234\b/);
   assert.match(startPayload.capture, /Fake Claude TUI/);
   const upgradedBrokerStatus = await probeWindowsBroker(mcpEnv);
   assert.equal(upgradedBrokerStatus.compatible, true);
