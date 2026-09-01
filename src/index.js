@@ -27,7 +27,7 @@ const CLAUDE_CONFIG_DIR = path.resolve(
 const DEFAULT_CWD = HOME;
 const DEFAULT_MANAGED_SESSION = "rail-connector-managed";
 const DEFAULT_REMOTE_NAME = "Rail-Connector";
-export const SERVER_VERSION = "1.0.0-beta.2";
+export const SERVER_VERSION = "1.0.0-beta.3";
 const IS_NATIVE_WINDOWS = process.platform === "win32";
 const REMOTE_URL_RE = /https:\/\/claude\.ai\/code\/[A-Za-z0-9_:-]+/;
 const DEFAULT_TEXT_CHUNK_SIZE = 2048;
@@ -61,6 +61,10 @@ const SESSION_ID_RE =
 const TERMINAL_STOP_REASONS = new Set(["end_turn", "stop_sequence", "max_tokens"]);
 const NO_ASSISTANT_CURSOR = "rail:no-assistant:v1";
 const PORTABLE_WAIT_CURSOR_PREFIX = "rail:v2:";
+const RESULT_ID_PREFIX = "rail:result:v1:";
+const RESULT_ID_RE = new RegExp(
+  `^(?:sha256:[0-9a-f]{64}|${RESULT_ID_PREFIX}[0-9a-f]{64}:[0-9a-f]{64})$`
+);
 const WAIT_ATTENTION_STATES = new Set([
   "exited",
   "limit_warning",
@@ -86,6 +90,16 @@ const SUBMIT_KEY_NAMES = new Set([
   "NumpadEnter",
 ]);
 const MAX_TRANSCRIPT_ASSISTANT_CHARS = 128 * 1024;
+const DEFAULT_RECENT_SESSION_BYTES = 2 * 1024 * 1024;
+const MAX_SESSION_JSONL_RECORD_BYTES = 32 * 1024 * 1024;
+const MAX_RECENT_SESSION_BYTES = MAX_SESSION_JSONL_RECORD_BYTES + 1;
+const DEFAULT_RESULT_CHUNK_CHARACTERS = 32 * 1024;
+const MAX_RESULT_CHUNK_CHARACTERS = 64 * 1024;
+const SESSION_RECORD_SOURCE_OFFSET = Symbol("sessionRecordSourceOffset");
+const SESSION_WINDOW_FILE_STATE = Symbol("sessionWindowFileState");
+const CLAUDE_RESULT_CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_CLAUDE_RESULT_CACHE_ENTRIES = 4;
+const MAX_CLAUDE_RESULT_CACHE_CODE_UNITS = 40 * 1024 * 1024;
 const BROKER_LEASE_TTL_MS = 120000;
 const BROKER_LEASE_RENEW_INTERVAL_MS = 30000;
 const CLAUDE_CAPABILITY_CACHE_TTL_MS = 60 * 1000;
@@ -95,6 +109,9 @@ const CLAUDE_CHILD_ENVIRONMENT_KEYS = [
   "CLAUDE_CODE_EFFORT_LEVEL",
   "CLAUDE_CODE_DISABLE_WORKFLOWS",
 ];
+const CLAUDE_DEBUG_FILTER_RE = /^[A-Za-z0-9_.*!:,-]{1,256}$/;
+const CLAUDE_DEBUG_RECEIPT_SCHEMA_VERSION = 2;
+const MAX_ULTRA_EFFORT_TRANSITION_EVENTS = 64;
 const BROKER_UNAVAILABLE_CODES = new Set([
   "ENOENT",
   "ECONNREFUSED",
@@ -111,6 +128,7 @@ function brokerUnavailable(error) {
 const sessionOperationLocks = new Map();
 const brokerMutationLeases = new Map();
 const claudeCapabilityCache = new Map();
+const claudeResultCache = new Map();
 
 function text(data) {
   const value = typeof data === "string" ? data : JSON.stringify(data, null, 2);
@@ -324,6 +342,26 @@ function createSessionSummaryState() {
     permissionMode: "",
     model: "",
     effort: "",
+    claudeVersion: "",
+    ultraEffortAttachmentObserved: false,
+    ultraEffortAttachmentObservedAt: "",
+    ultraEffortAttachmentActive: null,
+    ultraEffortAttachmentCurrentDirection: "",
+    ultraEffortAttachmentLastTransitionDirection: "",
+    ultraEffortAttachmentLastTransitionAt: "",
+    ultraEffortAttachmentLastEnteredAt: "",
+    ultraEffortAttachmentLastExitedAt: "",
+    ultraEffortAttachmentEnterCount: 0,
+    ultraEffortAttachmentExitCount: 0,
+    ultraEffortAttachmentTransitionEvents: [],
+    ultraEffortAttachmentTransitionEventsOmitted: 0,
+    ultraEffortAttachmentCountsAreLowerBound: false,
+    ultraEffortAttachmentHistoryIncomplete: false,
+    ultraEffortAttachmentUnknownReason: "no_transitions_observed",
+    workflowKeywordRequestCount: 0,
+    runtimeUntimestampedRecords: [],
+    runtimeUntimestampedRecordsDropped: 0,
+    runtimeCurrentLaunchObserved: false,
     workflowLaunchObserved: false,
     workflowLaunchStatus: "",
     workflowLaunchUpdatedAt: "",
@@ -399,10 +437,81 @@ function recordWorkflowObservedAt(state, timestamp = "") {
   }
 }
 
-function clearObservedPosture(state) {
+function resetUltraEffortState(state) {
+  state.ultraEffortAttachmentObserved = false;
+  state.ultraEffortAttachmentObservedAt = "";
+  state.ultraEffortAttachmentActive = null;
+  state.ultraEffortAttachmentCurrentDirection = "";
+  state.ultraEffortAttachmentLastTransitionDirection = "";
+  state.ultraEffortAttachmentLastTransitionAt = "";
+  state.ultraEffortAttachmentLastEnteredAt = "";
+  state.ultraEffortAttachmentLastExitedAt = "";
+  state.ultraEffortAttachmentEnterCount = 0;
+  state.ultraEffortAttachmentExitCount = 0;
+  state.ultraEffortAttachmentTransitionEvents = [];
+  state.ultraEffortAttachmentTransitionEventsOmitted = 0;
+  state.ultraEffortAttachmentCountsAreLowerBound = false;
+  state.ultraEffortAttachmentHistoryIncomplete = false;
+  state.ultraEffortAttachmentUnknownReason = "no_transitions_observed";
+  state.workflowKeywordRequestCount = 0;
+}
+
+function clearObservedPosture(
+  state,
+  { preserveUltraHistory = false, markUltraHistoryGap = false } = {}
+) {
   state.permissionMode = "";
   state.model = "";
   state.effort = "";
+  state.claudeVersion = "";
+  if (!preserveUltraHistory) {
+    resetUltraEffortState(state);
+    return;
+  }
+  state.ultraEffortAttachmentActive = null;
+  state.ultraEffortAttachmentCurrentDirection = "";
+  if (markUltraHistoryGap) {
+    state.ultraEffortAttachmentHistoryIncomplete = true;
+    state.ultraEffortAttachmentCountsAreLowerBound = true;
+    state.ultraEffortAttachmentUnknownReason = "history_gap";
+  }
+}
+
+function recordUltraEffortTransition(state, direction, timestamp = "") {
+  const isEnter = direction === "enter";
+  const isDuplicate =
+    state.ultraEffortAttachmentCurrentDirection === direction;
+  if (isEnter) {
+    const firstObservedEnter = !state.ultraEffortAttachmentObserved;
+    state.ultraEffortAttachmentObserved = true;
+    if (firstObservedEnter || timestamp) {
+      state.ultraEffortAttachmentObservedAt = timestamp;
+    }
+    if (timestamp || !state.ultraEffortAttachmentLastEnteredAt) {
+      state.ultraEffortAttachmentLastEnteredAt = timestamp;
+    }
+  } else if (timestamp || !state.ultraEffortAttachmentLastExitedAt) {
+    state.ultraEffortAttachmentLastExitedAt = timestamp;
+  }
+  state.ultraEffortAttachmentActive = isEnter;
+  state.ultraEffortAttachmentUnknownReason = "";
+  if (isEnter) state.ultraEffortAttachmentEnterCount += 1;
+  else state.ultraEffortAttachmentExitCount += 1;
+  state.ultraEffortAttachmentTransitionEvents.push({
+    direction,
+    at: timestamp,
+  });
+  if (
+    state.ultraEffortAttachmentTransitionEvents.length >
+    MAX_ULTRA_EFFORT_TRANSITION_EVENTS
+  ) {
+    state.ultraEffortAttachmentTransitionEvents.shift();
+    state.ultraEffortAttachmentTransitionEventsOmitted += 1;
+  }
+  if (isDuplicate) return;
+  state.ultraEffortAttachmentCurrentDirection = direction;
+  state.ultraEffortAttachmentLastTransitionDirection = direction;
+  state.ultraEffortAttachmentLastTransitionAt = timestamp;
 }
 
 async function withManagedMutationLock(
@@ -569,6 +678,313 @@ function conversationMessageFromRecord(record) {
   return body ? { role, body } : null;
 }
 
+function safeCodeUnitPrefix(value, maxCodeUnits) {
+  if (value.length <= maxCodeUnits) return value;
+  let end = maxCodeUnits;
+  const last = value.charCodeAt(end - 1);
+  const next = value.charCodeAt(end);
+  if (
+    last >= 0xd800 &&
+    last <= 0xdbff &&
+    next >= 0xdc00 &&
+    next <= 0xdfff
+  ) {
+    end -= 1;
+  }
+  return value.slice(0, end);
+}
+
+function codePointLength(value) {
+  let length = 0;
+  for (const _character of value) length += 1;
+  return length;
+}
+
+function sliceByCodePoints(value, offsetCharacters, maxCharacters, hint = null) {
+  let characterIndex = 0;
+  let codeUnitIndex = 0;
+  if (
+    hint &&
+    Number.isSafeInteger(hint.offsetCharacters) &&
+    Number.isSafeInteger(hint.codeUnitIndex) &&
+    hint.offsetCharacters >= 0 &&
+    hint.offsetCharacters <= offsetCharacters &&
+    hint.codeUnitIndex >= 0 &&
+    hint.codeUnitIndex <= value.length
+  ) {
+    characterIndex = hint.offsetCharacters;
+    codeUnitIndex = hint.codeUnitIndex;
+  }
+  while (characterIndex < offsetCharacters && codeUnitIndex < value.length) {
+    const codePoint = value.codePointAt(codeUnitIndex);
+    codeUnitIndex += codePoint > 0xffff ? 2 : 1;
+    characterIndex += 1;
+  }
+  const startCodeUnit = codeUnitIndex;
+  const endCharacters = offsetCharacters + maxCharacters;
+  while (characterIndex < endCharacters && codeUnitIndex < value.length) {
+    const codePoint = value.codePointAt(codeUnitIndex);
+    codeUnitIndex += codePoint > 0xffff ? 2 : 1;
+    characterIndex += 1;
+  }
+  return {
+    text: value.slice(startCodeUnit, codeUnitIndex),
+    returnedCharacters: characterIndex - offsetCharacters,
+    nextCodeUnitIndex: codeUnitIndex,
+  };
+}
+
+function textSha256(value) {
+  return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+function assistantRecordIdentityDigest(record) {
+  const sessionId = record.sessionId ?? record.session_id ?? "";
+  const explicitId = record.uuid || record.message?.id || "";
+  const sourceOffset = record[SESSION_RECORD_SOURCE_OFFSET];
+  const locator = explicitId
+    ? `id:${explicitId}`
+    : Number.isSafeInteger(sourceOffset) && sourceOffset >= 0
+      ? `offset:${sourceOffset}`
+      : `record:${JSON.stringify(record)}`;
+  return createHash("sha256")
+    .update(String(sessionId), "utf8")
+    .update("\0")
+    .update(locator, "utf8")
+    .digest("hex");
+}
+
+function assistantResultMetadata(
+  record,
+  body,
+  digest = textSha256(body),
+  recordIdentityDigest = assistantRecordIdentityDigest(record)
+) {
+  const contentDigest = digest.slice("sha256:".length);
+  const usage = record.message?.usage ?? record.usage ?? null;
+  const numericUsage = (name) =>
+    Number.isFinite(usage?.[name]) ? Number(usage[name]) : null;
+  return {
+    resultId: `${RESULT_ID_PREFIX}${contentDigest}:${recordIdentityDigest}`,
+    textSha256: digest,
+    textLength: body.length,
+    textCharacters: codePointLength(body),
+    textUtf8Bytes: Buffer.byteLength(body, "utf8"),
+    usage: usage && typeof usage === "object"
+      ? {
+          evidence: "claude_session_log_main_record",
+          scope: "main_assistant_record",
+          delegatedAgentCoverage: "unknown",
+          costUsd: null,
+          creditUsage: null,
+          inputTokens: numericUsage("input_tokens"),
+          outputTokens: numericUsage("output_tokens"),
+          cacheCreationInputTokens: numericUsage(
+            "cache_creation_input_tokens"
+          ),
+          cacheReadInputTokens: numericUsage("cache_read_input_tokens"),
+          iterations: numericUsage("iterations"),
+          serviceTier:
+            typeof usage.service_tier === "string"
+              ? usage.service_tier
+              : null,
+          speed: typeof usage.speed === "string" ? usage.speed : null,
+        }
+      : null,
+  };
+}
+
+function assistantResultTarget(resultId) {
+  if (!resultId.startsWith(RESULT_ID_PREFIX)) {
+    return {
+      scope: "legacy_assistant_text_content",
+      textSha256: resultId,
+      recordIdentityDigest: null,
+    };
+  }
+  const [contentDigest, recordIdentityDigest] = resultId
+    .slice(RESULT_ID_PREFIX.length)
+    .split(":");
+  return {
+    scope: "assistant_record",
+    textSha256: `sha256:${contentDigest}`,
+    recordIdentityDigest,
+  };
+}
+
+function assistantResultMatch(record, target) {
+  let recordIdentityDigest = null;
+  if (target.scope === "assistant_record") {
+    recordIdentityDigest = assistantRecordIdentityDigest(record);
+    if (recordIdentityDigest !== target.recordIdentityDigest) return null;
+  }
+  const conversationMessage = conversationMessageFromRecord(record);
+  if (!conversationMessage || conversationMessage.role !== "assistant") {
+    return null;
+  }
+  const digest = textSha256(conversationMessage.body);
+  if (digest !== target.textSha256) return null;
+  const metadata = assistantResultMetadata(
+    record,
+    conversationMessage.body,
+    digest,
+    recordIdentityDigest ?? assistantRecordIdentityDigest(record)
+  );
+  return { record, body: conversationMessage.body, metadata };
+}
+
+function firstAssistantResultMatch(records, target) {
+  for (const record of records) {
+    const match = assistantResultMatch(record, target);
+    if (match) return match;
+  }
+  return null;
+}
+
+function assistantResultMatches(records, target) {
+  const matches = [];
+  for (const record of records) {
+    const match = assistantResultMatch(record, target);
+    if (match) matches.push(match);
+  }
+  return matches;
+}
+
+function conversationRecordCursor(record, role, body, recordIndex) {
+  const explicit =
+    role === "assistant"
+      ? record.uuid || record.message?.id
+      : record.uuid || record.promptId;
+  if (explicit) return explicit;
+  const sourceOffset = record[SESSION_RECORD_SOURCE_OFFSET];
+  if (Number.isSafeInteger(sourceOffset) && sourceOffset >= 0) {
+    const digest = createHash("sha256")
+      .update(JSON.stringify(record), "utf8")
+      .digest("hex")
+      .slice(0, 16);
+    return `rail:record:v1:${sourceOffset}:sha256:${digest}`;
+  }
+  const digest = createHash("sha256")
+    .update(JSON.stringify(record), "utf8")
+    .update(`\0${recordIndex}`)
+    .digest("hex");
+  return `rail:record:v1:sha256:${digest}`;
+}
+
+function conversationMessagePreview(record, conversationMessage, maxCodeUnits) {
+  const { role, body } = conversationMessage;
+  const preview = safeCodeUnitPrefix(body, maxCodeUnits);
+  const integrity =
+    role === "assistant"
+      ? assistantResultMetadata(record, body)
+      : {
+          textLength: body.length,
+          textCharacters: codePointLength(body),
+          textUtf8Bytes: Buffer.byteLength(body, "utf8"),
+          textSha256: textSha256(body),
+        };
+  return {
+    role,
+    timestamp: record.timestamp ?? "",
+    text: preview,
+    ...integrity,
+    textTruncated: preview.length < body.length,
+  };
+}
+
+function ultraEffortLifecycleFromState(
+  state,
+  {
+    scope = "full_session_log",
+    coverage = "full",
+    skippedBytes = 0,
+    trailingRecordIncomplete = false,
+    recordOverflowed = false,
+    includeTransitionEvents = true,
+  } = {}
+) {
+  const transitionObserved =
+    state.ultraEffortAttachmentEnterCount > 0 ||
+    state.ultraEffortAttachmentExitCount > 0;
+  const observationUncertain =
+    state.ultraEffortAttachmentHistoryIncomplete === true ||
+    trailingRecordIncomplete;
+  const active = trailingRecordIncomplete
+    ? null
+    : state.ultraEffortAttachmentActive;
+  const activeUnknownReason =
+    active !== null
+      ? ""
+      : recordOverflowed
+        ? "record_overflow"
+        : trailingRecordIncomplete
+          ? "trailing_record_incomplete"
+          : coverage === "none"
+            ? "no_session_log"
+            : state.ultraEffortAttachmentUnknownReason ||
+              (transitionObserved
+                ? "history_gap"
+                : "no_transitions_observed");
+  const lifecycle =
+    active === true
+      ? "active"
+      : active === false
+        ? "inactive_exited"
+        : observationUncertain || coverage === "none"
+          ? "unknown"
+          : state.ultraEffortAttachmentObserved
+            ? "historical_only"
+            : "never_observed";
+  const historyCoverage =
+    coverage === "none"
+      ? "none"
+      : state.ultraEffortAttachmentHistoryIncomplete || coverage !== "full"
+        ? "partial"
+        : "full";
+  return {
+    observed: state.ultraEffortAttachmentObserved === true,
+    observedAt: state.ultraEffortAttachmentObservedAt || "",
+    active,
+    lifecycle,
+    activeUnknownReason,
+    lastTransition: state.ultraEffortAttachmentLastTransitionDirection
+      ? {
+          direction: state.ultraEffortAttachmentLastTransitionDirection,
+          at: state.ultraEffortAttachmentLastTransitionAt || "",
+        }
+      : null,
+    lastEnterAt: state.ultraEffortAttachmentLastEnteredAt || "",
+    lastExitAt: state.ultraEffortAttachmentLastExitedAt || "",
+    enterCount: state.ultraEffortAttachmentEnterCount,
+    exitCount: state.ultraEffortAttachmentExitCount,
+    transitionEventsIncluded: includeTransitionEvents,
+    transitionEventsAvailable:
+      state.ultraEffortAttachmentTransitionEvents.length,
+    ...(includeTransitionEvents
+      ? {
+          transitionEvents: state.ultraEffortAttachmentTransitionEvents.map(
+            (event) => ({ ...event })
+          ),
+        }
+      : {}),
+    transitionEventsOmitted:
+      state.ultraEffortAttachmentTransitionEventsOmitted,
+    transitionHistoryTruncated:
+      state.ultraEffortAttachmentTransitionEventsOmitted > 0,
+    countsAreLowerBound:
+      state.ultraEffortAttachmentCountsAreLowerBound === true ||
+      coverage !== "full" ||
+      trailingRecordIncomplete,
+    workflowKeywordRequestCount: state.workflowKeywordRequestCount,
+    historyCoverage,
+    observationUncertain,
+    observationCoverage: coverage,
+    observationSkippedBytes: skippedBytes,
+    scope,
+    evidence: transitionObserved ? "claude_session_log" : "",
+  };
+}
+
 function addSessionRecord(
   state,
   record,
@@ -578,6 +994,12 @@ function addSessionRecord(
   if (!recordMatchesSession(record, expectedSessionId)) return;
   if (record.isSidechain === true) return;
   if (record.timestamp) state.lastTimestamp = record.timestamp;
+  if (
+    typeof record.version === "string" &&
+    /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(record.version.trim())
+  ) {
+    state.claudeVersion = record.version.trim();
+  }
   if (record.type === "ai-title" && typeof record.aiTitle === "string") {
     state.titleCandidates["ai-title"] = record.aiTitle.trim();
   }
@@ -595,6 +1017,21 @@ function addSessionRecord(
     state.permissionMode = String(record.permissionMode);
   }
   if (record.permissionMode) state.permissionMode = String(record.permissionMode);
+  const attachmentType =
+    record.type === "attachment" ? record.attachment?.type : "";
+  if (
+    attachmentType === "ultra_effort_enter" ||
+    attachmentType === "ultra_effort_exit"
+  ) {
+    recordUltraEffortTransition(
+      state,
+      attachmentType === "ultra_effort_enter" ? "enter" : "exit",
+      record.timestamp || ""
+    );
+  }
+  if (attachmentType === "workflow_keyword_request") {
+    state.workflowKeywordRequestCount += 1;
+  }
   if (
     record.message?.role === "assistant" &&
     record.isMeta !== true &&
@@ -740,9 +1177,14 @@ function sessionSummaryResult(
   state,
   includeSnippets,
   includeRemoteUrl = false,
-  includeFilePath = false
+  includeFilePath = false,
+  lifecycleOptions = {}
 ) {
   const { title, titleSource } = currentSessionTitle(state);
+  const ultraEffortAttachment = ultraEffortLifecycleFromState(
+    state,
+    lifecycleOptions
+  );
   const result = {
     sessionId: path.basename(file, ".jsonl"),
     titlePresent: Boolean(title),
@@ -755,6 +1197,17 @@ function sessionSummaryResult(
     observedPermissionMode: state.permissionMode || null,
     observedModel: state.model || null,
     observedEffort: state.effort || null,
+    observedClaudeVersion: state.claudeVersion || null,
+    ultraEffortAttachmentObserved: state.ultraEffortAttachmentObserved === true,
+    ultraEffortAttachmentObservedAt:
+      state.ultraEffortAttachmentObservedAt || null,
+    ultraEffortActive: ultraEffortAttachment.active,
+    ultraEffortLifecycle: ultraEffortAttachment.lifecycle,
+    ultraEffortLastEnteredAt: ultraEffortAttachment.lastEnterAt || null,
+    ultraEffortLastExitedAt: ultraEffortAttachment.lastExitAt || null,
+    ultraEffortHistoryIncomplete:
+      ultraEffortAttachment.historyCoverage === "partial",
+    ultraEffortAttachment,
   };
   if (includeFilePath) result.file = file;
   if (includeRemoteUrl) {
@@ -776,12 +1229,22 @@ async function readSessionSummarySegments(file, stat, maxBytes) {
   const handle = await fs.promises.open(file, "r");
   try {
     if (stat.size <= maxBytes) {
-      if (stat.size === 0) return { segments: [""], bytesRead: 0, truncated: false };
+      if (stat.size === 0) {
+        return {
+          segments: [""],
+          bytesRead: 0,
+          bytesProcessed: 0,
+          bytesSkipped: 0,
+          truncated: false,
+        };
+      }
       const buffer = Buffer.alloc(stat.size);
       const read = await handle.read(buffer, 0, stat.size, 0);
       return {
         segments: [buffer.subarray(0, read.bytesRead).toString("utf8")],
         bytesRead: read.bytesRead,
+        bytesProcessed: read.bytesRead,
+        bytesSkipped: 0,
         truncated: false,
       };
     }
@@ -797,12 +1260,19 @@ async function readSessionSummarySegments(file, stat, maxBytes) {
     const tailText = tailBuffer.subarray(0, tailRead.bytesRead).toString("utf8");
     const headEnd = headText.lastIndexOf("\n");
     const tailStartLine = tailText.indexOf("\n");
+    const segments = [
+      headEnd >= 0 ? headText.slice(0, headEnd + 1) : "",
+      tailStartLine >= 0 ? tailText.slice(tailStartLine + 1) : "",
+    ];
+    const bytesProcessed = segments.reduce(
+      (total, segment) => total + Buffer.byteLength(segment),
+      0
+    );
     return {
-      segments: [
-        headEnd >= 0 ? headText.slice(0, headEnd + 1) : "",
-        tailStartLine >= 0 ? tailText.slice(tailStartLine + 1) : "",
-      ],
+      segments,
       bytesRead: headRead.bytesRead + tailRead.bytesRead,
+      bytesProcessed,
+      bytesSkipped: Math.max(0, stat.size - bytesProcessed),
       truncated: true,
     };
   } finally {
@@ -818,7 +1288,12 @@ async function summarizeSessionMetadata(metadata, includeSnippets, maxBytes, inc
   let lineCount = 0;
 
   for (const [segmentIndex, segment] of readResult.segments.entries()) {
-    if (readResult.truncated && segmentIndex > 0) clearObservedPosture(state);
+    if (readResult.truncated && segmentIndex > 0) {
+      clearObservedPosture(state, {
+        preserveUltraHistory: true,
+        markUltraHistoryGap: true,
+      });
+    }
     let offset = 0;
     while (offset <= segment.length) {
       let end = segment.indexOf("\n", offset);
@@ -847,12 +1322,19 @@ async function summarizeSessionMetadata(metadata, includeSnippets, maxBytes, inc
     state,
     includeSnippets,
     includeRemoteUrl,
-    false
+    false,
+    {
+      scope: "bounded_session_summary",
+      coverage: readResult.truncated ? "head_tail" : "full",
+      skippedBytes: readResult.bytesSkipped,
+      includeTransitionEvents: false,
+    }
   );
   if (readResult.truncated) {
     summary.summaryTruncated = true;
     summary.summaryBytesRead = readResult.bytesRead;
-    summary.summaryBytesSkipped = Math.max(0, stat.size - readResult.bytesRead);
+    summary.summaryBytesProcessed = readResult.bytesProcessed;
+    summary.summaryBytesSkipped = readResult.bytesSkipped;
     summary.messageCountIsPartial = true;
   }
   const { title } = currentSessionTitle(state);
@@ -881,9 +1363,13 @@ export async function inspectSessionFile(file, maxMessages) {
   const expectedSessionId = path.basename(file, ".jsonl");
   const readResult = await readSessionSummarySegments(file, stat, MAX_SESSION_SUMMARY_BYTES);
   const state = createSessionSummaryState();
-  const messages = [];
   for (const [segmentIndex, segment] of readResult.segments.entries()) {
-    if (readResult.truncated && segmentIndex > 0) clearObservedPosture(state);
+    if (readResult.truncated && segmentIndex > 0) {
+      clearObservedPosture(state, {
+        preserveUltraHistory: true,
+        markUltraHistoryGap: true,
+      });
+    }
     for (let line of segment.split("\n")) {
       if (line.endsWith("\r")) line = line.slice(0, -1);
       if (!line) continue;
@@ -891,28 +1377,49 @@ export async function inspectSessionFile(file, maxMessages) {
         const record = JSON.parse(line);
         if (!recordMatchesSession(record, expectedSessionId)) continue;
         addSessionRecord(state, record, expectedSessionId);
-        const conversationMessage = conversationMessageFromRecord(record);
-        if (conversationMessage) {
-          messages.push({
-            role: conversationMessage.role,
-            timestamp: record.timestamp ?? "",
-            text: conversationMessage.body.slice(0, 4000),
-          });
-          if (messages.length > maxMessages) messages.shift();
-        }
       } catch {
         // Ignore partial/corrupt lines and sampled boundaries.
       }
     }
   }
-  const summary = sessionSummaryResult(file, stat, state, true, true, true);
+  const recentWindow = await readRecentSessionRecordWindowFromFile(
+    file,
+    expectedSessionId,
+    { minConversationRecords: maxMessages }
+  );
+  const messages = [];
+  for (const record of recentWindow.records) {
+    const conversationMessage = conversationMessageFromRecord(record);
+    if (!conversationMessage) continue;
+    messages.push(
+      conversationMessagePreview(record, conversationMessage, 4000)
+    );
+    if (messages.length > maxMessages) messages.shift();
+  }
+  const summary = sessionSummaryResult(file, stat, state, true, true, true, {
+    scope: "bounded_session_detail",
+    coverage: readResult.truncated ? "head_tail" : "full",
+    skippedBytes: readResult.bytesSkipped,
+    includeTransitionEvents: true,
+  });
   if (readResult.truncated) {
     summary.summaryTruncated = true;
     summary.summaryBytesRead = readResult.bytesRead;
-    summary.summaryBytesSkipped = Math.max(0, stat.size - readResult.bytesRead);
+    summary.summaryBytesProcessed = readResult.bytesProcessed;
+    summary.summaryBytesSkipped = readResult.bytesSkipped;
     summary.messageCountIsPartial = true;
   }
-  return { ...summary, recentMessages: messages };
+  return {
+    ...summary,
+    recentMessages: messages,
+    transcriptRead: {
+      status: recentWindow.status,
+      bytesRead: recentWindow.bytesRead,
+      bytesSkipped: recentWindow.bytesSkipped,
+      trailingRecordIncomplete: recentWindow.trailingRecordIncomplete,
+      attentionReason: recentWindow.attentionReason,
+    },
+  };
 }
 
 function skippedSessionSummary(metadata, includeSnippets, includeRemoteUrl) {
@@ -922,7 +1429,13 @@ function skippedSessionSummary(metadata, includeSnippets, includeRemoteUrl) {
     createSessionSummaryState(),
     includeSnippets,
     includeRemoteUrl,
-    false
+    false,
+    {
+      scope: "skipped_session_summary",
+      coverage: "none",
+      skippedBytes: metadata.stat.size,
+      includeTransitionEvents: false,
+    }
   );
   summary.summarySkipped = true;
   summary.summarySkipReason = "scan_byte_budget_exhausted";
@@ -1415,6 +1928,283 @@ function pushOptionalListArg(args, flag, value, label) {
   if (normalized) args.push(`${flag}=${normalized}`);
 }
 
+function assertSafeClaudeDebugFilter(value) {
+  if (!CLAUDE_DEBUG_FILTER_RE.test(String(value ?? ""))) {
+    throw new Error(
+      "debugFilter must use only letters, digits, underscore, dot, star, bang, colon, comma, or hyphen and be at most 256 characters."
+    );
+  }
+  return String(value);
+}
+
+function debugFileIdentity(stat) {
+  return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+}
+
+function ensurePrivateDebugDirectory(
+  stateDir = railConnectorStateDir(),
+  { create = true } = {}
+) {
+  const resolvedStateDir = path.resolve(stateDir);
+  if (create) {
+    fs.mkdirSync(resolvedStateDir, { recursive: true, mode: 0o700 });
+  }
+  const stateStat = fs.lstatSync(resolvedStateDir);
+  if (!stateStat.isDirectory() || stateStat.isSymbolicLink()) {
+    throw new Error("Rail Connector state directory must be a real directory, not a symlink.");
+  }
+  const canonicalStateDir =
+    fs.realpathSync.native?.(resolvedStateDir) ??
+    fs.realpathSync(resolvedStateDir);
+  const debugDir = path.join(canonicalStateDir, "debug");
+  if (create) fs.mkdirSync(debugDir, { recursive: true, mode: 0o700 });
+  const debugStat = fs.lstatSync(debugDir);
+  if (!debugStat.isDirectory() || debugStat.isSymbolicLink()) {
+    throw new Error("Claude debug directory must be a real directory, not a symlink.");
+  }
+  const canonicalDebugDir =
+    fs.realpathSync.native?.(debugDir) ?? fs.realpathSync(debugDir);
+  if (normalizeAbsoluteForPathCompare(canonicalDebugDir) !==
+      normalizeAbsoluteForPathCompare(debugDir)) {
+    throw new Error("Claude debug directory canonical path changed during validation.");
+  }
+  return canonicalDebugDir;
+}
+
+export function prepareClaudeDebugCapture({
+  sessionName,
+  startedAtMs,
+  stateDir = railConnectorStateDir(),
+}) {
+  assertSafeManagedSessionName(sessionName);
+  if (!Number.isInteger(startedAtMs) || startedAtMs <= 0) {
+    throw new Error("Debug capture requires a valid launch timestamp.");
+  }
+  const debugDir = ensurePrivateDebugDirectory(stateDir);
+  const captureId = randomUUID();
+  const file = path.join(
+    debugDir,
+    `${sessionName}-${startedAtMs}-${captureId}.log`
+  );
+  const receiptFile = `${file}.receipt.json`;
+  let handle;
+  try {
+    handle = fs.openSync(file, "wx", 0o600);
+  } finally {
+    if (handle !== undefined) fs.closeSync(handle);
+  }
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error("Claude debug capture target must be a regular file.");
+    }
+    return {
+      file,
+      receiptFile,
+      identity: debugFileIdentity(stat),
+      captureId,
+      sessionName,
+      startedAtMs,
+    };
+  } catch (error) {
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      // Preserve the setup failure.
+    }
+    throw error;
+  }
+}
+
+function claudeDebugArgsSha256(args) {
+  return `sha256:${createHash("sha256")
+    .update(JSON.stringify(args))
+    .digest("hex")}`;
+}
+
+export function bindPreparedClaudeDebugCapture(capture, args) {
+  if (!capture || !Array.isArray(args)) {
+    throw new Error("Debug capture binding requires a prepared capture and launch argv.");
+  }
+  const receipt = {
+    schemaVersion: CLAUDE_DEBUG_RECEIPT_SCHEMA_VERSION,
+    captureId: capture.captureId,
+    fileName: path.basename(capture.file),
+    identity: capture.identity,
+    sessionName: capture.sessionName,
+    launchRequestedAt: new Date(capture.startedAtMs).toISOString(),
+    debugFilter: argValue(args, "--debug") || null,
+    argsSha256: claudeDebugArgsSha256(args),
+    platform: process.platform,
+  };
+  try {
+    fs.writeFileSync(capture.receiptFile, `${JSON.stringify(receipt)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+  } catch (error) {
+    discardPreparedClaudeDebugCapture(capture);
+    throw error;
+  }
+  return { ...capture, receipt };
+}
+
+export function discardPreparedClaudeDebugCapture(
+  capture,
+  { unlinkSync = fs.unlinkSync } = {}
+) {
+  if (!capture) return { removed: false, warnings: [] };
+  const warnings = [];
+  let logRemoved = false;
+  try {
+    unlinkSync(capture.file);
+    logRemoved = true;
+  } catch (error) {
+    if (error.code === "ENOENT") logRemoved = true;
+    else warnings.push({ target: "log", code: error.code || "EDELETE" });
+  }
+  if (logRemoved) {
+    try {
+      unlinkSync(capture.receiptFile);
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        warnings.push({ target: "receipt", code: error.code || "EDELETE" });
+      }
+    }
+  }
+  return {
+    removed: logRemoved && warnings.length === 0,
+    warnings,
+  };
+}
+
+const DEFINITIVE_PRECOMMIT_BROKER_START_ERROR_CODES = new Set([
+  "EAUTH",
+  "EBROKERUPGRADE",
+  "ECWDPROVENANCE",
+  "ECWDUNAVAILABLE",
+  "ELAUNCHCOMMAND",
+  "ELAUNCHENV",
+  "ELEASE",
+  "ESHUTDOWN",
+  "ESTALE",
+]);
+
+export function brokerStartFailureDefinitelyPrecommit(error) {
+  return DEFINITIVE_PRECOMMIT_BROKER_START_ERROR_CODES.has(error?.code);
+}
+
+export function claudeDebugCaptureStatus(
+  args = [],
+  stateDir = railConnectorStateDir(),
+  { expectedSessionName = null } = {}
+) {
+  const fileValue = argValue(args, "--debug-file");
+  if (!fileValue) return null;
+  const file = path.resolve(fileValue);
+  const pathSha256 = `sha256:${createHash("sha256")
+    .update(file)
+    .digest("hex")}`;
+  let debugDir;
+  try {
+    debugDir = ensurePrivateDebugDirectory(stateDir, { create: false });
+  } catch {
+    return {
+      enabled: true,
+      status: "state_directory_unavailable",
+      file: null,
+      pathSha256,
+      contentsReturned: false,
+    };
+  }
+  if (
+    normalizeAbsoluteForPathCompare(path.dirname(file)) !==
+    normalizeAbsoluteForPathCompare(debugDir)
+  ) {
+    return {
+      enabled: true,
+      status: "untrusted_path",
+      file: null,
+      pathSha256,
+      contentsReturned: false,
+    };
+  }
+  let receipt;
+  try {
+    const receiptFile = `${file}.receipt.json`;
+    const receiptStat = fs.lstatSync(receiptFile);
+    receipt =
+      receiptStat.isFile() &&
+      !receiptStat.isSymbolicLink() &&
+      receiptStat.size <= 16 * 1024
+        ? JSON.parse(fs.readFileSync(receiptFile, "utf8"))
+        : null;
+  } catch {
+    receipt = null;
+  }
+  let stat;
+  try {
+    stat = fs.lstatSync(file);
+  } catch {
+    stat = null;
+  }
+  const regularFile = Boolean(
+    stat && stat.isFile() && !stat.isSymbolicLink()
+  );
+  const validReceipt = Boolean(
+    receipt &&
+      receipt.schemaVersion === CLAUDE_DEBUG_RECEIPT_SCHEMA_VERSION &&
+      typeof receipt.captureId === "string" &&
+      receipt.fileName === path.basename(file) &&
+      typeof receipt.identity === "string" &&
+      typeof receipt.sessionName === "string" &&
+      typeof receipt.argsSha256 === "string"
+  );
+  const identityMatch = Boolean(
+    regularFile &&
+      validReceipt &&
+      debugFileIdentity(stat) === receipt.identity
+  );
+  const filter = argValue(args, "--debug");
+  const launchBindingMatch = Boolean(
+    validReceipt &&
+      receipt.argsSha256 === claudeDebugArgsSha256(args) &&
+      receipt.debugFilter === (filter || null) &&
+      (!expectedSessionName || receipt.sessionName === expectedSessionName)
+  );
+  const readyStatus = process.platform === "win32"
+    ? "ready_acl_unverified"
+    : "ready";
+  return {
+    enabled: true,
+    status: !regularFile
+      ? "missing_or_non_regular"
+      : !validReceipt
+        ? "receipt_missing_or_invalid"
+        : identityMatch
+          ? launchBindingMatch
+            ? readyStatus
+            : "launch_binding_mismatch"
+          : "identity_mismatch",
+    filter: filter || null,
+    file,
+    pathSha256,
+    present: regularFile,
+    sizeBytes: regularFile ? stat.size : null,
+    identityMatch,
+    launchBindingMatch,
+    receiptSchemaVersion: validReceipt ? receipt.schemaVersion : null,
+    pathScope: "mcp_private_state_directory",
+    contentsReturned: false,
+    containsSensitiveData: true,
+    windowsAclVerified: process.platform === "win32" ? false : null,
+    retentionPolicy: "manual_operator_cleanup",
+    note: process.platform === "win32"
+      ? "File identity and launch binding are verified, but Node file mode bits are not a Windows ACL guarantee. Restrict the MCP state directory to the current account and remove the log after the bounded diagnostic."
+      : "The MCP requested owner-only creation modes. Remove the retained log after the bounded diagnostic.",
+  };
+}
+
 export function claudeArgs({
   sessionId,
   newSessionId,
@@ -1435,6 +2225,9 @@ export function claudeArgs({
   safeMode,
   bare,
   axScreenReader,
+  debug,
+  debugFilter,
+  debugFile,
 }) {
   if (sessionId && continueLatest) throw new Error("sessionId and continueLatest are mutually exclusive.");
   if (newSessionId && (sessionId || continueLatest)) {
@@ -1467,9 +2260,16 @@ export function claudeArgs({
   if (ultracode && !["settings", "effort"].includes(ultracodeMechanism)) {
     throw new Error(`Unsupported Ultracode launch mechanism: ${ultracodeMechanism}`);
   }
+  if (debugFilter && !debug) {
+    throw new Error("debugFilter requires debug=true.");
+  }
+  if (debug && !debugFile) {
+    throw new Error("debug=true requires an MCP-generated debug file.");
+  }
   assertSafeClaudeCliValue("remoteName", remoteName);
   if (sessionTitle) assertSafeClaudeCliValue("sessionTitle", sessionTitle);
   if (model) assertSafeClaudeCliValue("model", model);
+  if (debugFile) assertSafeClaudeCliValue("debugFile", debugFile);
 
   const args = [];
   if (continueLatest) args.push("--continue");
@@ -1486,6 +2286,8 @@ export function claudeArgs({
   if (safeMode) args.push("--safe-mode");
   if (bare) args.push("--bare");
   if (axScreenReader) args.push("--ax-screen-reader");
+  if (debugFilter) args.push(`--debug=${assertSafeClaudeDebugFilter(debugFilter)}`);
+  if (debug) args.push(`--debug-file=${debugFile}`);
   pushOptionalArg(args, "--name", sessionTitle);
   args.push(`--remote-control=${remoteName}`, `--permission-mode=${permissionMode}`);
   return args;
@@ -1525,7 +2327,10 @@ export function resolvedLaunchPosture(options) {
   };
 }
 
-export function bypassPolicyStatus(env = process.env) {
+export function bypassPolicyStatus(
+  env = process.env,
+  platform = process.platform
+) {
   const value = env[BYPASS_POLICY_ENV];
   const mode =
     value === BYPASS_ISOLATED_POLICY_VALUE
@@ -1547,6 +2352,19 @@ export function bypassPolicyStatus(env = process.env) {
     requiresPolicyAcknowledgement: true,
     readAtProcessStart: true,
     relaunchRequiredAfterChange: true,
+    securityBoundary: {
+      platform,
+      isolationClaim: mode === "isolated" ? "operator_asserted" : "none",
+      osIsolationVerified: false,
+      filesystemBoundary: "none_verified_by_mcp",
+      allowedRootsScope: "mcp_session_management_only",
+      warning:
+        mode === "isolated"
+          ? "The isolated policy value is an operator assertion; this MCP does not verify an OS isolation boundary."
+          : mode === "local_host_acknowledged"
+            ? "bypassPermissions can modify host resources available to Claude without approval prompts."
+            : null,
+    },
   };
 }
 
@@ -1641,8 +2459,101 @@ export function requestedLaunchPostureFromArgs(args = []) {
     ultracode,
     ultracodeMechanism,
     bypassPermissionsAcknowledged: null,
-    bypassPermissionsPolicyMode:
-      permissionMode === "bypassPermissions" ? bypassPolicyStatus().mode : null,
+    // CLI args cannot prove which process-start policy authorized an old launch.
+    bypassPermissionsPolicyMode: null,
+  };
+}
+
+export function launchAuditReceipt({
+  requested = null,
+  resolved = requested,
+  args = null,
+  platform = process.platform,
+  launchEnvironment = null,
+  expectedSessionName = null,
+} = {}) {
+  const launchArgs = Array.isArray(args) ? args : null;
+  const permissionMode =
+    resolved?.permissionMode ?? requested?.permissionMode ?? null;
+  const bypassPermissionsRequested = permissionMode === "bypassPermissions";
+  const bypassPolicyMode = bypassPermissionsRequested
+    ? resolved?.bypassPermissionsPolicyMode ??
+      requested?.bypassPermissionsPolicyMode ??
+      null
+    : null;
+  const isolatedPolicyAsserted = bypassPolicyMode === "isolated";
+  const launchEnvironmentRecorded =
+    launchEnvironment?.evidenceScope === "claude_child_launch_environment";
+  let warning = null;
+  if (bypassPermissionsRequested) {
+    warning = isolatedPolicyAsserted
+      ? "The isolated bypass policy is an operator assertion. This MCP did not verify a VM, container, Windows Sandbox, restricted token, or filesystem isolation boundary; bypass can modify every host resource available to the Claude process."
+      : "bypassPermissions can modify host resources available to the Claude process without approval prompts. Allowed roots limit MCP session management, not Claude filesystem access.";
+  }
+  return {
+    evidenceScope: launchArgs
+      ? "persisted_launch_metadata"
+      : "posture_without_persisted_launch_argv",
+    postureSemantics: {
+      requested: "operator_request",
+      resolved: "validated_claude_cli_launch_arguments",
+      effective:
+        "Only posture.observed fields with their named evidence source describe observed runtime state. Model alias resolution, fallback, and delegated-agent posture otherwise remain unknown.",
+    },
+    securityBoundary: {
+      platform,
+      bypassPermissionsRequested,
+      bypassPermissionsPolicyMode: bypassPolicyMode,
+      isolationClaim: isolatedPolicyAsserted
+        ? "operator_asserted"
+        : "none",
+      osIsolationVerified: false,
+      filesystemBoundary: "none_verified_by_mcp",
+      allowedRootsScope: "mcp_session_management_only",
+      childEnvironment: launchEnvironmentRecorded
+        ? platform === "win32"
+          ? "inherits_mcp_process_environment_with_launch_overrides"
+          : "tmux_session_environment_with_explicit_claude_overrides"
+        : platform === "win32"
+          ? "unknown_legacy_windows_child_environment"
+          : "unknown_legacy_tmux_child_environment",
+      childEnvironmentEvidence: launchEnvironmentRecorded
+        ? "persisted_claude_child_launch_environment"
+        : "unavailable",
+      warning,
+    },
+    toolPolicy: {
+      requested: {
+        tools: launchArgs ? argValue(launchArgs, "--tools") : null,
+        allowedTools: launchArgs
+          ? argValue(launchArgs, "--allowedTools")
+          : null,
+        disallowedTools: launchArgs
+          ? argValue(launchArgs, "--disallowedTools")
+          : null,
+      },
+      argvDelivered: launchArgs !== null,
+      evidence: launchArgs ? "persisted_launch_argv" : "unavailable",
+      effectiveMainSessionPolicy: "unverified",
+      delegatedAgentCoverage: "unknown",
+    },
+    debugCapture: launchArgs
+      ? claudeDebugCaptureStatus(launchArgs, undefined, {
+          expectedSessionName,
+        })
+      : null,
+    subagentTelemetry: {
+      status: "unavailable",
+      evidence: "not_exposed_by_current_claude_session_log_contract",
+      model: null,
+      fallback: null,
+      permissionMode: null,
+      toolPolicy: null,
+      inputTokens: null,
+      outputTokens: null,
+      costUsd: null,
+      creditUsage: null,
+    },
   };
 }
 
@@ -1650,7 +2561,24 @@ export function compareLaunchMetadata(existing, requested) {
   if (!existing?.args || !requested?.args || !existing.cwd || !requested.cwd) {
     return { comparison: "unknown", launchMismatch: null };
   }
-  const argsMismatch = JSON.stringify(existing.args) !== JSON.stringify(requested.args);
+  const comparableArgs = (args) => {
+    const normalized = [];
+    for (let index = 0; index < args.length; index += 1) {
+      const arg = args[index];
+      if (arg === "--debug-file") {
+        normalized.push("--debug-file=<mcp-generated>");
+        index += 1;
+      } else if (arg.startsWith("--debug-file=")) {
+        normalized.push("--debug-file=<mcp-generated>");
+      } else {
+        normalized.push(arg);
+      }
+    }
+    return normalized;
+  };
+  const argsMismatch =
+    JSON.stringify(comparableArgs(existing.args)) !==
+    JSON.stringify(comparableArgs(requested.args));
   const normalizeCwd = (value) => {
     try {
       return normalizeForPathCompare(value);
@@ -2252,10 +3180,16 @@ async function backendLaunchMetadata(sessionName) {
   return managedTmuxMetadata(sessionName);
 }
 
-export function publicLaunchMetadata(metadata) {
+export function publicLaunchMetadata(
+  metadata,
+  { expectedSessionName = metadata?.name ?? null } = {}
+) {
   if (!metadata || typeof metadata !== "object") return metadata;
   const { observedPosture: _legacyObservedPosture, ...publicMetadata } = metadata;
-  return publicMetadata;
+  const debugLog = claudeDebugCaptureStatus(publicMetadata.args, undefined, {
+    expectedSessionName,
+  });
+  return debugLog ? { ...publicMetadata, debugLog } : publicMetadata;
 }
 
 async function backendUpdateMetadata(
@@ -2397,7 +3331,11 @@ async function managedPostureReport(
     currentMetadata?.resolvedPosture ?? currentMetadata?.requestedPosture ?? null,
     signals,
     currentTranscriptObserved,
-    { launchEnvironment: currentMetadata?.launchEnvironment ?? null }
+    {
+      launchEnvironment: currentMetadata?.launchEnvironment ?? null,
+      launchMetadata: currentMetadata,
+      expectedSessionName: sessionName,
+    }
   );
 }
 
@@ -2468,14 +3406,29 @@ const WORKSPACE_TRUST_YES_RE = /(?:yes,?\s+i trust|yes,?\s+proceed)/i;
 const WORKSPACE_TRUST_NO_RE = /(?:no,?\s+exit|no,?\s+cancel)/i;
 const EFFORT_INDICATOR_RE =
   /(?:^|\n)(?![ \t\u2502\u2503\u2551]*>)[ \t\u2502\u2503\u2551]*(?:Current effort level|Effort level):\s*(ultracode|low|medium|high|xhigh|max)\b/gi;
+const EFFORT_BANNER_RE =
+  /(?:^|\n)(?![ \t\u2502\u2503\u2551]*(?:>|[-*]|you:|claude:|assistant:|tool:))[ \t\u2502\u2503\u2551]*[A-Z][A-Za-z0-9 ._:-]{0,80}\s+with\s+(low|medium|high|xhigh|max)\s+effort\s*·\s*Claude\b[^\r\n]*/gi;
 const EFFORT_SET_RE =
   /(?:^|\n)[ \t\u2502\u2503\u2551]*⎿\s*Set effort level to\s+(ultracode|low|medium|high|xhigh|max)\b/gi;
 const ULTRACODE_STATUS_RE =
-  /(?:^|\n)[ \t\u2502\u2503\u2551]*[✦✧]\s*ultracode\s*·\s*xhigh effort\s*\+\s*dynamic workflows/gi;
+  /(?:^|\n)(?![ \t\u2502\u2503\u2551]*>)[ \t\u2502\u2503\u2551]*(?:[✦✧]\s*ultracode|effort:\s*ultracode)\s*·\s*xhigh effort\s*\+\s*dynamic workflows/gi;
 const ULTRACODE_UNAVAILABLE_RE =
   /(?:^|\n)(?![ \t\u2502\u2503\u2551]*>)[ \t\u2502\u2503\u2551]*(?:Error:\s*)?(?:Ultracode needs dynamic workflows enabled|Ultracode runs at xhigh effort, which is restricted)/i;
 const PERMISSION_INDICATOR_RE =
-  /(?:^|\n)[ \t\u2502\u2503\u2551]*(?:(manual|default|plan|acceptEdits|auto|dontAsk|bypassPermissions)\s+mode\s+on|Permission mode:\s*(manual|default|plan|acceptEdits|auto|dontAsk|bypassPermissions))\b/gi;
+  /(?:^|\n)(?![ \t\u2502\u2503\u2551]*>)[ \t\u2502\u2503\u2551]*(?:(manual|default|plan|acceptEdits|auto|dontAsk|bypassPermissions)\s+mode\s+on|Permission mode:\s*(manual|default|plan|acceptEdits|auto|dontAsk|bypassPermissions)|(bypass permissions|accept edits|plan mode|manual|default|auto|don'?t ask)\s+on)\b(?=[ \t]*(?:$|\r?\n|\(|·))/gi;
+
+function normalizedTerminalPermissionMode(value) {
+  const normalized = String(value).trim().toLowerCase();
+  if (normalized === "bypass permissions") return "bypassPermissions";
+  if (normalized === "accept edits") return "acceptEdits";
+  if (normalized === "plan mode") return "plan";
+  if (normalized === "don't ask" || normalized === "dont ask") return "dontAsk";
+  return (
+    CLAUDE_PERMISSION_MODES.find(
+      (mode) => mode.toLowerCase() === normalized
+    ) ?? ""
+  );
+}
 
 function activeInputLineText(line) {
   let index = 0;
@@ -2641,11 +3594,44 @@ function workspaceTrustPromptFromCapture(capture) {
   );
 }
 
+export function workspaceTrustMenuState(capture) {
+  const lines = activeTuiControlRegion(capture, 40).split(/\r?\n/);
+  let yesIndex = -1;
+  let noIndex = -1;
+  let selected = "unknown";
+  for (const [index, line] of lines.entries()) {
+    const option = WORKSPACE_TRUST_YES_RE.test(line)
+      ? "yes"
+      : WORKSPACE_TRUST_NO_RE.test(line)
+        ? "no"
+        : "";
+    if (!option) continue;
+    if (option === "yes") yesIndex = index;
+    else noIndex = index;
+    if (/^[\s\u2502\u2503\u2551]*[>❯]\s*/u.test(line)) {
+      selected = option;
+    }
+  }
+  const detected = yesIndex >= 0 && noIndex >= 0;
+  return {
+    detected,
+    selected: detected ? selected : "unknown",
+    navigationKey:
+      detected && selected === "no"
+        ? yesIndex > noIndex
+          ? "Down"
+          : "Up"
+        : null,
+  };
+}
+
 function permissionModeFromCapture(capture) {
   const recent = activeTuiControlRegion(capture, 80);
   let mode = "";
   for (const match of recent.matchAll(PERMISSION_INDICATOR_RE)) {
-    mode = (match[1] || match[2] || "").trim();
+    mode = normalizedTerminalPermissionMode(
+      match[1] || match[2] || match[3] || ""
+    );
   }
   return mode;
 }
@@ -2654,6 +3640,11 @@ function effortEventFromCapture(capture) {
   const recentCapture = activeTuiControlRegion(capture, 80);
   let event = null;
   for (const match of recentCapture.matchAll(EFFORT_INDICATOR_RE)) {
+    if (!event || match.index >= event.index) {
+      event = { kind: "active", effort: match[1].toLowerCase(), index: match.index };
+    }
+  }
+  for (const match of recentCapture.matchAll(EFFORT_BANNER_RE)) {
     if (!event || match.index >= event.index) {
       event = { kind: "active", effort: match[1].toLowerCase(), index: match.index };
     }
@@ -2841,6 +3832,13 @@ function assessUltracodePosture(
   const runtimeEffort = priorObserved.effort || null;
   const terminalEffort = signals.effortIndicator || null;
   const workflowActivity = priorObserved.workflowActivity ?? emptyWorkflowActivity();
+  const ultraEffortAttachment = priorObserved.ultraEffortAttachment ?? {
+    observed: false,
+    observedAt: "",
+    active: null,
+    lifecycle: "never_observed",
+    evidence: "",
+  };
   const currentMcpEnvironment = ultracodeEnvironmentStatus();
   const environmentComparison = !launchEnvironment
     ? "launch_not_recorded"
@@ -2848,31 +3846,69 @@ function assessUltracodePosture(
         environmentCategoryFingerprint(currentMcpEnvironment)
       ? "match"
       : "different";
-  const sessionUltracodeObserved =
-    priorObserved.ultracode === true &&
+  const sessionUltracodeEvidence =
     priorObserved.evidence?.ultracode === "claude_session_log";
+  const sessionUltracodeObserved =
+    priorObserved.ultracode === true && sessionUltracodeEvidence;
+  const sessionUltracodeInactive =
+    priorObserved.ultracode === false && sessionUltracodeEvidence;
+  const attachmentLifecycleActive = ultraEffortAttachment.active === true;
+  const attachmentLifecycleInactive = ultraEffortAttachment.active === false;
+  const lifecycleActive = attachmentLifecycleActive || sessionUltracodeObserved;
+  const lifecycleInactive = attachmentLifecycleInactive || sessionUltracodeInactive;
+  const completeInactiveLifecycle = lifecycleInactive;
   const conflictSources = [];
   for (const [source, effort] of [
     ["claude_session_log", runtimeEffort],
     ["terminal_heuristic", terminalEffort],
   ]) {
-    if (requestedUltracode && effort && !["xhigh", "ultracode"].includes(effort)) {
+    if (
+      (requestedUltracode || lifecycleActive) &&
+      !completeInactiveLifecycle &&
+      effort &&
+      !["xhigh", "ultracode"].includes(effort)
+    ) {
       conflictSources.push({ source, effort });
     }
   }
+  const environmentBlocked = Boolean(
+    launchEnvironment?.status === "blocking" &&
+      (requestedUltracode || lifecycleActive)
+  );
+  const terminalRejectionConflict = Boolean(
+    lifecycleActive && signals.ultracodeUnavailable
+  );
+  const attentionStatus = environmentBlocked
+    ? "environment_blocked"
+    : conflictSources.length
+      ? "conflicting_effort_evidence"
+      : terminalRejectionConflict
+        ? "terminal_rejection_conflict"
+        : null;
 
   let status = "not_requested";
   let note = "UltraCode was not requested for this managed launch.";
-  if (requestedUltracode) {
+  if (environmentBlocked) {
+    status = "environment_blocked";
+    note = "The captured Claude child launch environment contains an override that conflicts with the requested or observed UltraCode lifecycle.";
+  } else if (conflictSources.length) {
+    status = "conflicting_effort_evidence";
+    note = "A bound runtime or terminal effort indicator conflicts with the requested or observed UltraCode posture.";
+  } else if (terminalRejectionConflict) {
+    status = "terminal_rejection_conflict";
+    note = "The session log records an active UltraCode lifecycle while current terminal output heuristically resembles an UltraCode rejection. Inspect both evidence sources.";
+  } else if (attachmentLifecycleActive) {
+    status = "attachment_lifecycle_active";
+    note = "Claude's session log contains a current UltraCode enter transition. This authenticates the client-side mode toggle, not server-side workflow execution.";
+  } else if (attachmentLifecycleInactive) {
+    status = ultraEffortAttachment.observed
+      ? "exited_after_entry"
+      : "attachment_lifecycle_inactive";
+    note = "Claude's session log contains a current UltraCode exit transition; the launch request is no longer the active client-side mode.";
+  } else if (requestedUltracode) {
     status = "requested_unconfirmed";
     note = "The UltraCode launch request was resolved, but no independent runtime or workflow evidence is available yet.";
-    if (launchEnvironment?.status === "blocking" && !sessionUltracodeObserved) {
-      status = "environment_blocked";
-      note = "The captured Claude child launch environment contains an override that blocks UltraCode workflow behavior.";
-    } else if (conflictSources.length) {
-      status = "conflicting_effort_evidence";
-      note = "A bound runtime or terminal effort indicator conflicts with the requested UltraCode posture.";
-    } else if (sessionUltracodeObserved) {
+    if (sessionUltracodeObserved) {
       status = "runtime_setting_observed";
       note = "An explicit UltraCode session-log indicator was observed.";
     } else if (signals.ultracodeUnavailable) {
@@ -2901,12 +3937,24 @@ function assessUltracodePosture(
     runtimeEffort,
     terminalEffort,
     workflowActivity,
+    ultraEffortAttachment,
+    lifecycle:
+      ultraEffortAttachment.lifecycle ??
+      (lifecycleActive
+        ? "active"
+        : lifecycleInactive
+          ? "inactive_exited"
+          : "unknown"),
     workflowTriggerAttribution: "unknown",
     environment: launchEnvironment ?? currentMcpEnvironment,
     launchEnvironment,
     currentMcpEnvironment,
     environmentComparison,
-    conflict: conflictSources.length > 0,
+    attentionStatus,
+    conflict:
+      environmentBlocked ||
+      conflictSources.length > 0 ||
+      terminalRejectionConflict,
     conflictSources,
     status,
     note,
@@ -2918,7 +3966,12 @@ export function launchPostureReport(
   resolved = requested,
   signals = {},
   priorObserved = {},
-  { launchEnvironment = null } = {}
+  {
+    launchEnvironment = null,
+    launchMetadata = null,
+    platform = process.platform,
+    expectedSessionName = launchMetadata?.name ?? null,
+  } = {}
 ) {
   const priorPermissionMode = priorObserved.permissionMode || null;
   const priorEffort = priorObserved.effort || null;
@@ -2931,6 +3984,7 @@ export function launchPostureReport(
     permissionMode: priorPermissionMode || signals.permissionModeIndicator || null,
     model: priorObserved.model || null,
     effort: priorEffort || signals.effortIndicator || null,
+    claudeVersion: priorObserved.claudeVersion || null,
     ultracode:
       priorUltracode !== null
         ? priorUltracode
@@ -2951,6 +4005,7 @@ export function launchPostureReport(
         : signals.effortIndicator
           ? "terminal_heuristic"
           : "",
+      claudeVersion: priorObserved.evidence?.claudeVersion ?? "",
       ultracode:
         priorUltracode !== null
           ? priorObserved.evidence?.ultracode || "observed"
@@ -2966,7 +4021,7 @@ export function launchPostureReport(
     verification = "session_log_observed";
     note =
       "Observed fields come from Claude's local session log when available; any remaining terminal-derived fields are identified separately as heuristics.";
-  } else if (signals.ultracodeUnavailable) {
+  } else if (requested?.ultracode && signals.ultracodeUnavailable) {
     verification = "ultracode_rejected_terminal_heuristic";
     note =
       "Terminal output appears to reject Ultracode, but mixed terminal text is heuristic evidence and must not be treated as authenticated runtime state.";
@@ -2987,6 +4042,9 @@ export function launchPostureReport(
       permissionMode: observed.permissionMode ? observed.evidence.permissionMode || "observed" : "requested_only",
       model: observed.model ? observed.evidence.model || "observed" : "requested_only",
       effort: observed.effort ? observed.evidence.effort || "observed" : "requested_only",
+      claudeVersion: observed.claudeVersion
+        ? observed.evidence.claudeVersion || "observed"
+        : "requested_only",
       ultracode: observed.ultracode !== null ? observed.evidence.ultracode || "observed" : "requested_only",
     },
     ultracodeAssessment: assessUltracodePosture(
@@ -2996,6 +4054,14 @@ export function launchPostureReport(
       priorObserved,
       launchEnvironment
     ),
+    audit: launchAuditReceipt({
+      requested,
+      resolved,
+      args: launchMetadata?.args ?? null,
+      platform,
+      launchEnvironment,
+      expectedSessionName,
+    }),
     note,
   };
 }
@@ -3356,66 +4422,688 @@ async function backendSendKey(sessionName, key, expectedMetadata = null) {
   await sleep(500);
 }
 
-export async function recentSessionRecords(
-  metadata,
-  maxBytes = 2 * 1024 * 1024
+function parseSessionJsonlWindow(
+  buffer,
+  absoluteStart,
+  startsAtRecordBoundary,
+  expectedSessionId
 ) {
-  if (!metadata?.cwd || !metadata?.resolvedSessionId) return [];
-  const resolvedSessionId = String(metadata.resolvedSessionId);
-  if (!SESSION_ID_RE.test(resolvedSessionId)) return [];
-  const file = path.join(
-    projectDirFromCwd(metadata.cwd),
-    `${resolvedSessionId}.jsonl`
+  let cursor = 0;
+  let firstRecordPartial = false;
+  let firstNewlineFound = true;
+  let firstNewlineOffset = 0;
+  if (!startsAtRecordBoundary) {
+    const newline = buffer.indexOf(0x0a);
+    firstNewlineFound = newline >= 0;
+    firstNewlineOffset = newline >= 0 ? newline : buffer.length;
+    firstRecordPartial = true;
+    cursor = newline >= 0 ? newline + 1 : buffer.length;
+  }
+
+  const records = [];
+  let malformedRecordCount = 0;
+  let trailingRecordIncomplete = false;
+  const parseLine = (start, end) => {
+    if (end > start && buffer[end - 1] === 0x0d) end -= 1;
+    if (end <= start) return;
+    try {
+      const record = JSON.parse(buffer.toString("utf8", start, end));
+      if (!recordMatchesSession(record, expectedSessionId)) return;
+      Object.defineProperty(record, SESSION_RECORD_SOURCE_OFFSET, {
+        value: absoluteStart + start,
+        enumerable: false,
+      });
+      records.push(record);
+    } catch {
+      malformedRecordCount += 1;
+    }
+  };
+
+  while (cursor < buffer.length) {
+    const newline = buffer.indexOf(0x0a, cursor);
+    if (newline < 0) break;
+    parseLine(cursor, newline);
+    cursor = newline + 1;
+  }
+  if (cursor < buffer.length) {
+    const before = records.length;
+    const malformedBefore = malformedRecordCount;
+    parseLine(cursor, buffer.length);
+    trailingRecordIncomplete =
+      records.length === before && malformedRecordCount > malformedBefore;
+  }
+  return {
+    records,
+    firstRecordPartial,
+    firstNewlineFound,
+    firstNewlineOffset,
+    malformedRecordCount,
+    trailingRecordIncomplete,
+  };
+}
+
+async function readSessionTailWindow(handle, statSize, requestedBytes) {
+  const bytes = Math.min(statSize, requestedBytes);
+  const start = Math.max(0, statSize - bytes);
+  const readStart = Math.max(0, start - 1);
+  const buffer = Buffer.alloc(statSize - readStart);
+  const { bytesRead } = await handle.read(
+    buffer,
+    0,
+    buffer.length,
+    readStart
   );
-  let stat;
+  const value = buffer.subarray(0, bytesRead);
+  const startsAtRecordBoundary =
+    start === 0 || (value.length > 0 && value[0] === 0x0a);
+  const dataOffset = start - readStart;
+  return {
+    buffer: value.subarray(dataOffset),
+    start,
+    bytesRead: Math.max(0, bytesRead - dataOffset),
+    startsAtRecordBoundary,
+  };
+}
+
+function sameOpenedFileIdentity(pathStat, openedStat) {
+  if (
+    Number.isFinite(pathStat.dev) &&
+    Number.isFinite(pathStat.ino) &&
+    Number.isFinite(openedStat.dev) &&
+    Number.isFinite(openedStat.ino) &&
+    pathStat.ino !== 0 &&
+    openedStat.ino !== 0
+  ) {
+    return pathStat.dev === openedStat.dev && pathStat.ino === openedStat.ino;
+  }
+  return pathStat.birthtimeMs === openedStat.birthtimeMs;
+}
+
+function sessionFileState(stat) {
+  return {
+    dev: Number(stat.dev),
+    ino: Number(stat.ino),
+    birthtimeMs: Number(stat.birthtimeMs),
+    ctimeMs: Number(stat.ctimeMs),
+    mtimeMs: Number(stat.mtimeMs),
+    size: Number(stat.size),
+  };
+}
+
+function sameSessionFileState(left, right) {
+  return (
+    sameOpenedFileIdentity(left, right) &&
+    left.birthtimeMs === right.birthtimeMs &&
+    left.ctimeMs === right.ctimeMs &&
+    left.mtimeMs === right.mtimeMs &&
+    left.size === right.size
+  );
+}
+
+async function partialFirstRecordExceedsBound(
+  handle,
+  windowStart,
+  suffixBytes,
+  maxRecordBytes
+) {
+  if (windowStart <= 0) return false;
+  if (suffixBytes >= maxRecordBytes) return true;
+  const allowedPrefixBytes = maxRecordBytes - suffixBytes;
+  const lookBehindBytes = Math.min(
+    windowStart,
+    allowedPrefixBytes + 1
+  );
+  const searchStart = windowStart - lookBehindBytes;
+  const buffer = Buffer.alloc(lookBehindBytes);
+  const { bytesRead } = await handle.read(
+    buffer,
+    0,
+    buffer.length,
+    searchStart
+  );
+  const value = buffer.subarray(0, bytesRead);
+  const priorNewline = value.lastIndexOf(0x0a);
+  if (priorNewline >= 0) {
+    const prefixBytes = value.length - priorNewline - 1;
+    return prefixBytes + suffixBytes > maxRecordBytes;
+  }
+  if (searchStart === 0) {
+    return windowStart + suffixBytes > maxRecordBytes;
+  }
+  return true;
+}
+
+export async function readRecentSessionRecordWindowFromFile(
+  file,
+  expectedSessionId,
+  {
+    initialBytes = DEFAULT_RECENT_SESSION_BYTES,
+    maxBytes = MAX_SESSION_JSONL_RECORD_BYTES,
+    minConversationRecords = 2,
+    stopWhen = null,
+  } = {}
+) {
+  let pathStat;
   try {
-    stat = await fs.promises.lstat(file);
+    pathStat = await fs.promises.lstat(file);
   } catch (error) {
-    if (error.code === "ENOENT") return [];
+    if (error.code === "ENOENT") {
+      return {
+        status: "missing",
+        records: [],
+        bytesRead: 0,
+        bytesSkipped: 0,
+        trailingRecordIncomplete: false,
+        attentionReason: "",
+      };
+    }
     throw error;
   }
-  if (!stat.isFile() || stat.isSymbolicLink()) return [];
-  const bytes = Math.min(stat.size, maxBytes);
-  const handle = await fs.promises.open(file, "r");
+  if (!pathStat.isFile() || pathStat.isSymbolicLink()) {
+    return {
+      status: "unavailable",
+      records: [],
+      bytesRead: 0,
+      bytesSkipped: 0,
+      trailingRecordIncomplete: false,
+      attentionReason: "non_regular_session_log",
+    };
+  }
+
+  const boundedRecordMaximum = Math.max(
+    1,
+    Math.min(
+      Number(maxBytes) || MAX_SESSION_JSONL_RECORD_BYTES,
+      MAX_SESSION_JSONL_RECORD_BYTES
+    )
+  );
+  const boundedReadMaximum = Math.min(
+    MAX_RECENT_SESSION_BYTES,
+    boundedRecordMaximum + 1
+  );
+  let requestedBytes = Math.max(
+    1,
+    Math.min(
+      Number(initialBytes) || DEFAULT_RECENT_SESSION_BYTES,
+      boundedReadMaximum
+    )
+  );
+  let handle;
   try {
-    const buffer = Buffer.alloc(bytes);
-    const { bytesRead } = await handle.read(buffer, 0, bytes, Math.max(0, stat.size - bytes));
-    let value = buffer.subarray(0, bytesRead).toString("utf8");
-    if (bytes < stat.size) {
-      const newline = value.indexOf("\n");
-      value = newline >= 0 ? value.slice(newline + 1) : "";
+    handle = await fs.promises.open(file, "r");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return {
+        status: "missing",
+        records: [],
+        bytesRead: 0,
+        bytesSkipped: 0,
+        trailingRecordIncomplete: false,
+        attentionReason: "",
+      };
     }
-    const records = [];
-    for (const line of value.split(/\r?\n/)) {
-      if (!line) continue;
-      try {
-        const record = JSON.parse(line);
-        if (recordMatchesSession(record, metadata.resolvedSessionId)) records.push(record);
-      } catch {
-        // Ignore an incomplete trailing line while Claude is appending.
+    throw error;
+  }
+  try {
+    const openedStat = await handle.stat();
+    if (
+      !openedStat.isFile() ||
+      !sameOpenedFileIdentity(pathStat, openedStat)
+    ) {
+      return {
+        status: "unavailable",
+        records: [],
+        bytesRead: 0,
+        bytesSkipped: 0,
+        trailingRecordIncomplete: false,
+        attentionReason: "session_log_changed_during_open",
+      };
+    }
+    for (;;) {
+      const currentStat = await handle.stat();
+      const window = await readSessionTailWindow(
+        handle,
+        currentStat.size,
+        requestedBytes
+      );
+      const parsed = parseSessionJsonlWindow(
+        window.buffer,
+        window.start,
+        window.startsAtRecordBoundary,
+        expectedSessionId
+      );
+      const conversationRecordCount = parsed.records.reduce(
+        (count, record) =>
+          count + (conversationMessageFromRecord(record) ? 1 : 0),
+        0
+      );
+      const fullFileRead = window.start === 0;
+      const maximumReached =
+        fullFileRead || requestedBytes >= boundedReadMaximum;
+      const requestedResultFound =
+        typeof stopWhen === "function"
+          ? Boolean(stopWhen(parsed.records))
+          : conversationRecordCount >= minConversationRecords;
+      if (
+        maximumReached ||
+        requestedResultFound
+      ) {
+        const recordTooLarge = Boolean(
+          maximumReached &&
+            !requestedResultFound &&
+            !fullFileRead &&
+            parsed.firstRecordPartial &&
+            (await partialFirstRecordExceedsBound(
+              handle,
+              window.start,
+              parsed.firstNewlineOffset,
+              boundedRecordMaximum
+            ))
+        );
+        const result = {
+          status: recordTooLarge
+            ? "record_too_large"
+            : fullFileRead
+              ? "full"
+              : "tail",
+          records: parsed.records,
+          bytesRead: window.bytesRead,
+          bytesSkipped: window.start,
+          trailingRecordIncomplete: parsed.trailingRecordIncomplete,
+          malformedRecordCount: parsed.malformedRecordCount,
+          attentionReason: recordTooLarge
+            ? "session_record_exceeds_bounded_reader"
+            : "",
+          maxRecordBytes: boundedRecordMaximum,
+        };
+        Object.defineProperty(result, SESSION_WINDOW_FILE_STATE, {
+          value: sessionFileState(currentStat),
+        });
+        return result;
       }
+      requestedBytes = Math.min(
+        boundedReadMaximum,
+        currentStat.size,
+        Math.max(requestedBytes + 1, requestedBytes * 2)
+      );
     }
-    return records;
   } finally {
     await handle.close();
   }
 }
 
+export async function recentSessionRecordWindow(metadata, options = {}) {
+  if (!metadata?.cwd || !metadata?.resolvedSessionId) {
+    return {
+      status: "unavailable",
+      records: [],
+      bytesRead: 0,
+      bytesSkipped: 0,
+      trailingRecordIncomplete: false,
+      attentionReason: "session_identity_unavailable",
+    };
+  }
+  const resolvedSessionId = String(metadata.resolvedSessionId);
+  if (!SESSION_ID_RE.test(resolvedSessionId)) {
+    return {
+      status: "unavailable",
+      records: [],
+      bytesRead: 0,
+      bytesSkipped: 0,
+      trailingRecordIncomplete: false,
+      attentionReason: "invalid_session_identity",
+    };
+  }
+  const file = path.join(
+    projectDirFromCwd(metadata.cwd),
+    `${resolvedSessionId}.jsonl`
+  );
+  return readRecentSessionRecordWindowFromFile(
+    file,
+    resolvedSessionId,
+    options
+  );
+}
+
+export async function recentSessionRecords(metadata, maxBytes = undefined) {
+  const options =
+    maxBytes === undefined
+      ? {}
+      : { initialBytes: maxBytes, maxBytes };
+  return (await recentSessionRecordWindow(metadata, options)).records;
+}
+
+function claudeResultCacheKey(file, sessionId, resultId) {
+  return `${path.resolve(file)}\0${sessionId}\0${resultId}`;
+}
+
+function pruneClaudeResultCache(now = Date.now()) {
+  for (const [key, entry] of claudeResultCache) {
+    if (entry.expiresAt <= now) claudeResultCache.delete(key);
+  }
+  let totalCodeUnits = 0;
+  for (const entry of claudeResultCache.values()) {
+    totalCodeUnits += entry.body.length;
+  }
+  while (
+    claudeResultCache.size > MAX_CLAUDE_RESULT_CACHE_ENTRIES ||
+    totalCodeUnits > MAX_CLAUDE_RESULT_CACHE_CODE_UNITS
+  ) {
+    const oldestKey = claudeResultCache.keys().next().value;
+    const oldest = claudeResultCache.get(oldestKey);
+    claudeResultCache.delete(oldestKey);
+    totalCodeUnits -= oldest?.body.length ?? 0;
+  }
+}
+
+async function cachedClaudeResult(file, sessionId, resultId) {
+  const key = claudeResultCacheKey(file, sessionId, resultId);
+  const entry = claudeResultCache.get(key);
+  if (!entry) return null;
+  const now = Date.now();
+  if (entry.expiresAt <= now) {
+    claudeResultCache.delete(key);
+    return null;
+  }
+  let stat;
+  try {
+    stat = await fs.promises.lstat(file);
+  } catch {
+    claudeResultCache.delete(key);
+    return null;
+  }
+  if (
+    !stat.isFile() ||
+    stat.isSymbolicLink() ||
+    !sameSessionFileState(entry.fileState, sessionFileState(stat))
+  ) {
+    claudeResultCache.delete(key);
+    return null;
+  }
+  entry.expiresAt = now + CLAUDE_RESULT_CACHE_TTL_MS;
+  claudeResultCache.delete(key);
+  claudeResultCache.set(key, entry);
+  return entry;
+}
+
+async function retainClaudeResult(file, sessionId, resultId, entry) {
+  if (
+    !entry.fileState ||
+    entry.body.length > MAX_CLAUDE_RESULT_CACHE_CODE_UNITS
+  ) {
+    return false;
+  }
+  let stat;
+  try {
+    stat = await fs.promises.lstat(file);
+  } catch {
+    return false;
+  }
+  if (
+    !stat.isFile() ||
+    stat.isSymbolicLink() ||
+    !sameSessionFileState(entry.fileState, sessionFileState(stat))
+  ) {
+    return false;
+  }
+  const key = claudeResultCacheKey(file, sessionId, resultId);
+  entry.expiresAt = Date.now() + CLAUDE_RESULT_CACHE_TTL_MS;
+  claudeResultCache.delete(key);
+  claudeResultCache.set(key, entry);
+  pruneClaudeResultCache();
+  return claudeResultCache.get(key) === entry;
+}
+
+function claudeResultChunkResponse(
+  entry,
+  sessionId,
+  resultId,
+  offsetCharacters,
+  maxCharacters,
+  cacheHit
+) {
+  if (offsetCharacters > entry.metadata.textCharacters) {
+    const error = new Error(
+      `Result range offset must be no greater than ${entry.metadata.textCharacters}.`
+    );
+    error.code = "EINVAL";
+    throw error;
+  }
+  const chunk = sliceByCodePoints(
+    entry.body,
+    offsetCharacters,
+    maxCharacters,
+    entry.cursor
+  );
+  const nextOffsetCharacters = offsetCharacters + chunk.returnedCharacters;
+  entry.cursor = {
+    offsetCharacters: nextOffsetCharacters,
+    codeUnitIndex: chunk.nextCodeUnitIndex,
+  };
+  return {
+    status: "ok",
+    sessionId,
+    resultId,
+    resultIdentityScope: entry.resultIdentityScope,
+    recordResultId: entry.recordResultId,
+    matchingRecordCount: entry.matchingRecordCount,
+    matchingRecordCoverage: entry.matchingRecordCoverage,
+    usageRecordAmbiguous: entry.usageRecordAmbiguous,
+    textSha256: entry.metadata.textSha256,
+    textLength: entry.metadata.textLength,
+    textCharacters: entry.metadata.textCharacters,
+    textUtf8Bytes: entry.metadata.textUtf8Bytes,
+    usage: entry.usageRecordAmbiguous ? null : entry.metadata.usage,
+    offsetCharacters,
+    maxCharacters,
+    returnedCharacters: chunk.returnedCharacters,
+    nextOffsetCharacters,
+    hasMore: nextOffsetCharacters < entry.metadata.textCharacters,
+    text: chunk.text,
+    chunkSha256: textSha256(chunk.text),
+    resultCache: {
+      hit: cacheHit,
+      retained: cacheHit || entry.cacheRetained,
+      scope: "mcp_process_memory",
+      validation: cacheHit
+        ? "unchanged_regular_session_log_identity_size_and_timestamps"
+        : entry.cacheRetained
+          ? "session_log_state_captured"
+          : "not_retained",
+    },
+    transcriptRead: {
+      status: entry.transcriptRead.status,
+      bytesRead: cacheHit ? 0 : entry.transcriptRead.bytesRead,
+      bytesSkipped: entry.transcriptRead.bytesSkipped,
+      cacheHit,
+    },
+  };
+}
+
+export async function readClaudeResultChunkFromFile(
+  file,
+  sessionId,
+  resultId,
+  offsetCharacters = 0,
+  maxCharacters = DEFAULT_RESULT_CHUNK_CHARACTERS
+) {
+  const normalizedResultId = String(resultId);
+  if (!RESULT_ID_RE.test(normalizedResultId)) {
+    const error = new Error(
+      "resultId must be a record-scoped result identity or legacy sha256 content identity."
+    );
+    error.code = "EINVAL";
+    throw error;
+  }
+  const boundedOffset = Number(offsetCharacters);
+  const boundedMaximum = Number(maxCharacters);
+  if (
+    !Number.isSafeInteger(boundedOffset) ||
+    boundedOffset < 0 ||
+    !Number.isSafeInteger(boundedMaximum) ||
+    boundedMaximum < 1 ||
+    boundedMaximum > MAX_RESULT_CHUNK_CHARACTERS
+  ) {
+    const error = new Error(
+      `Result range must use a non-negative integer offset and maxCharacters from 1 through ${MAX_RESULT_CHUNK_CHARACTERS}.`
+    );
+    error.code = "EINVAL";
+    throw error;
+  }
+  const target = assistantResultTarget(normalizedResultId);
+  const recordScopedIdentity = target.scope === "assistant_record";
+  if (recordScopedIdentity) {
+    const cached = await cachedClaudeResult(
+      file,
+      sessionId,
+      normalizedResultId
+    );
+    if (cached) {
+      return claudeResultChunkResponse(
+        cached,
+        sessionId,
+        normalizedResultId,
+        boundedOffset,
+        boundedMaximum,
+        true
+      );
+    }
+  }
+  let scopedMatch = null;
+  const window = await readRecentSessionRecordWindowFromFile(file, sessionId, {
+    initialBytes: DEFAULT_RECENT_SESSION_BYTES,
+    maxBytes: MAX_SESSION_JSONL_RECORD_BYTES,
+    stopWhen: recordScopedIdentity
+      ? (records) => {
+          scopedMatch = firstAssistantResultMatch(records, target);
+          return scopedMatch !== null;
+        }
+      : () => false,
+  });
+  const matches = recordScopedIdentity
+    ? scopedMatch
+      ? [scopedMatch]
+      : []
+    : assistantResultMatches(window.records, target);
+  if (window.status === "record_too_large" && matches.length === 0) {
+    const error = new Error(
+      "The requested Claude result exceeds the bounded JSONL record reader."
+    );
+    error.code = "ESESSIONRECORDTOOLARGE";
+    throw error;
+  }
+
+  const match = matches.at(-1) ?? null;
+  if (!match) {
+    const error = new Error(
+      window.bytesSkipped > 0
+        ? "No matching Claude result was found in the bounded recent transcript window. Refresh the session and use a resultId returned by get_claude_session or wait_for_claude_turn."
+        : "No matching Claude result was found in this session."
+    );
+    error.code = window.bytesSkipped > 0 ? "ERESULTWINDOW" : "ENOENT";
+    throw error;
+  }
+
+  if (boundedOffset > match.metadata.textCharacters) {
+    const error = new Error(
+      `Result range offset must be no greater than ${match.metadata.textCharacters}.`
+    );
+    error.code = "EINVAL";
+    throw error;
+  }
+  const fullMatchCoverage = window.bytesSkipped === 0;
+  const usageRecordAmbiguous =
+    matches.length !== 1 || (!recordScopedIdentity && !fullMatchCoverage);
+  const entry = {
+    body: match.body,
+    metadata: match.metadata,
+    resultIdentityScope: recordScopedIdentity
+      ? "assistant_record"
+      : "legacy_assistant_text_content",
+    recordResultId: usageRecordAmbiguous ? null : match.metadata.resultId,
+    matchingRecordCount: matches.length,
+    matchingRecordCoverage: fullMatchCoverage
+      ? "full_session_log"
+      : "bounded_recent_window",
+    usageRecordAmbiguous,
+    cursor: null,
+    fileState: window[SESSION_WINDOW_FILE_STATE] ?? null,
+    cacheRetained: false,
+    transcriptRead: {
+      status: window.status,
+      bytesRead: window.bytesRead,
+      bytesSkipped: window.bytesSkipped,
+    },
+  };
+  if (recordScopedIdentity) {
+    entry.cacheRetained = await retainClaudeResult(
+      file,
+      sessionId,
+      normalizedResultId,
+      entry
+    );
+  }
+  return claudeResultChunkResponse(
+    entry,
+    sessionId,
+    normalizedResultId,
+    boundedOffset,
+    boundedMaximum,
+    false
+  );
+}
+
 export function runtimeObservationFromRecords(records, metadata = {}) {
   const state = createSessionSummaryState();
   for (const record of records) addRuntimeObservationRecord(state, record, metadata);
-  return runtimeObservationFromState(state);
+  return runtimeObservationFromState(state, {
+    scope: Number.isFinite(Number(metadata?.startedAtMs))
+      ? "current_launch"
+      : "full_session_log",
+  });
 }
 
 function addRuntimeObservationRecord(state, record, metadata = {}) {
   const launchStartedAtMs = Number(metadata?.startedAtMs);
   if (Number.isFinite(launchStartedAtMs)) {
     const recordTimestampMs = Date.parse(record.timestamp ?? "");
-    if (
-      !Number.isFinite(recordTimestampMs) ||
-      recordTimestampMs < launchStartedAtMs - 5000
-    ) {
+    if (!Number.isFinite(recordTimestampMs)) {
+      if (recordMatchesSession(record, metadata?.resolvedSessionId ?? "")) {
+        if (state.runtimeCurrentLaunchObserved) {
+          addSessionRecord(
+            state,
+            record,
+            metadata?.resolvedSessionId,
+            false
+          );
+        } else {
+          state.runtimeUntimestampedRecords.push(record);
+          if (state.runtimeUntimestampedRecords.length > 128) {
+            state.runtimeUntimestampedRecords.shift();
+            state.runtimeUntimestampedRecordsDropped += 1;
+          }
+        }
+      }
       return;
+    }
+    const currentLaunchRecord = recordTimestampMs >= launchStartedAtMs - 5000;
+    const pendingRecords = state.runtimeUntimestampedRecords.splice(0);
+    if (!currentLaunchRecord) {
+      state.runtimeUntimestampedRecordsDropped = 0;
+      return;
+    }
+    state.runtimeCurrentLaunchObserved = true;
+    if (state.runtimeUntimestampedRecordsDropped > 0) {
+      markRuntimeObservationGap(state);
+      state.runtimeUntimestampedRecordsDropped = 0;
+    }
+    for (const pendingRecord of pendingRecords) {
+      addSessionRecord(
+        state,
+        pendingRecord,
+        metadata?.resolvedSessionId,
+        false
+      );
     }
   }
   addSessionRecord(state, record, metadata?.resolvedSessionId, false);
@@ -3424,15 +5112,30 @@ function addRuntimeObservationRecord(state, record, metadata = {}) {
 function runtimeObservationFromState(
   state,
   {
+    scope = "current_launch",
     coverage = "full",
     skippedBytes = 0,
     trailingRecordIncomplete = false,
+    recordOverflowed = false,
   } = {}
 ) {
   const permissionMode = trailingRecordIncomplete ? "" : state.permissionMode;
   const model = trailingRecordIncomplete ? "" : state.model;
   const effort = trailingRecordIncomplete ? "" : state.effort;
-  const ultracodeObserved = effort === "ultracode" ? true : null;
+  const claudeVersion = trailingRecordIncomplete ? "" : state.claudeVersion;
+  const ultraEffortAttachment = ultraEffortLifecycleFromState(state, {
+    scope,
+    coverage,
+    skippedBytes,
+    trailingRecordIncomplete,
+    recordOverflowed,
+  });
+  const ultracodeObserved =
+    ultraEffortAttachment.active !== null
+      ? ultraEffortAttachment.active
+      : effort === "ultracode"
+        ? true
+        : null;
   const observationUncertain =
     state.workflowObservationUncertain === true || trailingRecordIncomplete;
   const workflowActivityObserved =
@@ -3454,7 +5157,9 @@ function runtimeObservationFromState(
     permissionMode: permissionMode || null,
     model: model || null,
     effort: effort || null,
+    claudeVersion: claudeVersion || null,
     ultracode: ultracodeObserved,
+    ultraEffortAttachment,
     workflowActivity: {
       state: workflowState,
       launchObserved: state.workflowLaunchObserved,
@@ -3482,7 +5187,11 @@ function runtimeObservationFromState(
       permissionMode: permissionMode ? "claude_session_log" : "",
       model: model ? "claude_session_log" : "",
       effort: effort ? "claude_session_log" : "",
-      ultracode: ultracodeObserved === true ? "claude_session_log" : "",
+      claudeVersion: claudeVersion ? "claude_session_log" : "",
+      ultracode:
+        ultracodeObserved === true || ultracodeObserved === false
+          ? "claude_session_log"
+          : "",
     },
   };
 }
@@ -3741,6 +5450,7 @@ function appendRuntimeObservationRemainder(entry, value) {
     runtimeObservationBufferedRecordBytes + valueBytes >
     MAX_RUNTIME_OBSERVATION_BUFFERED_RECORD_BYTES;
   if (recordLimitExceeded || processLimitExceeded) {
+    entry.skippedBytes += entry.remainderBytes + valueBytes;
     markRuntimeObservationRecordOverflow(entry);
     return false;
   }
@@ -3774,9 +5484,14 @@ function consumeRuntimeObservationText(entry, text, metadata) {
   let value = text;
   if (entry.discardUntilNewline) {
     const newline = value.indexOf("\n");
-    if (newline < 0) return;
+    if (newline < 0) {
+      entry.skippedBytes += Buffer.byteLength(value);
+      return;
+    }
+    entry.skippedBytes += Buffer.byteLength(value.slice(0, newline + 1));
     value = value.slice(newline + 1);
     entry.discardUntilNewline = false;
+    entry.recordOverflowed = false;
   }
   let start = 0;
   for (;;) {
@@ -3786,6 +5501,10 @@ function consumeRuntimeObservationText(entry, text, metadata) {
     if (appendRuntimeObservationRemainder(entry, segment)) {
       const line = takeRuntimeObservationRemainder(entry);
       addRuntimeObservationLines(entry.state, [line], metadata);
+    } else {
+      // The oversized record ended at this newline. Keep the historical gap,
+      // but allow later complete records to restore current posture evidence.
+      entry.recordOverflowed = false;
     }
     entry.discardUntilNewline = false;
     start = newline + 1;
@@ -3821,7 +5540,11 @@ function consumeCompleteRuntimeObservationRemainder(entry, metadata) {
 }
 
 function markRuntimeObservationGap(state) {
-  clearObservedPosture(state);
+  clearObservedPosture(state, {
+    preserveUltraHistory: true,
+    markUltraHistoryGap: true,
+  });
+  state.runtimeUntimestampedRecords = [];
   state.activeWorkflowTaskIds.clear();
   state.unidentifiedPendingWorkflowCount = Math.max(
     0,
@@ -3918,12 +5641,17 @@ async function loadRuntimeObservation(metadata, file, key) {
         const headBytes = Math.min(RUNTIME_OBSERVATION_HEAD_BYTES, stat.size);
         const headBuffer = Buffer.alloc(headBytes);
         const headRead = await handle.read(headBuffer, 0, headBytes, 0);
-        const headText = headBuffer.subarray(0, headRead.bytesRead).toString("utf8");
-        const lastNewline = headText.lastIndexOf("\n");
-        if (lastNewline >= 0) {
+        const headData = headBuffer.subarray(0, headRead.bytesRead);
+        const lastNewlineByte = headData.lastIndexOf(0x0a);
+        const processedHeadBytes =
+          lastNewlineByte >= 0 ? lastNewlineByte + 1 : 0;
+        if (processedHeadBytes > 0) {
           addRuntimeObservationLines(
             entry.state,
-            headText.slice(0, lastNewline + 1).split(/\r?\n/),
+            headData
+              .subarray(0, processedHeadBytes)
+              .toString("utf8")
+              .split(/\r?\n/),
             metadata
           );
         }
@@ -3934,7 +5662,7 @@ async function loadRuntimeObservation(metadata, file, key) {
         );
         entry.discardUntilNewline = entry.offset > headRead.bytesRead;
         entry.coverage = "head_tail";
-        entry.skippedBytes = Math.max(0, entry.offset - headRead.bytesRead);
+        entry.skippedBytes = Math.max(0, entry.offset - processedHeadBytes);
       }
       historyHash = await consumeRuntimeObservationBytes(
         handle,
@@ -3943,23 +5671,6 @@ async function loadRuntimeObservation(metadata, file, key) {
         metadata,
         historyHash
       );
-      if (
-        entry.coverage === "head_tail" &&
-        !entry.state.workflowObservationUncertain &&
-        !runtimeObservationHasRemainder(entry) &&
-        !entry.recordOverflowed
-      ) {
-        disposeRuntimeObservationCacheEntry(entry);
-        entry = newRuntimeObservationCacheEntry(stat);
-        historyHash = await consumeRuntimeObservationBytes(
-          handle,
-          entry,
-          stat,
-          metadata
-        );
-        preserveFullGuard = false;
-        preserveBoundaryGuards = false;
-      }
       await updateRuntimeObservationCacheGuards(handle, entry, stat, {
         historyHash,
         preserveFullGuard,
@@ -3976,6 +5687,7 @@ async function loadRuntimeObservation(metadata, file, key) {
       disposeRuntimeObservationCacheEntry(oldestEntry);
     }
     const result = runtimeObservationFromState(entry.state, {
+      scope: "current_launch",
       coverage: entry.coverage,
       skippedBytes: entry.skippedBytes,
       trailingRecordIncomplete: Boolean(
@@ -3983,6 +5695,7 @@ async function loadRuntimeObservation(metadata, file, key) {
         entry.discardUntilNewline ||
         entry.recordOverflowed
       ),
+      recordOverflowed: entry.recordOverflowed,
     });
     cacheCommitted = true;
     return result;
@@ -4057,20 +5770,40 @@ export function transcriptSnapshotFromRecords(records, resolvedSessionId = null)
     const { role, body } = conversationMessage;
     if (role === "user") {
       lastUserIndex = recordIndex;
+      const preview = conversationMessagePreview(
+        record,
+        conversationMessage,
+        4000
+      );
       lastUser = {
-        cursor: record.uuid || record.promptId || record.timestamp || "",
-        timestamp: record.timestamp ?? "",
-        text: body.slice(0, 4000),
+        cursor: conversationRecordCursor(record, role, body, recordIndex),
+        timestamp: preview.timestamp,
+        text: preview.text,
+        textLength: preview.textLength,
+        textCharacters: preview.textCharacters,
+        textUtf8Bytes: preview.textUtf8Bytes,
+        textSha256: preview.textSha256,
+        textTruncated: preview.textTruncated,
       };
     }
     if (role === "assistant") {
       lastAssistantIndex = recordIndex;
+      const preview = conversationMessagePreview(
+        record,
+        conversationMessage,
+        MAX_TRANSCRIPT_ASSISTANT_CHARS
+      );
       lastAssistant = {
-        cursor: record.uuid || record.message?.id || record.timestamp || "",
-        timestamp: record.timestamp ?? "",
-        text: body.slice(0, MAX_TRANSCRIPT_ASSISTANT_CHARS),
-        textLength: body.length,
-        textTruncated: body.length > MAX_TRANSCRIPT_ASSISTANT_CHARS,
+        cursor: conversationRecordCursor(record, role, body, recordIndex),
+        timestamp: preview.timestamp,
+        text: preview.text,
+        resultId: preview.resultId,
+        textLength: preview.textLength,
+        textCharacters: preview.textCharacters,
+        textUtf8Bytes: preview.textUtf8Bytes,
+        textSha256: preview.textSha256,
+        textTruncated: preview.textTruncated,
+        usage: preview.usage,
         stopReason: record.message?.stop_reason ?? null,
         model: record.message?.model ?? null,
         effort: record.effort ?? null,
@@ -4291,10 +6024,20 @@ function submitResultStartedTurn(result) {
 }
 
 async function sessionTranscriptSnapshot(metadata) {
-  return transcriptSnapshotFromRecords(
-    await recentSessionRecords(metadata),
-    metadata?.resolvedSessionId ?? null
-  );
+  const window = await recentSessionRecordWindow(metadata);
+  return {
+    ...transcriptSnapshotFromRecords(
+      window.records,
+      metadata?.resolvedSessionId ?? null
+    ),
+    read: {
+      status: window.status,
+      bytesRead: window.bytesRead,
+      bytesSkipped: window.bytesSkipped,
+      trailingRecordIncomplete: window.trailingRecordIncomplete,
+      attentionReason: window.attentionReason,
+    },
+  };
 }
 
 export async function runSubmitPrompt(
@@ -4350,6 +6093,10 @@ export async function runSubmitPrompt(
     sendResult?.bracketedPasteUsed === undefined
       ? bracketedPaste
       : Boolean(sendResult.bracketedPasteUsed);
+  const deliveryWarning =
+    bracketedPaste && !bracketedPasteUsed
+      ? "Bracketed paste was requested but unavailable; the prompt used literal chunked input. Transcript acknowledgement remains the integrity check for the submitted text."
+      : undefined;
 
   let retriesUsed = 0;
   let transcriptAcknowledged = await promptAcknowledged(sessionName, input.text, submittedAtMs);
@@ -4402,6 +6149,7 @@ export async function runSubmitPrompt(
     requestedPasteMode,
     bracketedPasteRequested: bracketedPaste,
     bracketedPasteUsed,
+    deliveryWarning,
     retriesUsed,
     transcriptAcknowledged,
     capture: capturedText,
@@ -4631,6 +6379,8 @@ export function parseClaudeCapabilities(
     ? [...new Set(quotedPermissionModes)]
     : CLAUDE_PERMISSION_MODES.filter((mode) => optionBlockLists(permissionBlock, mode));
   const settingsFlagAvailable = helpOutput.includes("--settings <file-or-json>");
+  const debugFlagAvailable = /^\s*(?:-\w,\s*)?--debug(?:\s|$)/m.test(helpOutput);
+  const debugFileFlagAvailable = /^\s*--debug-file(?:\s|$)/m.test(helpOutput);
   const versionSupportsDirectUltracode = claudeVersionAtLeast(
     versionOutput,
     ULTRACODE_DIRECT_VERSION_FLOOR
@@ -4671,6 +6421,8 @@ export function parseClaudeCapabilities(
       settingsFlag: settingsFlagAvailable,
       remoteControlFlag: helpOutput.includes("--remote-control"),
       safeModeFlag: helpOutput.includes("--safe-mode"),
+      debugFlag: debugFlagAvailable,
+      debugFileFlag: debugFileFlagAvailable,
     },
     mcp: {
       effortLevels: [...CLAUDE_EFFORT_LEVELS],
@@ -4686,9 +6438,11 @@ export function parseClaudeCapabilities(
       bypassPermissionsPolicyEnvironment: BYPASS_POLICY_ENV,
       bypassPermissionsPolicyReadAtProcessStart: true,
       bypassPermissionsPolicyRelaunchRequiredAfterChange: true,
+      bypassPermissionsSecurityBoundary: bypassPolicy.securityBoundary,
     },
     ultracode: {
       advertisedAsEffort: advertisedUltracode,
+      helpListsUltracode: advertisedUltracode,
       supportedByInstalledVersion: versionSupportsDirectUltracode,
       directLaunchVersionFloor: ULTRACODE_DIRECT_VERSION_FLOOR.join("."),
       documentationUrl: ULTRACODE_DOCUMENTATION_URL,
@@ -4699,11 +6453,17 @@ export function parseClaudeCapabilities(
       mcpLaunchRequestAvailable: directUltracodeAvailable,
       experimentalSessionSettingsRequestAvailable: !directUltracodeAvailable && settingsFlagAvailable,
       launchMechanism: ultracodeLaunchMechanism,
+      launchArgument:
+        ultracodeLaunchMechanism === "effort_flag"
+          ? "--effort=ultracode"
+          : null,
       accountAndPolicyStatus: "unverified_no_authoritative_runtime_state",
       note: argumentProbe.rejected
         ? "The calibrated parser probe rejected --effort=ultracode. Help advertisement and version coverage remain provenance only and do not override that rejection."
         : directUltracodeAvailable
-        ? "The installed Claude CLI accepts or is covered by the documented direct UltraCode effort request, so the MCP uses --effort=ultracode. Acceptance, runtime effort, and workflow evidence are reported separately."
+        ? advertisedUltracode
+          ? "The installed Claude CLI advertises the direct UltraCode effort request, so the MCP uses --effort=ultracode. Acceptance, runtime effort, and workflow evidence are reported separately."
+          : "Claude help does not list ultracode as an effort value; this is not an unavailability result. The installed version accepts or is covered by the documented direct UltraCode request, so the MCP uses --effort=ultracode while reporting parser, runtime-effort, and workflow evidence separately."
         : settingsFlagAvailable
           ? "The installed Claude CLI exposes generic session settings but does not advertise Ultracode. The MCP can make an explicitly confirmed experimental settings request, but support and activation remain unverified."
           : "The installed Claude CLI exposes no supported Ultracode launch path.",
@@ -4780,6 +6540,20 @@ function windowsCommandLineValue(value) {
   return `"${String(value).replaceAll('"', '""')}"`;
 }
 
+function assertWindowsBatchArgument(value) {
+  const argument = String(value);
+  if (argument.length > 4096) {
+    throw new Error(
+      "Claude launch arguments routed through a Windows .cmd/.bat shim cannot exceed 4096 characters."
+    );
+  }
+  if (argument.includes("%") || argument.includes('"') || argument.endsWith("\\")) {
+    throw new Error(
+      "Claude launch arguments routed through a Windows .cmd/.bat shim cannot contain '%', a double quote, or a trailing backslash because cmd.exe can rewrite the final argv. Configure RAIL_CONNECTOR_CLAUDE_PATH to the native Claude executable or use a transport-safe tool rule."
+    );
+  }
+}
+
 export function windowsPtyLaunchDescriptor(
   command,
   args,
@@ -4790,6 +6564,9 @@ export function windowsPtyLaunchDescriptor(
     platform === "win32" &&
     [".cmd", ".bat"].includes(path.extname(String(command)).toLowerCase())
   ) {
+    for (const commandArg of commandArgs) {
+      assertWindowsBatchArgument(commandArg);
+    }
     const commandProcessor =
       env.ComSpec ||
       (env.SystemRoot ? path.join(env.SystemRoot, "System32", "cmd.exe") : "cmd.exe");
@@ -4800,7 +6577,7 @@ export function windowsPtyLaunchDescriptor(
     return {
       command: commandProcessor,
       args: [],
-      commandLine: `/d /s /c "${commandLine}"`,
+      commandLine: `/d /s /v:off /c "${commandLine}"`,
       metadataCommand: String(command),
       metadataArgs: commandArgs,
     };
@@ -4815,11 +6592,14 @@ export function windowsPtyLaunchDescriptor(
 
 async function execClaudeCommand(command, args, options) {
   if (IS_NATIVE_WINDOWS && [".cmd", ".bat"].includes(path.extname(command).toLowerCase())) {
+    for (const commandArg of args) {
+      assertWindowsBatchArgument(commandArg);
+    }
     const commandProcessor =
       process.env.ComSpec ||
       (process.env.SystemRoot ? path.join(process.env.SystemRoot, "System32", "cmd.exe") : "cmd.exe");
     const commandLine = [windowsCommandLineValue(command), ...args.map(windowsCommandLineValue)].join(" ");
-    return execFileAsync(commandProcessor, ["/d", "/s", "/c", `"${commandLine}"`], {
+    return execFileAsync(commandProcessor, ["/d", "/s", "/v:off", "/c", `"${commandLine}"`], {
       ...options,
       windowsVerbatimArguments: true,
     });
@@ -4972,6 +6752,12 @@ export function resolveLaunchOptionsFromCapabilities(
   if (needsEffortInspection && !capabilities.advertised?.effortLevels?.includes(options.effort)) {
     throw new Error(`The installed Claude CLI does not advertise effort level ${options.effort}.`);
   }
+  if (options.debug && !capabilities.advertised?.debugFileFlag) {
+    throw new Error("The installed Claude CLI does not advertise --debug-file.");
+  }
+  if (options.debugFilter && !capabilities.advertised?.debugFlag) {
+    throw new Error("The installed Claude CLI does not advertise --debug filters.");
+  }
   const requestedPermissionMode = options.requestedPermissionMode ?? options.permissionMode ?? "default";
   const advertisedPermissionModes = capabilities.advertised?.permissionModes ?? [];
   let permissionMode = requestedPermissionMode;
@@ -5001,13 +6787,18 @@ export function resolveLaunchOptionsFromCapabilities(
 }
 
 async function prepareLaunchOptions(options, claudeCommand, resolveOptions = {}) {
+  const capabilities = await inspectClaudeCapabilities(claudeCommand);
   return {
     ...resolveLaunchOptionsFromCapabilities(
       options,
-      await inspectClaudeCapabilities(claudeCommand),
+      capabilities,
       resolveOptions
     ),
     claudeCommand,
+    claudeCliVersion:
+      typeof capabilities.version === "string"
+        ? capabilities.version.trim()
+        : null,
   };
 }
 
@@ -5043,7 +6834,16 @@ async function backendStartUnlocked({
     if (!IS_NATIVE_WINDOWS) await requireManagedTmuxSession(sessionName);
     const existing = await backendLaunchMetadata(sessionName);
     if (!killExisting) {
-      const requestedArgs = claudeArgs(preparedLaunchOptions);
+      const requestedArgs = claudeArgs({
+        ...preparedLaunchOptions,
+        debugFile: preparedLaunchOptions.debug
+          ? path.join(
+              railConnectorStateDir(),
+              "debug",
+              `${sessionName}-generated-on-start.log`
+            )
+          : undefined,
+      });
       const requestedMetadata = {
         cwd: resolvedCwd,
         args: requestedArgs,
@@ -5060,11 +6860,14 @@ async function backendStartUnlocked({
       return {
         status: "already_running",
         capture: await backendCapture(sessionName, 80, existing),
-        existingSession: publicLaunchMetadata(existing),
+        existingSession: publicLaunchMetadata(existing, {
+          expectedSessionName: sessionName,
+        }),
         existingRequestedPosture: existing?.requestedPosture ?? null,
         existingResolvedPosture: existing?.resolvedPosture ?? existing?.requestedPosture ?? null,
         requestedArgs,
         requestedPosture: requestedMetadata.requestedPosture,
+        claudeCliVersion: preparedLaunchOptions.claudeCliVersion,
         launchMismatch: comparison.launchMismatch,
         launchComparison: comparison.comparison,
         note,
@@ -5111,8 +6914,29 @@ async function backendStartUnlocked({
   }
 
   const sessionLogSnapshot = snapshotSessionLogs(resolvedCwd);
-  const args = claudeArgs(preparedLaunchOptions);
   const startedAtMs = Date.now();
+  const debugFilePlaceholder = preparedLaunchOptions.debug
+    ? path.join(
+        railConnectorStateDir(),
+        "debug",
+        `${sessionName}-${startedAtMs}-generated.log`
+      )
+    : undefined;
+  let args = claudeArgs({
+    ...preparedLaunchOptions,
+    debugFile: debugFilePlaceholder,
+  });
+  const debugCapture = preparedLaunchOptions.debug
+    ? prepareClaudeDebugCapture({ sessionName, startedAtMs })
+    : null;
+  if (debugCapture) {
+    args = args.map((arg) =>
+      arg === `--debug-file=${debugFilePlaceholder}`
+        ? `--debug-file=${debugCapture.file}`
+        : arg
+    );
+    bindPreparedClaudeDebugCapture(debugCapture, args);
+  }
   const childEnvironment = {
     ...process.env,
     CLAUDE_CONFIG_DIR,
@@ -5132,38 +6956,59 @@ async function backendStartUnlocked({
   });
   if (IS_NATIVE_WINDOWS) {
     const brokerOperation = windowsReplacement ? "replace" : "start";
-    const ptyLaunch = windowsPtyLaunchDescriptor(claudeCommand, args);
-    const brokerResult = await windowsBrokerRequest(brokerOperation, {
-      sessionName,
-      ...ptyLaunch,
-      cols: 140,
-      rows: 40,
-      cwd: resolvedCwd,
-      canonicalCwd: canonicalResolvedCwd,
-      env: childEnvironment,
-      requestedPosture: launchMetadata.requestedPosture,
-      resolvedPosture: launchMetadata.resolvedPosture,
-      launchEnvironment,
-      resolvedSessionId: launchMetadata.resolvedSessionId,
-      expectedStartedAtMs:
-        windowsReplacement?.expectedStartedAtMs ?? undefined,
-      expectedGenerationId:
-        windowsReplacement?.expectedGenerationId ?? undefined,
-      leaseId: brokerMutationLeases.get(sessionName),
-      leaseTtlMs: BROKER_LEASE_TTL_MS,
-      graceful: windowsReplacement?.graceful ?? false,
-      force: windowsReplacement?.force ?? false,
-    });
+    let ptyLaunch;
+    try {
+      ptyLaunch = windowsPtyLaunchDescriptor(claudeCommand, args);
+    } catch (error) {
+      discardPreparedClaudeDebugCapture(debugCapture);
+      throw error;
+    }
+    let brokerResult;
+    try {
+      brokerResult = await windowsBrokerRequest(brokerOperation, {
+        sessionName,
+        ...ptyLaunch,
+        cols: 140,
+        rows: 40,
+        cwd: resolvedCwd,
+        canonicalCwd: canonicalResolvedCwd,
+        env: childEnvironment,
+        requestedPosture: launchMetadata.requestedPosture,
+        resolvedPosture: launchMetadata.resolvedPosture,
+        launchEnvironment,
+        resolvedSessionId: launchMetadata.resolvedSessionId,
+        expectedStartedAtMs:
+          windowsReplacement?.expectedStartedAtMs ?? undefined,
+        expectedGenerationId:
+          windowsReplacement?.expectedGenerationId ?? undefined,
+        leaseId: brokerMutationLeases.get(sessionName),
+        leaseTtlMs: BROKER_LEASE_TTL_MS,
+        graceful: windowsReplacement?.graceful ?? false,
+        force: windowsReplacement?.force ?? false,
+      });
+    } catch (error) {
+      // A transport failure can happen after the broker committed the launch.
+      // Retain the generated log and receipt so persisted argv never points to
+      // evidence this client deleted without reconciling the broker generation.
+      if (brokerStartFailureDefinitelyPrecommit(error)) {
+        discardPreparedClaudeDebugCapture(debugCapture);
+      }
+      throw error;
+    }
     if (brokerResult.status === "replace_failed") {
+      discardPreparedClaudeDebugCapture(debugCapture);
       throw new Error(
         `Unable to replace managed session ${sessionName}: ${brokerResult.stopResult?.status ?? "unknown"}.`
       );
     }
     if (brokerResult.status === "already_running") {
+      discardPreparedClaudeDebugCapture(debugCapture);
       return {
         status: "already_running",
         capture: brokerResult.capture,
-        existingSession: publicLaunchMetadata(brokerResult.metadata),
+        existingSession: publicLaunchMetadata(brokerResult.metadata, {
+          expectedSessionName: sessionName,
+        }),
         existingRequestedPosture: brokerResult.metadata?.requestedPosture ?? null,
         existingResolvedPosture: brokerResult.metadata?.resolvedPosture ?? null,
         requestedArgs: args,
@@ -5179,6 +7024,7 @@ async function backendStartUnlocked({
       startedAtMs: brokerResult.metadata?.startedAtMs ?? startedAtMs,
       generationId: brokerResult.metadata?.generationId ?? null,
       args,
+      claudeCliVersion: preparedLaunchOptions.claudeCliVersion,
       launchMetadata,
       sessionLogSnapshot,
       replacementAudit,
@@ -5199,10 +7045,14 @@ async function backendStartUnlocked({
     ],
     { timeoutMs: 10000 }
   );
-  if (!started.ok) throw new Error(started.stderr || "Failed to start tmux session");
+  if (!started.ok) {
+    discardPreparedClaudeDebugCapture(debugCapture);
+    throw new Error(started.stderr || "Failed to start tmux session");
+  }
   const paneIdentity = await tmuxPaneIdentity(sessionName);
   if (!paneIdentity || paneIdentity.sessionName !== sessionName) {
     await tmux(["kill-session", "-t", sessionName], { timeoutMs: 5000 });
+    discardPreparedClaudeDebugCapture(debugCapture);
     throw new Error("Unable to establish tmux pane identity for the managed Claude session.");
   }
   launchMetadata.paneId = paneIdentity.paneId;
@@ -5210,6 +7060,7 @@ async function backendStartUnlocked({
   const metadataError = await writeTmuxLaunchMetadata(sessionName, launchMetadata);
   if (metadataError) {
     await tmux(["kill-session", "-t", sessionName], { timeoutMs: 5000 });
+    discardPreparedClaudeDebugCapture(debugCapture);
     throw new Error(`Unable to establish tmux session ownership: ${metadataError}`);
   }
   return {
@@ -5217,6 +7068,7 @@ async function backendStartUnlocked({
     capture: "",
     startedAtMs,
     args,
+    claudeCliVersion: preparedLaunchOptions.claudeCliVersion,
     launchMetadata,
     sessionLogSnapshot,
     replacementAudit,
@@ -5362,6 +7214,48 @@ server.registerTool(
 );
 
 server.registerTool(
+  "get_claude_result",
+  {
+    description:
+      "Retrieve an exact, integrity-checked chunk of an assistant result returned by get_claude_session or wait_for_claude_turn. Record-scoped result identities distinguish identical answer text; textSha256 remains the content-integrity hash. Chunks use Unicode character offsets and remain bound to the supplied project and session UUID.",
+    inputSchema: {
+      sessionId: z.string(),
+      resultId: z
+        .string()
+        .regex(RESULT_ID_RE)
+        .describe(
+          "Opaque record-scoped result identity returned with an assistant message. Legacy sha256 content identities remain accepted."
+        ),
+      cwd: z.string().default(DEFAULT_CWD),
+      offsetCharacters: z.number().int().min(0).default(0),
+      maxCharacters: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_RESULT_CHUNK_CHARACTERS)
+        .default(DEFAULT_RESULT_CHUNK_CHARACTERS),
+    },
+  },
+  async ({ sessionId, resultId, cwd, offsetCharacters, maxCharacters }) => {
+    assertSafeSessionId(sessionId);
+    const file = path.join(
+      projectDirFromCwd(cwd),
+      `${sessionId}.jsonl`
+    );
+    if (!fs.existsSync(file)) throw new Error(`No session log found: ${file}`);
+    return text(
+      await readClaudeResultChunkFromFile(
+        file,
+        sessionId,
+        resultId,
+        offsetCharacters,
+        maxCharacters
+      )
+    );
+  }
+);
+
+server.registerTool(
   "start_remote_control",
   {
     description:
@@ -5439,6 +7333,21 @@ server.registerTool(
         .boolean()
         .default(false)
         .describe("Start Claude with --ax-screen-reader for flatter terminal output when supported."),
+      debug: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Capture Claude debug output to an MCP-generated file under the private state directory. The MCP returns provenance and size, never log contents."
+        ),
+      debugFilter: z
+        .string()
+        .min(1)
+        .max(256)
+        .regex(CLAUDE_DEBUG_FILTER_RE)
+        .optional()
+        .describe(
+          "Optional Claude debug category filter, such as api,hooks or !statsig,!file. Requires debug=true."
+        ),
       killExisting: z.boolean().default(false).describe("Kill an existing managed session with this name before starting."),
       forceKillExisting: z
         .boolean()
@@ -5514,6 +7423,9 @@ server.registerTool(
     if (input.ultracode && input.safeMode) {
       throw new Error("ultracode cannot be combined with safeMode because safe mode disables workflows.");
     }
+    if (input.debugFilter && !input.debug) {
+      throw new Error("debugFilter requires debug=true.");
+    }
     const sessionName = managedSessionName(input);
     const backend = IS_NATIVE_WINDOWS ? "native-windows-broker" : "tmux";
 
@@ -5538,6 +7450,8 @@ server.registerTool(
       safeMode: input.safeMode,
       bare: input.bare,
       axScreenReader: input.axScreenReader,
+      debug: input.debug,
+      debugFilter: input.debugFilter,
       killExisting,
       forceKillExisting,
     });
@@ -5552,13 +7466,21 @@ server.registerTool(
         ...started,
         backend,
         managedSession: sessionName,
+        claudeCliVersion: started.claudeCliVersion ?? null,
+        debugLog: claudeDebugCaptureStatus(existingMetadata?.args, undefined, {
+          expectedSessionName: sessionName,
+        }),
         signals,
         posture: launchPostureReport(
           started.existingRequestedPosture,
           started.existingResolvedPosture,
           signals,
           observation,
-          { launchEnvironment: existingMetadata?.launchEnvironment ?? null }
+          {
+            launchEnvironment: existingMetadata?.launchEnvironment ?? null,
+            launchMetadata: existingMetadata,
+            expectedSessionName: sessionName,
+          }
         ),
       });
     }
@@ -5585,9 +7507,15 @@ server.registerTool(
         status: "exited_during_startup",
         backend,
         managedSession: sessionName,
+        claudeCliVersion: started.claudeCliVersion ?? null,
         sessionId: resolvedResumeSessionId ?? effectiveNewSessionId ?? null,
         cwd: resolvedCwd,
         exitCode,
+        debugLog: claudeDebugCaptureStatus(
+          deadMetadata?.args ?? started.args,
+          undefined,
+          { expectedSessionName: sessionName }
+        ),
         capture: deadCapture,
         signals,
         posture: launchPostureReport(
@@ -5600,6 +7528,8 @@ server.registerTool(
               deadMetadata?.launchEnvironment ??
               started.launchMetadata?.launchEnvironment ??
               null,
+            launchMetadata: deadMetadata ?? started.launchMetadata ?? null,
+            expectedSessionName: sessionName,
           }
         ),
         note: "Claude exited during startup. Most often this means Claude Code is not authenticated in this same OS context - run `claude` here, log in, then retry.",
@@ -5617,12 +7547,30 @@ server.registerTool(
     let needsWorkspaceTrust = startupSignals.state === "workspace_trust_required";
     if (trustWorkspace && needsWorkspaceTrust) {
       try {
-        await backendSendKey(sessionName, "Enter", startupMetadata);
-        pane = await pollCapture(
-          sessionName,
-          (p) => REMOTE_URL_RE.test(p) || p.includes("Resume from summary"),
-          { timeoutMs: 9000, expectedMetadata: startupMetadata }
-        );
+        let trustMenu = workspaceTrustMenuState(pane);
+        if (trustMenu.selected === "no" && trustMenu.navigationKey) {
+          await backendSendKey(
+            sessionName,
+            trustMenu.navigationKey,
+            startupMetadata
+          );
+          pane = await pollCapture(
+            sessionName,
+            (p) =>
+              REMOTE_URL_RE.test(p) ||
+              workspaceTrustMenuState(p).selected === "yes",
+            { timeoutMs: 3000, expectedMetadata: startupMetadata }
+          );
+          trustMenu = workspaceTrustMenuState(pane);
+        }
+        if (trustMenu.selected === "yes") {
+          await backendSendKey(sessionName, "Enter", startupMetadata);
+          pane = await pollCapture(
+            sessionName,
+            (p) => REMOTE_URL_RE.test(p) || p.includes("Resume from summary"),
+            { timeoutMs: 9000, expectedMetadata: startupMetadata }
+          );
+        }
         startupSignals = captureSignals(pane);
         needsWorkspaceTrust = startupSignals.state === "workspace_trust_required";
       } catch {
@@ -5712,6 +7660,7 @@ server.registerTool(
       logBindingStatus: logResult.bindingStatus,
       cwd: resolvedCwd,
       remoteUrl,
+      claudeCliVersion: started.claudeCliVersion ?? null,
       permissionMode: resolvedPosture.permissionMode,
       permissionModeRequested: requestedPosture.permissionMode,
       permissionModeResolved: resolvedPosture.permissionMode,
@@ -5730,6 +7679,11 @@ server.registerTool(
         started.replacementAudit?.workflowInterrupted ?? false,
       needsWorkspaceTrust,
       metadataWarning,
+      debugLog: claudeDebugCaptureStatus(
+        currentMetadata?.args ?? started.args,
+        undefined,
+        { expectedSessionName: sessionName }
+      ),
       note: readiness.note || undefined,
       capture: pane,
       signals,
@@ -5859,6 +7813,27 @@ server.registerTool(
         observation.workflowActivity
       );
       transcript = await sessionTranscriptSnapshot(metadata);
+      if (transcript.read?.attentionReason) {
+        return text({
+          status: "needs_attention",
+          reason: transcript.read.attentionReason,
+          managedSession: sessionName,
+          capture,
+          signals,
+          transcript,
+          posture: await managedPostureReport(
+            sessionName,
+            signals,
+            metadata,
+            observation
+          ),
+          note:
+            transcript.read.attentionReason ===
+            "session_record_exceeds_bounded_reader"
+              ? "Claude's newest JSONL record exceeds the bounded transcript reader. Inspect the session log size before retrying or changing limits."
+              : "Claude transcript identity or its regular session-log source is unavailable; inspect the managed session metadata before retrying.",
+        });
+      }
       baselineTranscript ??= transcriptCursorBaseline(transcript);
       const decision = waitTurnDecision({
         afterCursor:
@@ -6529,11 +8504,11 @@ server.registerTool(
             session.cwd,
             session.canonicalCwd
           );
-          const {
-            canonicalCwd: _canonicalCwd,
-            observedPosture: _legacyObservedPosture,
-            ...publicSession
-          } = session;
+          const { canonicalCwd: _canonicalCwd, ...sessionWithoutCanonical } =
+            session;
+          const publicSession = publicLaunchMetadata(
+            sessionWithoutCanonical
+          );
           let workflowActivity = emptyWorkflowActivity();
           let workflowObservationAvailable = true;
           try {

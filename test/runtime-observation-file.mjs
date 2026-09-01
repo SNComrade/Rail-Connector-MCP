@@ -288,7 +288,7 @@ try {
     "utf8"
   );
   const checkpointed = await sessionRuntimeObservation(metadata);
-  assert.equal(checkpointed.permissionMode, "bypassPermissions");
+  assert.equal(checkpointed.permissionMode, null);
   assert.equal(checkpointed.model, "claude-fable-5");
   assert.equal(checkpointed.effort, "max");
   assert.equal(checkpointed.workflowActivity.state, "launch_observed");
@@ -299,6 +299,8 @@ try {
     "2026-08-18T09:00:08Z"
   );
   assert.equal(checkpointed.workflowActivity.observationUncertain, false);
+  assert.equal(checkpointed.workflowActivity.observationCoverage, "head_tail");
+  assert.ok(checkpointed.workflowActivity.observationSkippedBytes > 0);
   assert.equal(checkpointed.workflowActivity.evidence, "claude_session_log");
   assert.doesNotMatch(
     JSON.stringify(checkpointed),
@@ -963,22 +965,37 @@ try {
     "utf8"
   );
   assert.ok(fs.statSync(replayLogFile).size > 2.5 * 1024 * 1024);
-  const replayedGap = await sessionRuntimeObservation({
+  const boundedGap = await sessionRuntimeObservation({
     cwd,
     resolvedSessionId: replaySessionId,
     startedAtMs,
   });
-  assert.equal(replayedGap.workflowActivity.state, "pending");
-  assert.equal(replayedGap.workflowActivity.pendingCount, 1);
-  assert.equal(replayedGap.workflowActivity.observationUncertain, false);
-  assert.equal(replayedGap.workflowActivity.observationCoverage, "full");
-  assert.equal(replayedGap.workflowActivity.observationSkippedBytes, 0);
+  assert.equal(boundedGap.workflowActivity.state, "idle_count_observed");
+  assert.equal(boundedGap.workflowActivity.pendingCount, 0);
+  assert.equal(boundedGap.workflowActivity.observationUncertain, false);
+  assert.equal(boundedGap.workflowActivity.observationCoverage, "head_tail");
+  const replayBytes = fs.readFileSync(replayLogFile);
+  const replayHead = replayBytes.subarray(0, 256 * 1024);
+  const replayProcessedHeadBytes = replayHead.lastIndexOf(0x0a) + 1;
+  const replayTailStart = Math.max(
+    256 * 1024,
+    replayBytes.length - 2 * 1024 * 1024
+  );
+  const replayFirstTailNewline = replayBytes.indexOf(0x0a, replayTailStart);
+  const expectedReplaySkippedBytes =
+    (replayFirstTailNewline >= 0
+      ? replayFirstTailNewline + 1
+      : replayBytes.length) - replayProcessedHeadBytes;
   assert.equal(
-    replayedGap.workflowActivity.lastObservedAt,
-    "2026-08-18T15:30:20Z"
+    boundedGap.workflowActivity.observationSkippedBytes,
+    expectedReplaySkippedBytes
+  );
+  assert.equal(
+    boundedGap.workflowActivity.lastObservedAt,
+    "2026-08-18T15:30:15Z"
   );
   assert.doesNotMatch(
-    JSON.stringify(replayedGap),
+    JSON.stringify(boundedGap),
     /hidden-middle-private-name|hidden-middle-private-task-id/
   );
 
@@ -1141,10 +1158,137 @@ try {
     "utf8"
   );
   const overflowReleased = await sessionRuntimeObservation(overflowMetadata);
-  assert.equal(overflowReleased.workflowActivity.state, "unknown_due_to_gap");
-  assert.equal(overflowReleased.workflowActivity.pendingCount, null);
-  assert.equal(overflowReleased.workflowActivity.lastKnownPendingCount, 0);
-  assert.equal(overflowReleased.workflowActivity.observationUncertain, true);
+  assert.equal(overflowReleased.workflowActivity.state, "idle_count_observed");
+  assert.equal(overflowReleased.workflowActivity.pendingCount, 0);
+  assert.equal(overflowReleased.workflowActivity.lastKnownPendingCount, null);
+  assert.equal(overflowReleased.workflowActivity.observationUncertain, false);
+  assert.equal(
+    overflowReleased.workflowActivity.observationSkippedBytes,
+    Buffer.byteLength(overflowRecord) + 1
+  );
+  assert.equal(
+    overflowReleased.ultraEffortAttachment.historyCoverage,
+    "partial"
+  );
+  assert.equal(
+    overflowReleased.ultraEffortAttachment.observationUncertain,
+    true
+  );
+  fs.appendFileSync(
+    overflowLogFile,
+    jsonl([
+      {
+        ...overflowBase,
+        type: "attachment",
+        timestamp: "2026-08-18T16:00:03Z",
+        attachment: { type: "ultra_effort_enter", reminderType: "full" },
+      },
+    ]),
+    "utf8"
+  );
+  const overflowUltraRecovered = await sessionRuntimeObservation(
+    overflowMetadata
+  );
+  assert.equal(overflowUltraRecovered.ultracode, true);
+  assert.equal(
+    overflowUltraRecovered.ultraEffortAttachment.lifecycle,
+    "active"
+  );
+  assert.equal(
+    overflowUltraRecovered.ultraEffortAttachment.historyCoverage,
+    "partial"
+  );
+  assert.equal(
+    overflowUltraRecovered.ultraEffortAttachment.countsAreLowerBound,
+    true
+  );
+
+  const lifecycleSessionId = "97979797-9797-4979-8979-979797979797";
+  const lifecycleLogFile = path.join(
+    projectDirectory,
+    `${lifecycleSessionId}.jsonl`
+  );
+  const lifecycleBase = { sessionId: lifecycleSessionId };
+  const lifecycleMetadata = {
+    cwd,
+    resolvedSessionId: lifecycleSessionId,
+    startedAtMs,
+  };
+  fs.writeFileSync(
+    lifecycleLogFile,
+    jsonl([
+      {
+        ...lifecycleBase,
+        type: "attachment",
+        timestamp: "2026-08-18T16:05:00Z",
+        attachment: { type: "ultra_effort_enter", reminderType: "full" },
+      },
+    ]),
+    "utf8"
+  );
+  const lifecycleEntered = await sessionRuntimeObservation(lifecycleMetadata);
+  assert.equal(lifecycleEntered.ultracode, true);
+  assert.equal(lifecycleEntered.ultraEffortAttachment.lifecycle, "active");
+
+  const exitRecord = JSON.stringify({
+    ...lifecycleBase,
+    type: "attachment",
+    timestamp: "2026-08-18T16:05:01Z",
+    attachment: { type: "ultra_effort_exit", reminderType: "full" },
+  });
+  const exitSplit = Math.floor(exitRecord.length / 2);
+  fs.appendFileSync(lifecycleLogFile, exitRecord.slice(0, exitSplit), "utf8");
+  const lifecyclePartialExit = await sessionRuntimeObservation(
+    lifecycleMetadata
+  );
+  assert.equal(lifecyclePartialExit.ultracode, null);
+  assert.equal(lifecyclePartialExit.ultraEffortAttachment.active, null);
+  assert.equal(lifecyclePartialExit.ultraEffortAttachment.lifecycle, "unknown");
+  assert.equal(
+    lifecyclePartialExit.ultraEffortAttachment.activeUnknownReason,
+    "trailing_record_incomplete"
+  );
+  fs.appendFileSync(
+    lifecycleLogFile,
+    `${exitRecord.slice(exitSplit)}\n`,
+    "utf8"
+  );
+  const lifecycleExited = await sessionRuntimeObservation(lifecycleMetadata);
+  assert.equal(lifecycleExited.ultracode, false);
+  assert.equal(
+    lifecycleExited.ultraEffortAttachment.lifecycle,
+    "inactive_exited"
+  );
+  assert.equal(lifecycleExited.ultraEffortAttachment.exitCount, 1);
+
+  fs.appendFileSync(
+    lifecycleLogFile,
+    jsonl([
+      {
+        ...lifecycleBase,
+        type: "attachment",
+        timestamp: "2026-08-18T16:05:02Z",
+        attachment: { type: "workflow_keyword_request" },
+      },
+      {
+        ...lifecycleBase,
+        type: "attachment",
+        timestamp: "2026-08-18T16:05:03Z",
+        attachment: { type: "ultra_effort_enter", reminderType: "full" },
+      },
+    ]),
+    "utf8"
+  );
+  const lifecycleReentered = await sessionRuntimeObservation(
+    lifecycleMetadata
+  );
+  assert.equal(lifecycleReentered.ultracode, true);
+  assert.equal(lifecycleReentered.ultraEffortAttachment.lifecycle, "active");
+  assert.equal(lifecycleReentered.ultraEffortAttachment.enterCount, 2);
+  assert.equal(
+    lifecycleReentered.ultraEffortAttachment.workflowKeywordRequestCount,
+    1
+  );
 
   const concurrentFragments = Array.from({ length: 5 }, (_, index) => {
     const digit = String(index + 1);

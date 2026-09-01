@@ -139,6 +139,22 @@ assert.equal(acknowledgedResult.status, "submitted");
 assert.equal(acknowledgedResult.transcriptAcknowledged, true);
 assert.equal(acknowledged.calls.sendKey.length, 0);
 
+const degradedPaste = scriptedBackend(["> ", "> ", "> "]);
+degradedPaste.dependencies.sendText = async (...args) => {
+  degradedPaste.calls.sendText.push(args);
+  return { bracketedPasteUsed: false };
+};
+degradedPaste.dependencies.promptAcknowledged = async () => true;
+const degradedPasteResult = await runSubmitPrompt(
+  input,
+  degradedPaste.dependencies
+);
+assert.equal(degradedPasteResult.status, "submitted");
+assert.equal(degradedPasteResult.pasteMode, "literal");
+assert.equal(degradedPasteResult.bracketedPasteRequested, true);
+assert.equal(degradedPasteResult.bracketedPasteUsed, false);
+assert.match(degradedPasteResult.deliveryWarning, /literal chunked input/);
+
 const delayedPaste = scriptedBackend([
   "> ",
   "> ",

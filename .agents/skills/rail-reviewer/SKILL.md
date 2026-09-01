@@ -17,14 +17,20 @@ output is evidence, not authority.
 - Ground branch, status, diff, relevant code, docs, and tests before prompting
   Claude.
 - Default report-only reviews to `permissionMode: "dontAsk"` when the installed
-  CLI advertises it, plus explicit no-edit constraints. `dontAsk` denies new
-  permission requests while allowing read-only inspection. Use `plan` only as
-  a compatibility fallback; never approve implementation from a report-only
+  CLI advertises it, pass `disallowedTools: ["Edit", "Write",
+  "NotebookEdit"]`, and include explicit no-edit constraints. `dontAsk` denies
+  new permission requests while allowing read-only inspection. Use `plan` only
+  as a compatibility fallback; never approve implementation from a report-only
   review. Report-only is verified by pre/post repository evidence; it is not an
-  operating-system sandbox. Deny `Edit`, `Write`, and `NotebookEdit`, constrain
-  shell use to inspection, and use a read-only copy when hard isolation matters.
-- Leave `trustWorkspace` false unless the user explicitly authorizes trust after
-  project configuration and hooks are inspected.
+  operating-system sandbox. Constrain shell use to inspection and use a
+  read-only copy when hard isolation matters.
+- `tools`, `allowedTools`, and `disallowedTools` constrain built-in Claude
+  tools only. MCP and connector tools can remain available; the current MCP
+  does not offer a verified strict MCP-config roster. Inspect the effective
+  roster when possible and do not describe the built-in deny list as hard
+  connector isolation.
+- Leave `trustWorkspace` false unless the user explicitly authorizes trust
+  after project configuration and hooks are inspected.
 - Honor an explicit user request for Ultracode with `ultracode: true`,
   `confirmUltracode: true`, and no ordinary effort. Check capability provenance
   and calibrated probe exit status plus environment blockers before launch,
@@ -32,6 +38,15 @@ output is evidence, not authority.
   `posture.ultracodeAssessment` without promoting `xhigh` alone to confirmed
   Ultracode. Keep the persisted child `launchEnvironment` separate from
   `currentMcpEnvironment` when a review reconnects after an MCP refresh.
+  `advertisedAsEffort: false` or `helpListsUltracode: false` means help text is
+  silent, not that the launch is unavailable. Read
+  `ultraEffortAttachment.active`, `lifecycle`, and `historyCoverage`: a latest
+  enter is active, a later exit is inactive, and a skipped or partial range is
+  unknown until a later complete transition restores current state. Historical
+  coverage remains partial after recovery. These attachments authenticate
+  client-side transitions, not workflow execution. Inspect `attentionStatus`;
+  a blocking environment, conflicting effort, or terminal-rejection conflict
+  takes precedence without erasing lifecycle evidence.
 - Honor an explicit user request to test or use bypass only when capability
   inspection reports policy enabled and the call includes
   `confirmBypassPermissions: true`. Do not independently elevate and do not
@@ -49,8 +64,12 @@ output is evidence, not authority.
   evidence may make the latter busy without proving that Claude's terminal is
   busy. When workflow pending clears, historical evidence should not remain in
   `workflowPendingEvidence`.
-- A `tool_use` record is not a final report. Check `textTruncated` before
-  synthesizing an unusually large review.
+- A `tool_use` record is not a final report. Check `textTruncated`,
+  `textSha256`, and `textCharacters` before synthesizing an unusually large
+  review. Use `get_claude_result` with the returned `resultId` until `hasMore`
+  is false; treat `resultId` as an opaque record identity and verify the
+  separate `textSha256` content digest instead of treating the preview as
+  complete.
 - Remote Control web may label the underlying xhigh setting `Extra` while
   UltraCode is active. A session-bound web `Extra` is compatible presentation,
   not confirmation or conflict. On an idle, empty composer,
@@ -88,9 +107,9 @@ output is evidence, not authority.
    gaps and residual risk. State launch acceptance, runtime effort, workflow
    activity, conflicts, and unknowns separately. Do not promise that Claude's
    footer will literally display `Ultracode`.
-8. **Clean up.** Recheck repository/index state and verify the composer is empty,
-   then gracefully stop the review session created by this workflow unless
-   follow-up continuity is requested. Preserve an
+8. **Clean up.** Recheck repository/index state, verify the composer is empty,
+   then gracefully stop only the review session created by this workflow
+   unless follow-up continuity is requested. Preserve an
    `awaiting_input` draft unless the user explicitly authorizes submission or
    discard.
 

@@ -15,6 +15,8 @@ Options:
   --remote-control [name]                Start Remote Control
   --safe-mode                           Start with customizations disabled
   --settings <file-or-json>             Load additional settings
+  --debug [filter]                      Enable debug logging
+  --debug-file <path>                   Write debug logs to a file
 `;
 
 const legacy = parseClaudeCapabilities("2.1.198 (Claude Code)\n", help, "claude.exe");
@@ -43,8 +45,13 @@ assert.equal(legacy.ultracode.launchMechanism, "experimental_session_settings");
 
 const current = parseClaudeCapabilities("2.1.220 (Claude Code)\n", help, "claude.exe");
 assert.equal(current.ultracode.supportedByInstalledVersion, true);
+assert.equal(current.advertised.debugFlag, true);
+assert.equal(current.advertised.debugFileFlag, true);
+assert.equal(current.ultracode.advertisedAsEffort, false);
+assert.equal(current.ultracode.helpListsUltracode, false);
 assert.equal(current.ultracode.mcpLaunchRequestAvailable, true);
 assert.equal(current.ultracode.launchMechanism, "effort_flag");
+assert.equal(current.ultracode.launchArgument, "--effort=ultracode");
 assert.equal(current.ultracode.capabilityStatus, "officially_supported_unprobed");
 assert.equal(current.ultracode.supportSource, "official_version_contract");
 assert.equal(current.ultracode.directLaunchVersionFloor, "2.1.203");
@@ -53,10 +60,48 @@ assert.equal(
   "https://code.claude.com/docs/en/settings#available-settings"
 );
 assert.match(current.ultracode.note, /--effort=ultracode/);
+assert.match(current.ultracode.note, /not an unavailability result/);
 assert.equal(
   resolveLaunchOptionsFromCapabilities({ permissionMode: "default", ultracode: true }, current)
     .ultracodeMechanism,
   "effort"
+);
+assert.equal(
+  resolveLaunchOptionsFromCapabilities(
+    { permissionMode: "default", debug: true, debugFilter: "api,!statsig" },
+    current
+  ).debug,
+  true
+);
+assert.throws(
+  () =>
+    resolveLaunchOptionsFromCapabilities(
+      { permissionMode: "default", debug: true },
+      {
+        ...current,
+        advertised: { ...current.advertised, debugFileFlag: false },
+      }
+    ),
+  /does not advertise --debug-file/
+);
+const debugFileOnly = parseClaudeCapabilities(
+  "2.1.220 (Claude Code)\n",
+  `${help.replace(/^\s*--debug \[filter\].*\n/m, "")}`,
+  "claude.exe"
+);
+assert.equal(debugFileOnly.advertised.debugFlag, false);
+assert.equal(debugFileOnly.advertised.debugFileFlag, true);
+assert.throws(
+  () =>
+    resolveLaunchOptionsFromCapabilities(
+      {
+        permissionMode: "default",
+        debug: true,
+        debugFilter: "api",
+      },
+      debugFileOnly
+    ),
+  /does not advertise --debug filters/
 );
 
 const acceptedUnadvertised = parseClaudeCapabilities(
@@ -238,6 +283,8 @@ const futureHelp = help.replace("(low, medium, high, xhigh, max)", "(low, medium
 const future = parseClaudeCapabilities("future-build (Claude Code)\n", futureHelp, "claude.exe");
 assert.deepEqual(future.advertised.effortLevels, ["low", "medium", "high", "xhigh", "max", "ultracode"]);
 assert.equal(future.ultracode.advertisedAsEffort, true);
+assert.equal(future.ultracode.helpListsUltracode, true);
+assert.equal(future.ultracode.launchArgument, "--effort=ultracode");
 assert.equal(future.ultracode.mcpLaunchRequestAvailable, true);
 
 const advertisedButRejected = parseClaudeCapabilities(

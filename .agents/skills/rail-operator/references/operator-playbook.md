@@ -6,6 +6,7 @@
 - `get_claude_capabilities`
 - `list_claude_sessions`
 - `get_claude_session`
+- `get_claude_result`
 - `start_remote_control`
 - `capture_remote_control`
 - `wait_for_claude_turn`
@@ -82,6 +83,7 @@ For either recipe, first verify `get_claude_capabilities` reports:
 - bypass policy `enabled: true`
 - the installed permission mode
 - `ultracode.launchMechanism: "effort_flag"`
+- `ultracode.launchArgument: "--effort=ultracode"`
 - `ultracode.argumentProbe.accepted: true`, or documented support provenance
 - `ultracode.environment.status: "compatible"`
 
@@ -90,9 +92,23 @@ exit for `--effort=ultracode` plus a nonzero invalid control is accepted even if
 Claude changes its error wording; timeout or signal termination is
 inconclusive. Claude Code v2.1.203 is the documented floor for direct
 `--effort=ultracode` startup.
+`advertisedAsEffort: false` and `helpListsUltracode: false` report that help
+omitted the literal value; they do not override supported version or calibrated
+probe evidence.
 
 After launch, inspect `posture.ultracodeAssessment`. `requested_unconfirmed`
 means the request was accepted but runtime evidence has not arrived.
+`attachment_lifecycle_active` means the latest complete bound attachment is an
+UltraCode enter; `exited_after_entry` means a later exit made that client-side
+mode inactive. Read `active`, `lastTransition`, and `historyCoverage`; a partial
+or skipped range keeps history coverage partial. Current state remains unknown
+until a later complete transition is observed; that transition can restore the
+current state without pretending the skipped history became complete. These
+transitions do not prove server-side workflow work.
+Check `attentionStatus` next. `environment_blocked`,
+`conflicting_effort_evidence`, and `terminal_rejection_conflict` take
+precedence in the primary status while preserving the lifecycle evidence that
+created the contradiction.
 `xhigh_correlated_unconfirmed` is consistent with UltraCode but is not proof of
 workflow orchestration. `workflow_activity_observed` reports sanitized Claude
 workflow activity while leaving its trigger attribution `unknown`. A bound
@@ -131,6 +147,27 @@ read when that MCP process starts. If a daemon-managed environment retains the
 old transport, use `codex app-server daemon restart`. Do not restart WSL or
 unrelated project services. Do not replace bypass with `default` and claim the
 request was honored.
+
+## Bounded Debug Capture
+
+For an explicitly requested launch investigation, add:
+
+```json
+{
+  "debug": true,
+  "debugFilter": "api,!statsig"
+}
+```
+
+The filter is optional. Verify capabilities advertise `--debug-file` and, when
+filtering, `--debug`. Read the returned `debugLog.status`, `identityMatch`,
+`launchBindingMatch`, and `sizeBytes`; contents are deliberately not returned.
+The generated log and
+receipt remain under the MCP state directory as sensitive local evidence until
+the operator removes them. On Windows, `ready_acl_unverified` and
+`windowsAclVerified: false` mean file identity and launch binding passed while
+Node mode bits remain insufficient ACL proof. Debug capture can correlate local argv and
+client events, but it cannot authenticate Anthropic's server-side effort.
 
 ## Resume, Continue, And Fork
 
@@ -224,7 +261,12 @@ For a large prompt, a pasted-text placeholder can become visible after the
 first capture. `submit_prompt` polls a bounded visibility window before deciding
 whether to send its Enter retry. If `paste_pending` still returns, inspect the
 capture before sending a key.
-Inspect `textLength` and `textTruncated` for unusually large answers. On
+Inspect `textLength`, `textCharacters`, `textUtf8Bytes`, `textSha256`, and
+`textTruncated` for unusually large answers. When truncated, call
+`get_claude_result` with the same `cwd`, conversation UUID, and returned
+opaque, record-scoped `resultId`; advance `offsetCharacters` through the
+Unicode-safe chunks until `hasMore` is false, then confirm the separate
+`textSha256` content digest. On
 `needs_attention`, inspect the reason and capture before acting. A timeout can
 be waited again. A `completed` result can include a separate `attention`
 object for a weaker limit or paste warning; keep the completed transcript and

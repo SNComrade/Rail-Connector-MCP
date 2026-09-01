@@ -17,6 +17,10 @@ Windows uses the persistent per-user broker. A refreshed Codex task should call
 `status` and reconnect to an existing `managedSession`; it should not assume the
 Claude process ended.
 
+MCP registration does not install user-scope skills. Follow [Skill
+Installation](SKILL_INSTALL.md) when these skills must be discovered
+from unrelated repositories, then open a fresh Codex task.
+
 ## Skill Validation
 
 ```powershell

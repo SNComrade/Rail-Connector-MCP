@@ -21,7 +21,7 @@ only to describe interoperability. See [NOTICE](NOTICE).
 
 ## Status
 
-The current version is `1.0.0-beta.2`, the second public beta. Treat
+The current version is `1.0.0-beta.3`, the third public beta. Treat
 the MCP tool schemas and response fields as prerelease interfaces until a stable
 release is published. See [Compatibility](COMPATIBILITY.md).
 
@@ -37,8 +37,11 @@ registry. Git tags and GitHub Releases are the public release authority.
 - Persistent per-user ConPTY broker on Windows and validated tmux ownership on
   Linux/macOS
 - Chunked prompt submission and transcript-backed completion waiting
+- Integrity-checked result previews with exact Unicode-safe chunk retrieval
 - Session rename plus MCP-local archive metadata
-- Requested, resolved, and observed launch-posture evidence
+- Requested, resolved, observed, and audit-scoped launch-posture evidence
+- Bounded UltraCode entry/exit lifecycle evidence and opt-in debug-log
+  provenance without returning debug contents
 - Repo-scoped Codex operator, debugger, and reviewer skills
 
 ## Requirements
@@ -76,7 +79,7 @@ For a published release, clone the immutable tag:
 Linux:
 
 ```bash
-git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.3 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 ./install.sh
 ```
@@ -87,7 +90,7 @@ macOS uses the same installer after the prerequisites in
 Native Windows PowerShell:
 
 ```powershell
-git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.3 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 .\install-windows.ps1
 ```

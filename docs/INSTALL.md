@@ -6,7 +6,7 @@ Install the MCP in the same OS context as Codex and Claude Code.
 - [Linux/WSL Install](LINUX.md)
 - [macOS Install](MACOS.md)
 
-Tagged release instructions use the immutable `v1.0.0-beta.2` source. Clone
+Tagged release instructions use the immutable `v1.0.0-beta.3` source. Clone
 without `--branch` only when intentionally evaluating mutable `main`.
 
 ## Requirements
@@ -23,7 +23,7 @@ without `--branch` only when intentionally evaluating mutable `main`.
 Linux/macOS:
 
 ```bash
-git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.3 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 ./install.sh
 ```
@@ -31,7 +31,7 @@ cd Rail-Connector-MCP
 Windows:
 
 ```powershell
-git clone --branch v1.0.0-beta.2 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.3 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 .\install-windows.ps1
 ```
@@ -74,6 +74,7 @@ The expected MCP tools are:
 
 - `list_claude_sessions`
 - `get_claude_session`
+- `get_claude_result`
 - `start_remote_control`
 - `capture_remote_control`
 - `wait_for_claude_turn`

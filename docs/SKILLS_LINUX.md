@@ -9,6 +9,10 @@ This repo includes Codex repo-scoped skills under:
 These skills are intended to work in Linux/WSL without requiring Windows-only
 runtime components. For Linux/WSL, the active Rail Connector backend is `tmux`.
 
+MCP registration does not install user-scope skills. Follow [Skill
+Installation](SKILL_INSTALL.md) when the skills must be discovered from
+unrelated repositories, then open a fresh Codex task.
+
 ## Active Skills
 
 - `rail-operator`

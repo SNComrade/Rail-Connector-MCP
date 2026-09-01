@@ -80,6 +80,8 @@ if (argv.includes("--help")) {
       "  --permission-mode <mode> default, manual, plan, acceptEdits, auto, dontAsk, bypassPermissions",
       "  --settings <file-or-json>",
       "  --remote-control",
+      "  --debug [filter]",
+      "  --debug-file <path>",
       "",
     ].join("\n")
   );
@@ -89,6 +91,14 @@ if (argv.includes("--help")) {
 if (argv.includes("--version")) {
   process.stdout.write("2.1.234 (Claude Code)\n");
   process.exit(0);
+}
+
+const debugFile = argumentValue("--debug-file");
+if (debugFile) {
+  fs.appendFileSync(
+    debugFile,
+    `${JSON.stringify({ type: "fake_debug", argvCount: argv.length })}\n`
+  );
 }
 
 writeSessionBridgeRecord();

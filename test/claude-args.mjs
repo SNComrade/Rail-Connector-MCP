@@ -7,10 +7,16 @@ import {
   bypassPolicyStatus,
   assertSafeManagedSessionName,
   assertSafeSessionId,
+  bindPreparedClaudeDebugCapture,
+  brokerStartFailureDefinitelyPrecommit,
   claudeChildLaunchEnvironmentStatus,
   claudeArgs,
+  claudeDebugCaptureStatus,
   compareLaunchMetadata,
+  discardPreparedClaudeDebugCapture,
+  launchAuditReceipt,
   managedSessionName,
+  prepareClaudeDebugCapture,
   requestedLaunchPosture,
   requestedLaunchPostureFromArgs,
   resolveCommandFromPath,
@@ -42,6 +48,24 @@ assert.equal(
 );
 assert.equal(managedSessionName({ managedSession: "explicit-session", tmuxSession: "legacy-session" }), "explicit-session");
 
+for (const code of [
+  "EAUTH",
+  "EBROKERUPGRADE",
+  "ECWDPROVENANCE",
+  "ECWDUNAVAILABLE",
+  "ELAUNCHCOMMAND",
+  "ELAUNCHENV",
+  "ELEASE",
+  "ESHUTDOWN",
+  "ESTALE",
+]) {
+  assert.equal(brokerStartFailureDefinitelyPrecommit({ code }), true);
+}
+for (const code of ["EBROKER", "ECONNRESET", "EMSGSIZE", "ETIMEDOUT", "ENOENT"]) {
+  assert.equal(brokerStartFailureDefinitelyPrecommit({ code }), false);
+}
+assert.equal(brokerStartFailureDefinitelyPrecommit(null), false);
+
 assert.deepEqual(
   windowsPtyLaunchDescriptor("C:\\Tools\\claude.cmd", ["--model", "sonnet"], {
     platform: "win32",
@@ -50,7 +74,7 @@ assert.deepEqual(
   {
     command: "C:\\Windows\\System32\\cmd.exe",
     args: [],
-    commandLine: '/d /s /c ""C:\\Tools\\claude.cmd" "--model" "sonnet""',
+    commandLine: '/d /s /v:off /c ""C:\\Tools\\claude.cmd" "--model" "sonnet""',
     metadataCommand: "C:\\Tools\\claude.cmd",
     metadataArgs: ["--model", "sonnet"],
   }
@@ -62,6 +86,38 @@ assert.deepEqual(
     args: ["--help"],
     metadataCommand: "/usr/bin/claude",
     metadataArgs: ["--help"],
+  }
+);
+for (const unsafeBatchArgument of [
+  "--allowedTools=Read(%PATH%)",
+  '--allowedTools=Bash(echo "quoted")',
+  "--allowedTools=C:\\work\\",
+  `--allowedTools=${"R".repeat(4097)}`,
+]) {
+  assert.throws(
+    () =>
+      windowsPtyLaunchDescriptor(
+        "C:\\Tools\\claude.cmd",
+        [unsafeBatchArgument],
+        {
+          platform: "win32",
+          env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+        }
+      ),
+    /cmd\.exe can rewrite|cannot exceed 4096/
+  );
+}
+assert.deepEqual(
+  windowsPtyLaunchDescriptor(
+    "C:\\Tools\\claude.exe",
+    ["--allowedTools=Read(%PATH%)"],
+    { platform: "win32" }
+  ),
+  {
+    command: "C:\\Tools\\claude.exe",
+    args: ["--allowedTools=Read(%PATH%)"],
+    metadataCommand: "C:\\Tools\\claude.exe",
+    metadataArgs: ["--allowedTools=Read(%PATH%)"],
   }
 );
 
@@ -83,8 +139,161 @@ for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
 for (const permissionMode of ["default", "manual", "acceptEdits", "auto", "dontAsk", "plan"]) {
   assert.deepEqual(
     claudeArgs({ remoteName: "Permissions", permissionMode }),
-    ["--remote-control=Permissions", `--permission-mode=${permissionMode}`]
+  ["--remote-control=Permissions", `--permission-mode=${permissionMode}`]
   );
+}
+
+const debugStateDir = fs.mkdtempSync(
+  path.join(os.tmpdir(), "claude-debug-capture-")
+);
+try {
+  const startedAtMs = Date.parse("2026-08-31T12:00:00Z");
+  const debugCapture = prepareClaudeDebugCapture({
+    sessionName: "debug_proof",
+    startedAtMs,
+    stateDir: debugStateDir,
+  });
+  const debugArgs = claudeArgs({
+    remoteName: "Debug Proof",
+    permissionMode: "manual",
+    debug: true,
+    debugFilter: "api,!statsig",
+    debugFile: debugCapture.file,
+  });
+  assert.deepEqual(debugArgs, [
+    "--debug=api,!statsig",
+    `--debug-file=${debugCapture.file}`,
+    "--remote-control=Debug Proof",
+    "--permission-mode=manual",
+  ]);
+  bindPreparedClaudeDebugCapture(debugCapture, debugArgs);
+  const debugReceipt = JSON.parse(
+    fs.readFileSync(debugCapture.receiptFile, "utf8")
+  );
+  assert.equal(Object.hasOwn(debugReceipt, "file"), false);
+  assert.equal(debugReceipt.fileName, path.basename(debugCapture.file));
+  assert.equal(debugReceipt.sessionName, "debug_proof");
+  assert.equal(debugReceipt.debugFilter, "api,!statsig");
+  assert.match(debugReceipt.argsSha256, /^sha256:[0-9a-f]{64}$/);
+  fs.appendFileSync(debugCapture.file, "synthetic debug evidence\n", "utf8");
+  const debugStatus = claudeDebugCaptureStatus(debugArgs, debugStateDir);
+  assert.equal(
+    debugStatus.status,
+    process.platform === "win32" ? "ready_acl_unverified" : "ready"
+  );
+  assert.equal(debugStatus.filter, "api,!statsig");
+  assert.equal(debugStatus.identityMatch, true);
+  assert.equal(debugStatus.launchBindingMatch, true);
+  assert.equal(debugStatus.contentsReturned, false);
+  assert.equal(debugStatus.sizeBytes > 0, true);
+  const previousDebugStateDir = process.env.RAIL_CONNECTOR_STATE_DIR;
+  process.env.RAIL_CONNECTOR_STATE_DIR = debugStateDir;
+  try {
+    assert.equal(
+      launchAuditReceipt({
+        args: debugArgs,
+        expectedSessionName: "debug_proof",
+      }).debugCapture.launchBindingMatch,
+      true
+    );
+    assert.equal(
+      launchAuditReceipt({
+        args: debugArgs,
+        expectedSessionName: "different_session",
+      }).debugCapture.status,
+      "launch_binding_mismatch"
+    );
+  } finally {
+    if (previousDebugStateDir === undefined) {
+      delete process.env.RAIL_CONNECTOR_STATE_DIR;
+    } else {
+      process.env.RAIL_CONNECTOR_STATE_DIR = previousDebugStateDir;
+    }
+  }
+  assert.equal(
+    claudeDebugCaptureStatus(
+      [...debugArgs.slice(0, -1), "--permission-mode=plan"],
+      debugStateDir
+    ).status,
+    "launch_binding_mismatch"
+  );
+  assert.equal(
+    claudeDebugCaptureStatus(debugArgs, debugStateDir, {
+      expectedSessionName: "different_session",
+    }).status,
+    "launch_binding_mismatch"
+  );
+  const unavailableDebugState = claudeDebugCaptureStatus(
+    debugArgs,
+    path.join(debugStateDir, "missing-state")
+  );
+  assert.equal(unavailableDebugState.status, "state_directory_unavailable");
+  assert.equal(unavailableDebugState.file, null);
+  const untrustedDebugPath = claudeDebugCaptureStatus(
+    ["--debug-file=C:\\outside\\debug.log"],
+    debugStateDir
+  );
+  assert.equal(untrustedDebugPath.status, "untrusted_path");
+  assert.equal(untrustedDebugPath.file, null);
+  fs.writeFileSync(debugCapture.receiptFile, "x".repeat(16 * 1024 + 1));
+  assert.equal(
+    claudeDebugCaptureStatus(debugArgs, debugStateDir).status,
+    "receipt_missing_or_invalid"
+  );
+  const cleanupCapture = prepareClaudeDebugCapture({
+    sessionName: "cleanup_proof",
+    startedAtMs: startedAtMs + 1,
+    stateDir: debugStateDir,
+  });
+  bindPreparedClaudeDebugCapture(cleanupCapture, [
+    "--debug",
+    `--debug-file=${cleanupCapture.file}`,
+  ]);
+  const simulatedCleanupFailure = discardPreparedClaudeDebugCapture(
+    cleanupCapture,
+    {
+      unlinkSync(file) {
+        if (file === cleanupCapture.file) {
+          const error = new Error("simulated sharing violation");
+          error.code = "EPERM";
+          throw error;
+        }
+        fs.unlinkSync(file);
+      },
+    }
+  );
+  assert.deepEqual(simulatedCleanupFailure, {
+    removed: false,
+    warnings: [{ target: "log", code: "EPERM" }],
+  });
+  assert.equal(fs.existsSync(cleanupCapture.file), true);
+  assert.equal(fs.existsSync(cleanupCapture.receiptFile), true);
+  assert.deepEqual(discardPreparedClaudeDebugCapture(cleanupCapture), {
+    removed: true,
+    warnings: [],
+  });
+  assert.equal(fs.existsSync(cleanupCapture.file), false);
+  assert.equal(fs.existsSync(cleanupCapture.receiptFile), false);
+  assert.throws(
+    () =>
+      claudeArgs({
+        remoteName: "Debug Proof",
+        permissionMode: "manual",
+        debug: true,
+      }),
+    /MCP-generated debug file/
+  );
+  assert.throws(
+    () =>
+      claudeArgs({
+        remoteName: "Debug Proof",
+        permissionMode: "manual",
+        debugFilter: "api",
+      }),
+    /requires debug=true/
+  );
+} finally {
+  fs.rmSync(debugStateDir, { recursive: true, force: true });
 }
 
 assert.throws(
@@ -245,6 +454,118 @@ assert.deepEqual(requestedLaunchPostureFromArgs(directUltracodeArgs), {
   bypassPermissionsAcknowledged: null,
   bypassPermissionsPolicyMode: null,
 });
+assert.equal(
+  requestedLaunchPostureFromArgs([
+    "--permission-mode=bypassPermissions",
+  ]).bypassPermissionsPolicyMode,
+  null
+);
+
+const isolatedLaunchAudit = launchAuditReceipt({
+  requested: {
+    permissionMode: "bypassPermissions",
+    bypassPermissionsPolicyMode: "isolated",
+  },
+  resolved: {
+    permissionMode: "bypassPermissions",
+    bypassPermissionsPolicyMode: "isolated",
+  },
+  args: [
+    "--allowedTools=Read,Grep",
+    "--disallowedTools=Edit,Write",
+    "--tools=Read,Grep,Bash",
+    "--permission-mode=bypassPermissions",
+  ],
+  platform: "win32",
+  launchEnvironment: {
+    status: "compatible",
+    evidenceScope: "claude_child_launch_environment",
+    effortOverrideStatus: "unset",
+    workflowsDisabled: false,
+    blockers: [],
+    note: "Synthetic recorded launch environment.",
+  },
+});
+assert.equal(
+  isolatedLaunchAudit.postureSemantics.resolved,
+  "validated_claude_cli_launch_arguments"
+);
+assert.equal(
+  isolatedLaunchAudit.securityBoundary.isolationClaim,
+  "operator_asserted"
+);
+assert.equal(isolatedLaunchAudit.securityBoundary.osIsolationVerified, false);
+assert.equal(
+  isolatedLaunchAudit.securityBoundary.childEnvironment,
+  "inherits_mcp_process_environment_with_launch_overrides"
+);
+assert.equal(
+  isolatedLaunchAudit.securityBoundary.childEnvironmentEvidence,
+  "persisted_claude_child_launch_environment"
+);
+assert.equal(
+  isolatedLaunchAudit.securityBoundary.allowedRootsScope,
+  "mcp_session_management_only"
+);
+assert.match(isolatedLaunchAudit.securityBoundary.warning, /did not verify/i);
+assert.deepEqual(isolatedLaunchAudit.toolPolicy.requested, {
+  tools: "Read,Grep,Bash",
+  allowedTools: "Read,Grep",
+  disallowedTools: "Edit,Write",
+});
+assert.equal(isolatedLaunchAudit.toolPolicy.argvDelivered, true);
+assert.equal(isolatedLaunchAudit.toolPolicy.effectiveMainSessionPolicy, "unverified");
+assert.equal(isolatedLaunchAudit.subagentTelemetry.status, "unavailable");
+assert.equal(isolatedLaunchAudit.subagentTelemetry.costUsd, null);
+
+const tmuxLaunchAudit = launchAuditReceipt({
+  requested: { permissionMode: "dontAsk" },
+  resolved: { permissionMode: "dontAsk" },
+  args: null,
+  platform: "linux",
+});
+assert.equal(
+  tmuxLaunchAudit.evidenceScope,
+  "posture_without_persisted_launch_argv"
+);
+assert.equal(
+  tmuxLaunchAudit.securityBoundary.childEnvironment,
+  "unknown_legacy_tmux_child_environment"
+);
+assert.equal(
+  tmuxLaunchAudit.securityBoundary.childEnvironmentEvidence,
+  "unavailable"
+);
+assert.equal(tmuxLaunchAudit.toolPolicy.argvDelivered, false);
+assert.deepEqual(tmuxLaunchAudit.toolPolicy.requested, {
+  tools: null,
+  allowedTools: null,
+  disallowedTools: null,
+});
+assert.equal(tmuxLaunchAudit.securityBoundary.warning, null);
+
+const recordedTmuxLaunchAudit = launchAuditReceipt({
+  requested: { permissionMode: "dontAsk" },
+  resolved: { permissionMode: "dontAsk" },
+  args: ["--permission-mode=dontAsk"],
+  platform: "linux",
+  launchEnvironment: {
+    status: "compatible",
+    evidenceScope: "claude_child_launch_environment",
+    effortOverrideStatus: "unset",
+    workflowsDisabled: false,
+    blockers: [],
+    note: "Synthetic recorded launch environment.",
+  },
+});
+assert.equal(
+  recordedTmuxLaunchAudit.securityBoundary.childEnvironment,
+  "tmux_session_environment_with_explicit_claude_overrides"
+);
+assert.equal(
+  recordedTmuxLaunchAudit.securityBoundary.childEnvironmentEvidence,
+  "persisted_claude_child_launch_environment"
+);
 
 const launchMetadata = {
   cwd: process.cwd(),
@@ -254,6 +575,32 @@ assert.deepEqual(compareLaunchMetadata(launchMetadata, { ...launchMetadata }), {
   comparison: "match",
   launchMismatch: false,
 });
+assert.deepEqual(
+  compareLaunchMetadata(
+    {
+      ...launchMetadata,
+      args: ["--debug-file=C:\\state\\first.log", "--permission-mode=manual"],
+    },
+    {
+      ...launchMetadata,
+      args: ["--debug-file=C:\\state\\second.log", "--permission-mode=manual"],
+    }
+  ),
+  { comparison: "match", launchMismatch: false }
+);
+assert.deepEqual(
+  compareLaunchMetadata(
+    {
+      ...launchMetadata,
+      args: ["--debug-file", "C:\\state\\first.log", "--permission-mode=manual"],
+    },
+    {
+      ...launchMetadata,
+      args: ["--debug-file", "C:\\state\\second.log", "--permission-mode=manual"],
+    }
+  ),
+  { comparison: "match", launchMismatch: false }
+);
 assert.deepEqual(
   compareLaunchMetadata(launchMetadata, { ...launchMetadata, args: ["--permission-mode", "plan"] }),
   { comparison: "mismatch", launchMismatch: true }
@@ -365,6 +712,15 @@ assert.deepEqual(
     requiresPolicyAcknowledgement: true,
     readAtProcessStart: true,
     relaunchRequiredAfterChange: true,
+    securityBoundary: {
+      platform: process.platform,
+      isolationClaim: "none",
+      osIsolationVerified: false,
+      filesystemBoundary: "none_verified_by_mcp",
+      allowedRootsScope: "mcp_session_management_only",
+      warning:
+        "bypassPermissions can modify host resources available to Claude without approval prompts.",
+    },
   }
 );
 assert.deepEqual(
@@ -385,6 +741,15 @@ assert.deepEqual(
     requiresPolicyAcknowledgement: true,
     readAtProcessStart: true,
     relaunchRequiredAfterChange: true,
+    securityBoundary: {
+      platform: process.platform,
+      isolationClaim: "operator_asserted",
+      osIsolationVerified: false,
+      filesystemBoundary: "none_verified_by_mcp",
+      allowedRootsScope: "mcp_session_management_only",
+      warning:
+        "The isolated policy value is an operator assertion; this MCP does not verify an OS isolation boundary.",
+    },
   }
 );
 for (const invalidPolicy of ["", "yes", "I_UNDERSTAND_THIS_REQUIRES_ISOLATION "]) {

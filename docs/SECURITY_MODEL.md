@@ -65,15 +65,23 @@ available so a policy change cannot trap an elevated session.
 current prompt; it does not change permission policy.
 
 For report-only reviews, prefer `permissionMode: "dontAsk"` when advertised,
-pass `disallowedTools: ["Edit", "Write", "NotebookEdit"]`, verify
-repository and index state before and after, and use an explicit prompt
-prohibiting edits, installs, commits, pushes,
-configuration changes, and commands that create artifacts. `dontAsk`
+pass `disallowedTools: ["Edit", "Write", "NotebookEdit"]`, verify repository
+and index state before and after, and use an explicit prompt prohibiting edits,
+installs, commits, pushes, configuration changes, and commands that create
+artifacts. `dontAsk`
 automatically denies new permission requests while allowing read-only
 inspection. `plan` is a compatibility fallback, but its approval workflow is
 not the report: never approve implementation from a report-only review. No
 interactive mode is a zero-write OS sandbox; Claude and the MCP still maintain
 local logs, terminal state, and caches.
+
+`tools`, `allowedTools`, and `disallowedTools` constrain Claude's built-in tool
+set. They do not remove or authenticate the effective roster of MCP and
+connector tools. A session can therefore retain mutating connector tools even
+when `Edit`, `Write`, and `NotebookEdit` are denied. This MCP does not currently
+offer a verified strict MCP-config launch mode. Treat report-only as a reviewed
+operating posture, verify the roster when possible, and use an isolated
+worktree or read-only copy when hard write isolation is required.
 
 ## Scope Restrictions
 
@@ -96,9 +104,19 @@ path that is still inside a currently configured root. Cleanup returns only a
 minimal managed name/state, never terminal capture. Older broker records
 without canonical provenance fail closed under configured roots.
 
+Allowed roots are an MCP working-directory and session-management boundary.
+They are not a Claude filesystem sandbox. An `Isolated` bypass policy is also
+only an operator assertion: the MCP does not verify a VM, container, Windows
+Sandbox, restricted token, or filesystem boundary. Launch receipts report
+`osIsolationVerified: false` and warn that bypass can modify every host resource
+available to the Claude process.
+
 Claude's `tools`, `allowedTools`, and `disallowedTools` flags are passed through
-to Claude Code. They complement, but do not replace, working-directory,
-permission, and prompt controls.
+to Claude Code. Launch receipts preserve the requested argv rules but leave
+effective enforcement and delegated-agent coverage unverified. These flags
+complement, but do not replace, working-directory, permission, and prompt
+controls. They cover built-in tools only and do not by themselves suppress MCP
+or connector tools.
 
 ## Broker And Concurrency
 
@@ -176,6 +194,13 @@ Responses separate:
 - posture observed from Claude's JSONL session log or terminal
 - the evidence source for each observation
 
+The `resolved` object is validated launch argv, not proof that a model alias
+resolved without fallback. The additive `audit` receipt records that semantic
+boundary, requested tool argv, unverified isolation, and unavailable
+per-subagent telemetry. Current Claude session logs do not provide a trustworthy
+per-subagent model, permission, fallback, tool, token, or dollar-cost receipt,
+so those fields remain unknown instead of being inferred.
+
 Do not report an unobserved field as confirmed. Session-log evidence is stronger
 than terminal heuristics, but neither is an authenticated Anthropic control
 plane. When Claude records `xhigh` for a successfully resolved direct
@@ -204,11 +229,19 @@ append-only; it does not claim to authenticate against another local process
 deliberately rewriting an oversized skipped middle while preserving both
 boundary guards. Trailing JSON records are buffered in chunks with an 8 MiB
 per-record and 32 MiB process-wide bound shared by cached and concurrently
-loading fragments. An overflow is discarded to the next record boundary but
-remains fail-closed because its workflow content was not observed; a later
-counter cannot silently clear that evidence gap.
-The cache is bounded and is not broker or tmux posture persistence.
-Terminal-only posture
+loading fragments. An overflow is discarded to the next record boundary while
+retaining explicit partial-history evidence. A later complete UltraCode
+transition or authoritative workflow counter may restore that current field;
+it does not rewrite the unobserved historical range as complete.
+The runtime-observation cache is bounded and is not broker or tmux posture
+persistence. Exact result paging uses a separate process-local cache for
+record-scoped IDs. It retains at most four entries and no more than 40 Mi
+UTF-16 code units in aggregate. It refreshes a five-minute expiry only after the
+same regular session-log file has unchanged identity, size, and timestamps.
+Any log change, file replacement, eviction, or MCP restart forces a fresh
+bounded read.
+The cache contains result text already available through the MCP and is never
+persisted to the broker, tmux metadata, or disk. Terminal-only posture
 heuristics are returned for the current capture but are not persisted as
 durable observation. Legacy broker or tmux `observedPosture` metadata remains
 read-compatible for migration but is excluded from public lifecycle responses.
@@ -220,6 +253,18 @@ launches explicitly set `CLAUDE_CONFIG_DIR`, the two UltraCode-relevant Claude
 environment variables, and `FORCE_COLOR` for the child instead of trusting a
 possibly older tmux-server copy. No raw value is added to public posture or
 managed metadata.
+
+For current native Windows launches, the Claude child inherits the MCP process
+environment plus explicit launch overrides. For current Linux/macOS launches,
+the child receives the tmux session environment plus explicit Claude launch
+overrides, and an existing tmux server can retain its own environment. The
+audit receipt reports that model only when sanitized child-launch environment
+evidence was persisted. Legacy launch metadata without that evidence reports
+the child environment as unknown rather than applying current behavior
+retroactively. Treat both MCP registration and terminal-server environments as
+part of the Claude trust boundary and keep unrelated secrets out of them;
+changing to a strict allowlist requires a separately reviewed compatibility
+design.
 
 Capability inspection calibrates the requested UltraCode parser probe against
 an invalid control by process exit status. Timeout and signal termination are
@@ -249,6 +294,7 @@ Never commit:
 - Claude JSONL transcripts
 - Remote Control URLs
 - broker tokens or logs
+- opt-in Claude debug logs under the MCP state directory
 - API keys, OAuth tokens, or `.env` files
 - private customer or business data
 
@@ -262,6 +308,18 @@ content and any recorded URL, so use it only for a selected conversation.
 The MCP captures Remote Control URLs produced by Claude Code; it does not
 implement Anthropic's private Remote Control protocol. Treat every URL as a
 sensitive live-session link.
+
+`start_remote_control` can opt into Claude's `--debug-file` support. The MCP
+creates a unique regular file and sidecar receipt under its state directory.
+The receipt binds file identity to the managed-session name, debug filter, and
+exact launch argv hash. The MCP reports provenance and size and never returns
+contents. Debug logs
+may contain prompts, paths, tool activity, and environment-adjacent data. They
+persist for operator-controlled evidence handling and have no automatic
+retention deletion. Unix owner-only creation modes are requested. Windows uses
+`ready_acl_unverified`, not `ready`, because Node mode bits do not prove a
+restrictive ACL; account-level state-directory permissions remain part of the
+trust boundary.
 
 Archive operations only maintain MCP-local sidecars. They never modify, move,
 truncate, or delete Claude's transcript.

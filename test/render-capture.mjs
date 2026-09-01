@@ -10,6 +10,7 @@ import {
   signalsWithWorkflowActivity,
   trustedSessionLogPosture,
   workflowObservationStatusFields,
+  workspaceTrustMenuState,
 } from "../src/index.js";
 
 const cursorStyleProbe = "\x1b[>0q\x1b]0;claude\x07\x1b[38;2;215;119;87mHello";
@@ -183,6 +184,31 @@ assert.equal(captureSignals(workspaceTrustScreen).state, "workspace_trust_requir
 const currentWorkspaceTrustScreen =
   "Quick safety check: Is this a project you created or one you trust?\n> 1. Yes, I trust this folder\n  2. No, exit";
 assert.equal(captureSignals(currentWorkspaceTrustScreen).state, "workspace_trust_required");
+assert.deepEqual(workspaceTrustMenuState(currentWorkspaceTrustScreen), {
+  detected: true,
+  selected: "yes",
+  navigationKey: null,
+});
+const noFirstWorkspaceTrustScreen = [
+  "Quick safety check: Is this a project you created or one you trust?",
+  "> No, exit",
+  "  Yes, I trust this folder",
+].join("\n");
+assert.deepEqual(workspaceTrustMenuState(noFirstWorkspaceTrustScreen), {
+  detected: true,
+  selected: "no",
+  navigationKey: "Down",
+});
+const noSecondWorkspaceTrustScreen = [
+  "Do you trust the files in this folder?",
+  "  Yes, I trust",
+  "> No, exit",
+].join("\n");
+assert.deepEqual(workspaceTrustMenuState(noSecondWorkspaceTrustScreen), {
+  detected: true,
+  selected: "no",
+  navigationKey: "Up",
+});
 assert.equal(captureSignals("Assistant quoted: Do you trust the files in this folder?\n> ").workspaceTrustPrompt, false);
 const quotedTrustScreen = [
   "● The report quoted:",
@@ -214,6 +240,49 @@ assert.equal(ultracodeSignals.ultracodeUnavailable, false);
 assert.equal(
   captureSignals("✦ ultracode · xhigh effort + dynamic workflows for maximum thoroughness").effortIndicator,
   "ultracode"
+);
+const currentClaudeLaunchBanner = [
+  "Claude Code v2.1.251",
+  "Fable 5 with xhigh effort · Claude Max",
+  "bypass permissions on (shift+tab to cycle)  ·  PR #53",
+  "effort: ultracode · xhigh effort + dynamic workflows for maximum thoroughness",
+  "/rc",
+].join("\n");
+const currentClaudeLaunchSignals = captureSignals(currentClaudeLaunchBanner);
+assert.equal(currentClaudeLaunchSignals.permissionModeIndicator, "bypassPermissions");
+assert.equal(currentClaudeLaunchSignals.effortIndicator, "ultracode");
+assert.equal(currentClaudeLaunchSignals.ultracodeActive, true);
+assert.equal(
+  captureSignals("Working with high effort can improve a difficult review.").effortIndicator,
+  ""
+);
+assert.equal(
+  captureSignals("bypass permissions on this machine is a posture description").permissionModeIndicator,
+  ""
+);
+assert.equal(
+  launchPostureReport(
+    { permissionMode: "bypassPermissions", effort: "xhigh", ultracode: true },
+    { permissionMode: "bypassPermissions", effort: "xhigh", ultracode: true },
+    currentClaudeLaunchSignals
+  ).verification,
+  "ultracode_observed_terminal_heuristic"
+);
+assert.equal(
+  captureSignals(
+    "> Fable 5 with xhigh effort · Claude Max\n> bypass permissions on\n> effort: ultracode · xhigh effort + dynamic workflows"
+  ).effortIndicator,
+  ""
+);
+assert.equal(
+  captureSignals(
+    "> Fable 5 with xhigh effort · Claude Max\n> bypass permissions on\n> effort: ultracode · xhigh effort + dynamic workflows"
+  ).permissionModeIndicator,
+  ""
+);
+assert.equal(
+  captureSignals("- Fable 5 with xhigh effort · Claude Max\nyou: bypass permissions on").effortIndicator,
+  ""
 );
 assert.equal(
   captureSignals("⎿  Set effort level to ultracode (this session only): xhigh + dynamic workflow orchestration")
@@ -380,6 +449,328 @@ assert.equal(currentLaunchObservation.model, "claude-current");
 assert.equal(currentLaunchObservation.effort, "high");
 assert.equal(currentLaunchObservation.ultracode, null);
 assert.equal(currentLaunchObservation.workflowActivity.state, "not_observed");
+const timestampLessStartupObservation = runtimeObservationFromRecords(
+  [
+    {
+      type: "permission-mode",
+      sessionId: postureSessionId,
+      permissionMode: "bypassPermissions",
+    },
+    {
+      type: "system",
+      subtype: "bridge_status",
+      timestamp: "2026-07-29T12:00:01Z",
+      sessionId: postureSessionId,
+      version: "2.1.251",
+    },
+    {
+      type: "attachment",
+      timestamp: "2026-07-29T12:00:02Z",
+      sessionId: postureSessionId,
+      version: "2.1.251",
+      attachment: { type: "ultra_effort_enter", reminderType: "full" },
+    },
+  ],
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+  }
+);
+assert.equal(timestampLessStartupObservation.permissionMode, "bypassPermissions");
+assert.equal(timestampLessStartupObservation.claudeVersion, "2.1.251");
+assert.equal(timestampLessStartupObservation.ultracode, true);
+assert.equal(timestampLessStartupObservation.ultraEffortAttachment.observed, true);
+assert.equal(
+  timestampLessStartupObservation.ultraEffortAttachment.observedAt,
+  "2026-07-29T12:00:02Z"
+);
+assert.equal(timestampLessStartupObservation.ultraEffortAttachment.active, true);
+assert.equal(timestampLessStartupObservation.ultraEffortAttachment.lifecycle, "active");
+assert.deepEqual(
+  timestampLessStartupObservation.ultraEffortAttachment.lastTransition,
+  { direction: "enter", at: "2026-07-29T12:00:02Z" }
+);
+assert.equal(timestampLessStartupObservation.ultraEffortAttachment.enterCount, 1);
+assert.equal(timestampLessStartupObservation.ultraEffortAttachment.exitCount, 0);
+assert.deepEqual(
+  timestampLessStartupObservation.ultraEffortAttachment.transitionEvents,
+  [{ direction: "enter", at: "2026-07-29T12:00:02Z" }]
+);
+assert.equal(
+  timestampLessStartupObservation.ultraEffortAttachment.evidence,
+  "claude_session_log"
+);
+assert.equal(
+  timestampLessStartupObservation.evidence.claudeVersion,
+  "claude_session_log"
+);
+const untimestampedUltraObservation = runtimeObservationFromRecords(
+  [
+    {
+      type: "system",
+      timestamp: "2026-07-29T12:00:01Z",
+      sessionId: postureSessionId,
+      version: "2.1.251",
+    },
+    {
+      type: "attachment",
+      sessionId: postureSessionId,
+      attachment: { type: "ultra_effort_enter", reminderType: "full" },
+    },
+    {
+      type: "system",
+      timestamp: "2026-07-29T12:00:02Z",
+      sessionId: postureSessionId,
+      version: "2.1.251",
+    },
+  ],
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+  }
+);
+assert.equal(untimestampedUltraObservation.ultraEffortAttachment.active, true);
+assert.equal(untimestampedUltraObservation.ultraEffortAttachment.lastEnterAt, "");
+assert.deepEqual(
+  untimestampedUltraObservation.ultraEffortAttachment.transitionEvents,
+  [{ direction: "enter", at: "" }]
+);
+const untimestampedExitAtEof = runtimeObservationFromRecords(
+  [
+    {
+      type: "attachment",
+      timestamp: "2026-07-29T12:00:02Z",
+      sessionId: postureSessionId,
+      attachment: { type: "ultra_effort_enter", reminderType: "full" },
+    },
+    {
+      type: "attachment",
+      sessionId: postureSessionId,
+      attachment: { type: "ultra_effort_exit", reminderType: "full" },
+    },
+  ],
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+  }
+);
+assert.equal(untimestampedExitAtEof.ultraEffortAttachment.active, false);
+assert.equal(untimestampedExitAtEof.ultraEffortAttachment.lastExitAt, "");
+assert.deepEqual(
+  untimestampedExitAtEof.ultraEffortAttachment.transitionEvents.at(-1),
+  { direction: "exit", at: "" }
+);
+const untimestampedDuplicateEnter = runtimeObservationFromRecords(
+  [
+    {
+      type: "attachment",
+      timestamp: "2026-07-29T12:00:02Z",
+      sessionId: postureSessionId,
+      attachment: { type: "ultra_effort_enter", reminderType: "full" },
+    },
+    {
+      type: "attachment",
+      sessionId: postureSessionId,
+      attachment: { type: "ultra_effort_enter", reminderType: "full" },
+    },
+  ],
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+  }
+);
+assert.equal(
+  untimestampedDuplicateEnter.ultraEffortAttachment.observedAt,
+  "2026-07-29T12:00:02Z"
+);
+assert.equal(
+  untimestampedDuplicateEnter.ultraEffortAttachment.lastEnterAt,
+  "2026-07-29T12:00:02Z"
+);
+assert.deepEqual(
+  untimestampedDuplicateEnter.ultraEffortAttachment.lastTransition,
+  { direction: "enter", at: "2026-07-29T12:00:02Z" }
+);
+const overflowedUntimestampedStartup = runtimeObservationFromRecords(
+  [
+    ...Array.from({ length: 129 }, () => ({
+      type: "attachment",
+      sessionId: postureSessionId,
+      attachment: { type: "ultra_effort_enter", reminderType: "full" },
+    })),
+    {
+      type: "system",
+      timestamp: "2026-07-29T12:00:02Z",
+      sessionId: postureSessionId,
+      version: "2.1.251",
+    },
+  ],
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+  }
+);
+assert.equal(overflowedUntimestampedStartup.ultraEffortAttachment.active, true);
+assert.equal(
+  overflowedUntimestampedStartup.ultraEffortAttachment.historyCoverage,
+  "partial"
+);
+assert.equal(
+  overflowedUntimestampedStartup.ultraEffortAttachment.countsAreLowerBound,
+  true
+);
+const ultraLifecycleObservation = runtimeObservationFromRecords(
+  [
+    {
+      type: "attachment",
+      timestamp: "2026-07-29T12:00:02Z",
+      sessionId: postureSessionId,
+      attachment: { type: "ultra_effort_enter", reminderType: "full" },
+    },
+    {
+      type: "attachment",
+      timestamp: "2026-07-29T12:00:03Z",
+      sessionId: postureSessionId,
+      attachment: { type: "ultra_effort_enter", reminderType: "full" },
+    },
+    {
+      type: "attachment",
+      timestamp: "2026-07-29T12:00:04Z",
+      sessionId: postureSessionId,
+      attachment: { type: "ultra_effort_exit", reminderType: "full" },
+    },
+    {
+      type: "attachment",
+      timestamp: "2026-07-29T12:00:05Z",
+      sessionId: postureSessionId,
+      attachment: { type: "workflow_keyword_request" },
+    },
+    {
+      type: "attachment",
+      timestamp: "2026-07-29T12:00:06Z",
+      sessionId: postureSessionId,
+      attachment: { type: "ultra_effort_enter", reminderType: "full" },
+    },
+  ],
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+  }
+);
+assert.equal(ultraLifecycleObservation.ultracode, true);
+assert.equal(ultraLifecycleObservation.ultraEffortAttachment.lifecycle, "active");
+assert.equal(ultraLifecycleObservation.ultraEffortAttachment.enterCount, 3);
+assert.equal(ultraLifecycleObservation.ultraEffortAttachment.exitCount, 1);
+assert.equal(
+  ultraLifecycleObservation.ultraEffortAttachment.workflowKeywordRequestCount,
+  1
+);
+assert.deepEqual(ultraLifecycleObservation.ultraEffortAttachment.lastTransition, {
+  direction: "enter",
+  at: "2026-07-29T12:00:06Z",
+});
+assert.deepEqual(ultraLifecycleObservation.ultraEffortAttachment.transitionEvents, [
+  { direction: "enter", at: "2026-07-29T12:00:02Z" },
+  { direction: "enter", at: "2026-07-29T12:00:03Z" },
+  { direction: "exit", at: "2026-07-29T12:00:04Z" },
+  { direction: "enter", at: "2026-07-29T12:00:06Z" },
+]);
+const boundedUltraTransitionHistory = runtimeObservationFromRecords(
+  Array.from({ length: 70 }, (_, index) => ({
+    type: "attachment",
+    timestamp: `2026-07-29T12:10:${String(index % 60).padStart(2, "0")}Z`,
+    sessionId: postureSessionId,
+    attachment: {
+      type: index % 2 === 0 ? "ultra_effort_enter" : "ultra_effort_exit",
+      reminderType: "full",
+    },
+  })),
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+  }
+);
+assert.equal(boundedUltraTransitionHistory.ultraEffortAttachment.enterCount, 35);
+assert.equal(boundedUltraTransitionHistory.ultraEffortAttachment.exitCount, 35);
+assert.equal(
+  boundedUltraTransitionHistory.ultraEffortAttachment.transitionEvents.length,
+  64
+);
+assert.equal(
+  boundedUltraTransitionHistory.ultraEffortAttachment.transitionEventsOmitted,
+  6
+);
+assert.equal(
+  boundedUltraTransitionHistory.ultraEffortAttachment.transitionHistoryTruncated,
+  true
+);
+const ultraExitedObservation = runtimeObservationFromRecords(
+  [
+    {
+      type: "attachment",
+      timestamp: "2026-07-29T12:00:02Z",
+      sessionId: postureSessionId,
+      attachment: { type: "ultra_effort_enter", reminderType: "full" },
+    },
+    {
+      type: "attachment",
+      timestamp: "2026-07-29T12:00:03Z",
+      sessionId: postureSessionId,
+      attachment: { type: "ultra_effort_exit", reminderType: "full" },
+    },
+  ],
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+  }
+);
+assert.equal(ultraExitedObservation.ultracode, false);
+assert.equal(ultraExitedObservation.evidence.ultracode, "claude_session_log");
+assert.equal(
+  ultraExitedObservation.ultraEffortAttachment.lifecycle,
+  "inactive_exited"
+);
+const ultraExitedPosture = launchPostureReport(
+  { effort: "xhigh", ultracode: true, ultracodeMechanism: "effort" },
+  { effort: "xhigh", ultracode: true, ultracodeMechanism: "effort" },
+  captureSignals("Current effort level: extra\n> "),
+  ultraExitedObservation
+);
+assert.equal(ultraExitedPosture.observed.ultracode, false);
+assert.equal(ultraExitedPosture.ultracodeAssessment.status, "exited_after_entry");
+assert.equal(ultraExitedPosture.ultracodeAssessment.conflict, false);
+const resumedTimestampLessObservation = runtimeObservationFromRecords(
+  [
+    {
+      type: "permission-mode",
+      sessionId: postureSessionId,
+      permissionMode: "bypassPermissions",
+    },
+    {
+      type: "system",
+      timestamp: "2026-07-29T11:00:00Z",
+      sessionId: postureSessionId,
+      version: "2.1.200",
+    },
+    {
+      type: "permission-mode",
+      sessionId: postureSessionId,
+      permissionMode: "manual",
+    },
+    {
+      type: "system",
+      timestamp: "2026-07-29T12:00:01Z",
+      sessionId: postureSessionId,
+      version: "2.1.251",
+    },
+  ],
+  {
+    resolvedSessionId: postureSessionId,
+    startedAtMs: postureLaunchMs,
+  }
+);
+assert.equal(resumedTimestampLessObservation.permissionMode, "manual");
+assert.equal(resumedTimestampLessObservation.claudeVersion, "2.1.251");
 const ultracodeRuntimeObservation = runtimeObservationFromRecords(
   [
     {
@@ -661,7 +1052,7 @@ assert.equal(
     .ultracodeAssessment.status,
   "rejected_terminal_heuristic"
 );
-const sessionEvidenceOutranksTerminalRejection = launchPostureReport(
+const sessionEvidenceConflictsWithTerminalRejection = launchPostureReport(
   { ultracode: true },
   { ultracode: true },
   unavailableUltracodeSignals,
@@ -679,10 +1070,76 @@ const sessionEvidenceOutranksTerminalRejection = launchPostureReport(
   }
 );
 assert.equal(
-  sessionEvidenceOutranksTerminalRejection.ultracodeAssessment.status,
-  "runtime_setting_observed"
+  sessionEvidenceConflictsWithTerminalRejection.ultracodeAssessment.status,
+  "terminal_rejection_conflict"
 );
-assert.equal(sessionEvidenceOutranksTerminalRejection.observed.ultracode, true);
+assert.equal(
+  sessionEvidenceConflictsWithTerminalRejection.ultracodeAssessment.attentionStatus,
+  "terminal_rejection_conflict"
+);
+assert.equal(sessionEvidenceConflictsWithTerminalRejection.observed.ultracode, true);
+const attachmentLifecycleConflictsWithTerminalRejection = launchPostureReport(
+  { ultracode: true },
+  { ultracode: true },
+  unavailableUltracodeSignals,
+  ultraLifecycleObservation
+);
+assert.equal(
+  attachmentLifecycleConflictsWithTerminalRejection.ultracodeAssessment.status,
+  "terminal_rejection_conflict"
+);
+assert.equal(
+  attachmentLifecycleConflictsWithTerminalRejection.ultracodeAssessment.lifecycle,
+  "active"
+);
+assert.equal(attachmentLifecycleConflictsWithTerminalRejection.observed.ultracode, true);
+const activeLifecycleWithMaxConflict = launchPostureReport(
+  { ultracode: true },
+  { ultracode: true },
+  captureSignals("Current effort level: max\n> "),
+  ultraLifecycleObservation
+);
+assert.equal(
+  activeLifecycleWithMaxConflict.ultracodeAssessment.status,
+  "conflicting_effort_evidence"
+);
+assert.equal(activeLifecycleWithMaxConflict.ultracodeAssessment.lifecycle, "active");
+assert.equal(activeLifecycleWithMaxConflict.ultracodeAssessment.conflict, true);
+const activeLifecycleWithBlockingEnvironment = launchPostureReport(
+  { ultracode: true },
+  { ultracode: true },
+  captureSignals("> "),
+  ultraLifecycleObservation,
+  {
+    launchEnvironment: {
+      status: "blocking",
+      effortOverrideStatus: "non_xhigh",
+      workflowsDisabled: false,
+      blockers: ["non_xhigh_effort_override"],
+    },
+  }
+);
+assert.equal(
+  activeLifecycleWithBlockingEnvironment.ultracodeAssessment.status,
+  "environment_blocked"
+);
+assert.equal(
+  activeLifecycleWithBlockingEnvironment.ultracodeAssessment.lifecycle,
+  "active"
+);
+const manuallyActivatedUltracode = launchPostureReport(
+  { ultracode: false },
+  { ultracode: false },
+  captureSignals("> "),
+  ultraLifecycleObservation
+);
+assert.equal(
+  manuallyActivatedUltracode.ultracodeAssessment.status,
+  "attachment_lifecycle_active"
+);
+assert.equal(manuallyActivatedUltracode.ultracodeAssessment.launchStatus, "not_requested");
+assert.equal(manuallyActivatedUltracode.observed.ultracode, true);
+assert.equal(manuallyActivatedUltracode.ultracodeAssessment.lifecycle, "active");
 assert.deepEqual(
   publicLaunchMetadata({
     schemaVersion: 3,

@@ -24,13 +24,19 @@ MCP process.
 
 Use `permissionMode: "dontAsk"` when the installed Claude CLI advertises it,
 pass `disallowedTools: ["Edit", "Write", "NotebookEdit"]`, leave workspace
-trust false unless explicitly authorized, and include a report-only prompt.
-Record repository and index state before and after the review; prompt wording is
-not an operating-system sandbox while shell inspection remains available.
-
-This denies new permission requests while letting Claude return a direct report instead of ending at plan approval.
+trust false unless explicitly authorized, and include an explicit report-only
+prompt. Record repository and index state before and after the review; prompt
+wording is not an operating-system sandbox while shell inspection remains
+available. This denies new permission requests while letting Claude return a
+direct report instead of ending at plan approval.
 Use `plan` only as a compatibility fallback, and never approve implementation
 from a report-only review.
+
+`disallowedTools` and `tools` constrain built-in Claude tools only. Connected
+MCP and connector tools can remain available, and the current MCP does not
+claim a verified strict MCP-config roster. Inspect the effective roster when
+possible, retain explicit no-mutation instructions, and use an isolated
+worktree or read-only copy when connector-level write isolation is required.
 
 ```text
 Report only. Do not edit files, commit, push, install packages, change
@@ -47,6 +53,8 @@ transcript result over scraping the animated terminal. Use
 `capture_remote_control` for trust, approval, limit,
 interruption, or terminal-state diagnosis. Treat `tool_use` as in progress,
 and check `textTruncated` before treating an unusually large answer as complete.
+Use `get_claude_result` with the opaque, record-scoped `resultId` for exact
+chunks and verify the separate `textSha256` content hash after the last chunk.
 A completed turn can also carry an additive `attention` warning; preserve the
 answer and handle that weaker warning separately. `workflowPending: true`
 keeps the wait active even if an assistant completion record is present.
@@ -71,8 +79,10 @@ For a development task where the operator has explicitly requested bypass:
 ```
 
 The MCP process must already have the local-host or isolated bypass policy
-acknowledgement. Bypass removes Claude approval prompts; inspect the working
-tree and test results after Claude finishes.
+acknowledgement. `Isolated` is an operator assertion, not an MCP-verified OS or
+filesystem boundary, and allowed roots limit MCP session management rather
+than Claude's filesystem access. Bypass removes Claude approval prompts;
+inspect the working tree and test results after Claude finishes.
 
 Ultracode is requested through the dedicated boolean, not the ordinary
 `effort` field or a prompt keyword. Current supported Claude builds use

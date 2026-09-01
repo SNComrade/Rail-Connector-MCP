@@ -37,6 +37,7 @@ try {
     "archive_claude_session",
     "capture_remote_control",
     "get_claude_capabilities",
+    "get_claude_result",
     "get_claude_session",
     "list_claude_sessions",
     "rename_claude_session",
@@ -63,10 +64,15 @@ try {
   assert.ok(startTool.inputSchema.properties.ultracode);
   assert.ok(startTool.inputSchema.properties.confirmUltracode);
   assert.ok(startTool.inputSchema.properties.confirmBypassPermissions);
+  assert.ok(startTool.inputSchema.properties.debug);
+  assert.ok(startTool.inputSchema.properties.debugFilter);
   assert.ok(startTool.inputSchema.properties.permissionMode.enum.includes("manual"));
   const listTool = tools.tools.find((tool) => tool.name === "list_claude_sessions");
   assert.ok(listTool.inputSchema.properties.includeRemoteUrls);
   assert.ok(listTool.inputSchema.properties.archiveState);
+  const resultTool = tools.tools.find((tool) => tool.name === "get_claude_result");
+  assert.ok(resultTool.inputSchema.properties.resultId);
+  assert.equal(resultTool.inputSchema.properties.maxCharacters.maximum, 64 * 1024);
   console.log("TOOLS", toolNames.join(", "));
 
   const sessions = await client.callTool(
