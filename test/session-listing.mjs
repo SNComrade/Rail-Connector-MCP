@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import {
   createPortableWaitCursor,
   inspectSessionFile,
@@ -257,7 +258,20 @@ assert.deepEqual(parsePortableWaitCursor(portableWaitCursor), {
   submittedAfterMs: Date.parse("2026-07-29T12:01:00Z"),
   resolvedSessionId: "34343434-3434-4343-8343-343434343434",
   generationId: "45454545-4545-4454-8454-454545454545",
+  startedAtMs: null,
 });
+const generationBoundWaitCursor = createPortableWaitCursor(
+  settledBaseline,
+  {
+    generationId: "45454545-4545-4454-8454-454545454545",
+    startedAtMs: Date.parse("2026-07-29T12:00:00Z"),
+  },
+  Date.parse("2026-07-29T12:01:00Z")
+);
+assert.equal(
+  parsePortableWaitCursor(generationBoundWaitCursor).startedAtMs,
+  Date.parse("2026-07-29T12:00:00Z")
+);
 assert.throws(
   () => parsePortableWaitCursor("rail:v2:not-valid-json"),
   (error) => error?.code === "EINVAL"
@@ -1184,6 +1198,118 @@ try {
     false
   );
   assert.equal((await setSessionArchiveState(lifecycleDir, lifecycleId, false, stateDir)).status, "unarchived");
+
+  const archiveLock = `${markerPath}.lock`;
+  const syntheticFsError = (code) => Object.assign(new Error(`synthetic archive lock ${code}`), { code });
+  async function withArchiveLockFaults(faults, check) {
+    const originalOpen = fs.promises.open;
+    const originalStat = fs.promises.stat;
+    const originalUnlink = fs.promises.unlink;
+    const originalNow = Object.getOwnPropertyDescriptor(performance, "now");
+    const calls = { open: 0, stat: 0, unlink: 0 };
+    fs.promises.open = async (file, ...args) => {
+      if (file !== archiveLock) return originalOpen(file, ...args);
+      calls.open += 1;
+      if (calls.open > 4) throw new Error("archive retry deadline was bypassed");
+      const error = faults.open?.(calls.open);
+      if (error) throw error;
+      const ownedHandle = await originalOpen(file, ...args);
+      return faults.writeError ? {
+        writeFile: async () => { throw faults.writeError; },
+        close: () => ownedHandle.close(),
+      } : ownedHandle;
+    };
+    fs.promises.stat = async (file, ...args) => {
+      if (file !== archiveLock) return originalStat(file, ...args);
+      calls.stat += 1;
+      const result = faults.stat?.(calls.stat);
+      if (result instanceof Error) throw result;
+      return result ?? originalStat(file, ...args);
+    };
+    fs.promises.unlink = async (file, ...args) => {
+      if (file !== archiveLock) return originalUnlink(file, ...args);
+      calls.unlink += 1;
+      if (!faults.skipUnlink) return originalUnlink(file, ...args);
+    };
+    if (faults.advanceClock) {
+      let now = -6000;
+      Object.defineProperty(performance, "now", { configurable: true, value: () => (now += 6000) });
+    }
+    try {
+      await check(() => setSessionArchiveState(lifecycleDir, lifecycleId, true, stateDir), calls);
+    } finally {
+      fs.promises.open = originalOpen;
+      fs.promises.stat = originalStat;
+      fs.promises.unlink = originalUnlink;
+      if (originalNow) Object.defineProperty(performance, "now", originalNow);
+      else delete performance.now;
+    }
+  }
+
+  const deniedOpen = syntheticFsError("EACCES");
+  await withArchiveLockFaults({ open: () => deniedOpen }, async (archive, calls) => {
+    await assert.rejects(archive, (error) => error === deniedOpen);
+    assert.deepEqual(calls, { open: 1, stat: 0, unlink: 0 });
+  });
+  const deniedWrite = syntheticFsError("EPERM");
+  await withArchiveLockFaults({ writeError: deniedWrite }, async (archive, calls) => {
+    await assert.rejects(archive, (error) => error === deniedWrite);
+    assert.deepEqual(calls, { open: 1, stat: 0, unlink: 1 });
+  });
+  assert.equal(fs.existsSync(archiveLock), false, "failed owner write must release only its acquired lock");
+  assert.equal(fs.existsSync(markerPath), false, "permission failures must not archive a session");
+
+  const contention = syntheticFsError("EEXIST");
+  for (const state of ["missing", "fresh", "stale"]) {
+    await withArchiveLockFaults({
+      open: () => contention,
+      stat: () => state === "missing" ? syntheticFsError("ENOENT") : {
+        mtimeMs: Date.now() - (state === "stale" ? 61000 : 0),
+      },
+      skipUnlink: true,
+      advanceClock: true,
+    }, async (archive, calls) => {
+      await assert.rejects(archive, (error) => error.code === "ETIMEDOUT" && error.cause === contention);
+      assert.equal(calls.open, 2, `${state} lock retries must respect the same deadline`);
+      assert.equal(calls.unlink, state === "stale" ? 2 : 0, "only stale locks may be removed");
+    });
+  }
+
+  const windowsSharing = syntheticFsError("EPERM");
+  if (process.platform === "win32") {
+    await withArchiveLockFaults({
+      open: (attempt) => attempt === 1 ? windowsSharing : null,
+      stat: () => syntheticFsError("ENOENT"),
+    }, async (archive, calls) => {
+      assert.equal((await archive()).status, "archived");
+      assert.equal(calls.open, 2, "a disappearing Windows lock may be acquired on the next attempt");
+    });
+    await setSessionArchiveState(lifecycleDir, lifecycleId, false, stateDir);
+    await withArchiveLockFaults({
+      open: () => windowsSharing,
+      stat: () => syntheticFsError("ENOENT"),
+      advanceClock: true,
+    }, async (archive, calls) => {
+      await assert.rejects(archive, (error) => error.code === "ETIMEDOUT" && error.cause === windowsSharing);
+      assert.equal(calls.open, 2, "persistent EPERM must fail with the original cause, without permission changes");
+    });
+    const deniedStat = syntheticFsError("EACCES");
+    await withArchiveLockFaults({ open: () => windowsSharing, stat: () => deniedStat }, async (archive) => {
+      await assert.rejects(archive, (error) => error === deniedStat);
+    });
+  } else {
+    await withArchiveLockFaults({ open: () => windowsSharing }, async (archive, calls) => {
+      await assert.rejects(archive, (error) => error === windowsSharing);
+      assert.equal(calls.open, 1, "EPERM retries are Windows-specific");
+    });
+  }
+  assert.equal(fs.existsSync(markerPath), false, "exhausted acquisition must not run the archive mutation");
+  fs.writeFileSync(archiveLock, "synthetic stale owner\n");
+  const staleTime = new Date(Date.now() - 61000);
+  fs.utimesSync(archiveLock, staleTime, staleTime);
+  assert.equal((await setSessionArchiveState(lifecycleDir, lifecycleId, true, stateDir)).status, "archived");
+  assert.equal(fs.existsSync(archiveLock), false, "a real stale lock must still be recovered and released");
+  await setSessionArchiveState(lifecycleDir, lifecycleId, false, stateDir);
 
   const isolationDir = path.join(root, "isolation");
   const targetId = "44444444-4444-4444-8444-444444444444";

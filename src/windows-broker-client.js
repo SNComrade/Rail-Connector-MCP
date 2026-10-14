@@ -7,12 +7,16 @@ import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 export const WINDOWS_BROKER_PROTOCOL = 1;
-export const WINDOWS_BROKER_VERSION = "1.0.0-beta.3+broker.3";
+// Exact stop identity adds broker-enforced fields. Keep the compatibility
+// version strict so a client cannot send them to an already-running older
+// broker that would ignore the fields.
+export const WINDOWS_BROKER_VERSION = "1.0.0-beta.4+broker.4";
 const BROKER_START_TIMEOUT_MS = 15000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_BROKER_LOG_BYTES = 2 * 1024 * 1024;
 const BROKER_READY_CACHE_TTL_MS = 1000;
+const BROKER_TOKEN_RE = /^[0-9a-f]{64}$/i;
 const COMPATIBILITY_CLEANUP_OPERATIONS = new Set([
   "acquireCleanupLease",
   "releaseCleanupLease",
@@ -65,12 +69,22 @@ export function windowsBrokerPaths(env = process.env, token = "") {
   };
 }
 
+function readBrokerTokenFile(paths) {
+  const stat = fs.lstatSync(paths.tokenFile);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    const error = new Error("The Windows broker token must be a regular file.");
+    error.code = "EAUTH";
+    throw error;
+  }
+  return fs.readFileSync(paths.tokenFile, "utf8").trim();
+}
+
 function ensureBrokerToken(paths) {
   fs.mkdirSync(paths.stateDir, { recursive: true, mode: 0o700 });
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
-      const existing = fs.readFileSync(paths.tokenFile, "utf8").trim();
-      if (existing.length >= 32) return existing;
+      const existing = readBrokerTokenFile(paths);
+      if (BROKER_TOKEN_RE.test(existing)) return existing;
       try {
         fs.unlinkSync(paths.tokenFile);
       } catch (error) {
@@ -91,6 +105,26 @@ function ensureBrokerToken(paths) {
     }
   }
   throw new Error(`Unable to establish a valid Windows broker token file: ${paths.tokenFile}`);
+}
+
+function readExistingBrokerToken(paths) {
+  let token;
+  try {
+    token = readBrokerTokenFile(paths);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      const unavailable = new Error("No Windows broker token is available.");
+      unavailable.code = "ENOENT";
+      throw unavailable;
+    }
+    throw error;
+  }
+  if (!BROKER_TOKEN_RE.test(token)) {
+    const error = new Error("The Windows broker token is invalid.");
+    error.code = "EAUTH";
+    throw error;
+  }
+  return token;
 }
 
 function requestOnce(
@@ -380,7 +414,12 @@ async function stopInactiveBroker(
 
 async function readyBrokerPaths(env, startIfMissing) {
   const tokenPaths = windowsBrokerPaths(env);
-  const token = ensureBrokerToken(tokenPaths);
+  // A no-start request is a read-only availability check. In particular,
+  // conditional stops must not create, replace, or repair a shared broker
+  // token before they have proved the requested generation.
+  const token = startIfMissing
+    ? ensureBrokerToken(tokenPaths)
+    : readExistingBrokerToken(tokenPaths);
   const paths = windowsBrokerPaths(env, token);
   const launchPolicyFingerprint =
     windowsBrokerLaunchPolicyFingerprint(env);
@@ -463,22 +502,7 @@ export async function windowsBrokerCleanupRequest(
     throw error;
   }
   const tokenPaths = windowsBrokerPaths(env);
-  let token;
-  try {
-    token = fs.readFileSync(tokenPaths.tokenFile, "utf8").trim();
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      const unavailable = new Error("No Windows broker token is available.");
-      unavailable.code = "ENOENT";
-      throw unavailable;
-    }
-    throw error;
-  }
-  if (token.length < 32) {
-    const error = new Error("The Windows broker token is invalid.");
-    error.code = "EAUTH";
-    throw error;
-  }
+  const token = readExistingBrokerToken(tokenPaths);
   const paths = windowsBrokerPaths(env, token);
   try {
     return await requestOnce(
@@ -499,12 +523,11 @@ export async function probeWindowsBroker(env = process.env) {
   const tokenPaths = windowsBrokerPaths(env);
   let token;
   try {
-    token = fs.readFileSync(tokenPaths.tokenFile, "utf8").trim();
+    token = readExistingBrokerToken(tokenPaths);
   } catch (error) {
-    if (error.code === "ENOENT") return null;
+    if (["ENOENT", "EAUTH"].includes(error.code)) return null;
     throw error;
   }
-  if (token.length < 32) return null;
   const paths = windowsBrokerPaths(env, token);
   const launchPolicyFingerprint =
     windowsBrokerLaunchPolicyFingerprint(env);

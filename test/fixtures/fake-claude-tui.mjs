@@ -1,13 +1,35 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { recordFixtureProcess } from "./fixture-process-ledger.mjs";
+
+function recordExitTrace(event, detail = {}) {
+  const file = process.env.RAIL_FAKE_CLAUDE_EXIT_TRACE;
+  if (!file) return;
+  try {
+    fs.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), pid: process.pid, event, ...detail })}\n`);
+  } catch { /* Optional diagnostics never change fixture exit behavior. */ }
+}
+if (process.env.RAIL_FAKE_CLAUDE_EXIT_TRACE) {
+  recordExitTrace("starting");
+  process.on("exit", (code) => recordExitTrace("exit", { code }));
+}
+await recordFixtureProcess();
 
 const argv = process.argv.slice(2);
+recordExitTrace("arguments", { sessionId: argumentValue("--session-id"), probe: argv.includes("--help") || argv.includes("--version") });
 
 function effortOverrideStatus(value) {
   const normalized = String(value ?? "").trim().toLowerCase();
   if (!normalized) return "unset";
   return normalized === "xhigh" ? "compatible_xhigh" : "other";
+}
+
+function promptSuggestionStatus(value) {
+  if (value === undefined || String(value).trim() === "") return "unset";
+  if (value === "false") return "disabled";
+  if (value === "true") return "enabled";
+  return "other";
 }
 
 function recordInvocation() {
@@ -28,6 +50,9 @@ function recordInvocation() {
       workflowsDisabled:
         process.env.CLAUDE_CODE_DISABLE_WORKFLOWS === "1",
       forceColor: process.env.FORCE_COLOR === "1" ? "enabled" : "other",
+      promptSuggestion: promptSuggestionStatus(
+        process.env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION
+      ),
     },
   };
   fs.writeFileSync(
@@ -93,6 +118,11 @@ if (argv.includes("--version")) {
   process.exit(0);
 }
 
+if (process.env.RAIL_FAKE_CLAUDE_EXIT_ON_START === "1") {
+  process.stderr.write("fixture exited before Remote Control became ready\n");
+  process.exit(23);
+}
+
 const debugFile = argumentValue("--debug-file");
 if (debugFile) {
   fs.appendFileSync(
@@ -106,18 +136,88 @@ process.stdin.setEncoding("utf8");
 if (process.stdin.isTTY && process.stdin.setRawMode) process.stdin.setRawMode(true);
 
 let input = "";
+let pastePending = false;
+let wire = "";
+let bracketedPasteMode = true;
+let disabledAfterKeywordPrefix = false;
+let disabledAfterKeywordBody = false;
+const disableBracketedPasteAfterKeywordPrefix =
+  process.env.RAIL_FAKE_CLAUDE_DISABLE_PASTE_AFTER_KEYWORD_PREFIX === "1";
+const disableBracketedPasteAfterKeywordBody =
+  process.env.RAIL_FAKE_CLAUDE_DISABLE_PASTE_AFTER_KEYWORD_BODY === "1";
+// Node 20 on Windows reads the console in plain raw mode and never sees the
+// paste markers, so the windows-broker test uses this unframed trigger there.
+const disableBracketedPasteAfterUnframedKeywordBody =
+  process.env.RAIL_FAKE_CLAUDE_DISABLE_PASTE_AFTER_UNFRAMED_KEYWORD_BODY === "1";
+const wireReceipt = process.env.RAIL_FAKE_CLAUDE_WIRE_RECEIPT || "";
+const tuiBanner = process.env.RAIL_FAKE_CLAUDE_BANNER || "Fake Claude TUI";
+function recordWire(chunk) {
+  if (!wireReceipt) return;
+  fs.appendFileSync(wireReceipt, `${JSON.stringify(String(chunk))}\n`, {
+    flag: "a",
+  });
+}
 process.stdout.write(
-  "\x1b[>0q\x1b[?2004hFake Claude TUI\r\nhttps://claude.ai/code/fake_tui\r\n> "
+  `\x1b[>0q\x1b[?2004h${tuiBanner}\r\nhttps://claude.ai/code/fake_tui\r\n> `
 );
+recordExitTrace("ready");
 
 process.stdin.on("data", (chunk) => {
-  input += chunk.replaceAll("\x1b[200~", "").replaceAll("\x1b[201~", "");
-  for (;;) {
-    const submit = input.search(/[\r\n]/);
-    if (submit < 0) break;
-    const command = input.slice(0, submit).trim();
-    input = input.slice(submit + 1);
+  recordWire(chunk);
+  wire += chunk;
+  // Model bracketed paste correctly: embedded newlines stay in the composer,
+  // while a literal CR/LF submits. Frames may be split across ConPTY reads.
+  let commands = [];
+  while (wire.length) {
+    if (bracketedPasteMode && wire.startsWith("\x1b[200~")) { pastePending = true; wire = wire.slice(6); continue; }
+    if (bracketedPasteMode && wire.startsWith("\x1b[201~")) { pastePending = false; wire = wire.slice(6); continue; }
+    if (bracketedPasteMode && ("\x1b[200~".startsWith(wire) || "\x1b[201~".startsWith(wire))) break;
+    const char = wire[0];
+    wire = wire.slice(1);
+    if (!pastePending && /[\r\n]/.test(char)) { commands.push(input); input = ""; }
+    else {
+      input += char;
+      if (
+        disableBracketedPasteAfterKeywordPrefix &&
+        !disabledAfterKeywordPrefix &&
+        !pastePending &&
+        input === "ultracode:"
+      ) {
+        disabledAfterKeywordPrefix = true;
+        bracketedPasteMode = false;
+        process.stdout.write("\x1b[?2004l");
+      }
+      if (
+        disableBracketedPasteAfterKeywordBody &&
+        !disabledAfterKeywordBody &&
+        pastePending &&
+        input.startsWith("ultracode:") &&
+        input.length > "ultracode:".length
+      ) {
+        disabledAfterKeywordBody = true;
+        bracketedPasteMode = false;
+        process.stdout.write("\x1b[?2004l");
+      }
+      if (
+        disableBracketedPasteAfterUnframedKeywordBody &&
+        !disabledAfterKeywordBody &&
+        input.startsWith("ultracode:") &&
+        input.length > "ultracode:".length
+      ) {
+        disabledAfterKeywordBody = true;
+        bracketedPasteMode = false;
+        process.stdout.write("\x1b[?2004l");
+      }
+    }
+  }
+  for (const submitted of commands) {
+    const command = submitted.trim();
+    if (command.startsWith("ultracode:")) {
+      process.stdout.write(`\r\nKEYWORD_ACK:${JSON.stringify(submitted)}\r\n> `);
+      continue;
+    }
     if (command === "/exit") {
+      recordExitTrace("exit_command", { ignored: process.env.RAIL_CONNECTOR_FAKE_CLAUDE_IGNORE_EXIT === "1" });
       if (process.env.RAIL_CONNECTOR_FAKE_CLAUDE_IGNORE_EXIT === "1") {
         process.stdout.write("\r\nIGNORED_EXIT\r\n> ");
         continue;

@@ -50,6 +50,7 @@ const expectedFiles = new Set([
   "package.json",
   "README.md",
   "SECURITY.md",
+  "src/claude-command-resolution.js",
   "src/index.js",
   "src/terminal.js",
   "src/windows-broker-client.js",

@@ -8,8 +8,14 @@ import os from "node:os";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
+import { performance } from "node:perf_hooks";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
+import { workflowKeywordPrefixLength } from "./terminal.js";
+import {
+  resolveNormalLaunchDescriptor,
+  resolveProductClaudeLaunchDescriptor,
+} from "./claude-command-resolution.js";
 import {
   railConnectorStateDir,
   probeWindowsBroker,
@@ -27,11 +33,13 @@ const CLAUDE_CONFIG_DIR = path.resolve(
 const DEFAULT_CWD = HOME;
 const DEFAULT_MANAGED_SESSION = "rail-connector-managed";
 const DEFAULT_REMOTE_NAME = "Rail-Connector";
-export const SERVER_VERSION = "1.0.0-beta.3";
+export const SERVER_VERSION = "1.0.0-beta.4";
 const IS_NATIVE_WINDOWS = process.platform === "win32";
 const REMOTE_URL_RE = /https:\/\/claude\.ai\/code\/[A-Za-z0-9_:-]+/;
 const DEFAULT_TEXT_CHUNK_SIZE = 2048;
 const DEFAULT_TEXT_CHUNK_DELAY_MS = 10;
+// Matches the Windows broker's per-chunk observation window in keyword mode.
+const KEYWORD_MODE_OBSERVATION_MS = 100;
 const DEFAULT_SUBMIT_RETRY_DELAY_MS = 1200;
 const SUBMIT_RETRY_VISIBILITY_POLLS = 4;
 const MCP_PROCESS_STARTED_AT = new Date().toISOString();
@@ -109,6 +117,7 @@ const CLAUDE_CHILD_ENVIRONMENT_KEYS = [
   "CLAUDE_CODE_EFFORT_LEVEL",
   "CLAUDE_CODE_DISABLE_WORKFLOWS",
 ];
+const PROMPT_SUGGESTION_ENV = "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION";
 const CLAUDE_DEBUG_FILTER_RE = /^[A-Za-z0-9_.*!:,-]{1,256}$/;
 const CLAUDE_DEBUG_RECEIPT_SCHEMA_VERSION = 2;
 const MAX_ULTRA_EFFORT_TRANSITION_EVENTS = 64;
@@ -137,6 +146,80 @@ function text(data) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// This barrier is deliberately test-only: it is disabled unless the synthetic
+// test process sets NODE_ENV and arms an exact stage/identity file. It never
+// changes a broker request or a generation decision; it can only pause the
+// caller until the test releases it, or fail closed on malformed/timed-out
+// control data. Keeping the hook here lets regression tests prove that the
+// public paired operations reject a replacement injected between their own
+// metadata/lease checks and the following broker action.
+async function pairedBoundaryTestHook(stage, sessionName, expectedGeneration) {
+  const hookDir =
+    process.env.NODE_ENV === "test"
+      ? String(process.env.RAIL_TEST_PAIRED_BOUNDARY_HOOK_DIR ?? "")
+      : "";
+  if (!hookDir || !expectedGeneration) return;
+  const armPath = path.join(hookDir, `${stage}.arm.json`);
+  if (!fs.existsSync(armPath)) return;
+  let arm;
+  try {
+    arm = JSON.parse(fs.readFileSync(armPath, "utf8"));
+  } catch {
+    const error = new Error(`Synthetic paired-boundary hook ${stage} has malformed control data.`);
+    error.code = "ETESTBOUNDARY";
+    throw error;
+  }
+  if (
+    arm?.sessionName !== sessionName ||
+    arm?.expectedGenerationId !== expectedGeneration.expectedGenerationId ||
+    arm?.expectedStartedAtMs !== expectedGeneration.expectedStartedAtMs
+  ) {
+    return;
+  }
+  const claimedPath = path.join(hookDir, `${stage}.claimed.json`);
+  const enteredPath = path.join(hookDir, `${stage}.entered.json`);
+  const releasePath = path.join(hookDir, `${stage}.release.json`);
+  try {
+    fs.renameSync(armPath, claimedPath);
+  } catch (cause) {
+    const error = new Error(`Synthetic paired-boundary hook ${stage} could not claim its control data.`);
+    error.code = "ETESTBOUNDARY";
+    error.cause = cause;
+    throw error;
+  }
+  const token = randomUUID();
+  fs.writeFileSync(
+    enteredPath,
+    `${JSON.stringify({
+      stage,
+      sessionName,
+      expectedGenerationId: expectedGeneration.expectedGenerationId,
+      expectedStartedAtMs: expectedGeneration.expectedStartedAtMs,
+      token,
+    })}\n`,
+    { flag: "wx" }
+  );
+  const deadline = Date.now() + 10000;
+  while (Date.now() <= deadline) {
+    if (fs.existsSync(releasePath)) {
+      try {
+        const release = JSON.parse(fs.readFileSync(releasePath, "utf8"));
+        if (release?.token === token) {
+          fs.rmSync(releasePath, { force: true });
+          fs.rmSync(claimedPath, { force: true });
+          return;
+        }
+      } catch {
+        // Keep waiting: only the exact test-owned release token can proceed.
+      }
+    }
+    await sleep(10);
+  }
+  const error = new Error(`Synthetic paired-boundary hook ${stage} was not released in time.`);
+  error.code = "ETESTBOUNDARY";
+  throw error;
 }
 
 export async function withSessionOperationLock(sessionName, operation) {
@@ -182,6 +265,102 @@ export function managedSessionName(input) {
       : input.managedSession ?? DEFAULT_MANAGED_SESSION;
   assertSafeManagedSessionName(name);
   return name;
+}
+
+const BROKER_GENERATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function stopExpectationError(message) {
+  const error = new Error(message);
+  error.code = "EINVAL";
+  return error;
+}
+
+/**
+ * Return the optional caller-owned Windows broker generation binding for a
+ * stop.  A partial binding is unsafe: it could name a replacement that reused
+ * only one of the two observable fields.
+ */
+export function expectedManagedGeneration(input = {}) {
+  const expectedGenerationId = input.expectedGenerationId;
+  const expectedStartedAtMs = input.expectedStartedAtMs;
+  const hasGeneration = expectedGenerationId !== undefined && expectedGenerationId !== null;
+  const hasStartedAt = expectedStartedAtMs !== undefined && expectedStartedAtMs !== null;
+  if (!hasGeneration && !hasStartedAt) return null;
+  if (!hasGeneration || !hasStartedAt) {
+    throw stopExpectationError(
+      "expectedGenerationId and expectedStartedAtMs must be supplied together."
+    );
+  }
+  if (
+    typeof expectedGenerationId !== "string" ||
+    !BROKER_GENERATION_ID_RE.test(expectedGenerationId)
+  ) {
+    throw stopExpectationError("expectedGenerationId must be a broker UUID.");
+  }
+  if (
+    !Number.isSafeInteger(expectedStartedAtMs) ||
+    expectedStartedAtMs <= 0
+  ) {
+    throw stopExpectationError(
+      "expectedStartedAtMs must be a positive safe integer timestamp."
+    );
+  }
+  return { expectedGenerationId, expectedStartedAtMs };
+}
+
+// Retain the original export for callers that adopted the first conditional
+// stop API. The same pair now protects every review-operation mutation/read.
+export const expectedStopGeneration = expectedManagedGeneration;
+
+/**
+ * Optional stronger stop identity. Existing generation-pair callers retain
+ * their behavior; when either extra field is supplied, all four identity
+ * fields must bind the one broker operation.
+ */
+export function expectedStopIdentity(input = {}) {
+  const expectedGeneration = expectedManagedGeneration(input);
+  const expectedResolvedSessionId = input.expectedResolvedSessionId;
+  const expectedCanonicalCwd = input.expectedCanonicalCwd;
+  const hasSessionId =
+    expectedResolvedSessionId !== undefined && expectedResolvedSessionId !== null;
+  const hasCwd =
+    expectedCanonicalCwd !== undefined && expectedCanonicalCwd !== null;
+  if (!hasSessionId && !hasCwd) return expectedGeneration;
+  if (!expectedGeneration || !hasSessionId || !hasCwd) {
+    throw stopExpectationError(
+      "expectedGenerationId, expectedStartedAtMs, expectedResolvedSessionId, and expectedCanonicalCwd must be supplied together."
+    );
+  }
+  if (typeof expectedResolvedSessionId !== "string" || !SESSION_ID_RE.test(expectedResolvedSessionId)) {
+    throw stopExpectationError("expectedResolvedSessionId must be a Claude session UUID.");
+  }
+  if (typeof expectedCanonicalCwd !== "string" || !path.isAbsolute(expectedCanonicalCwd)) {
+    throw stopExpectationError("expectedCanonicalCwd must be an absolute canonical path.");
+  }
+  return {
+    ...expectedGeneration,
+    expectedResolvedSessionId,
+    expectedCanonicalCwd: normalizeAbsoluteForPathCompare(expectedCanonicalCwd),
+  };
+}
+
+function requireNativeGenerationBinding(expectedGeneration) {
+  if (expectedGeneration && !IS_NATIVE_WINDOWS) {
+    const error = new Error(
+      "expectedGenerationId and expectedStartedAtMs are supported only by the native Windows broker."
+    );
+    error.code = "EUNSUPPORTED";
+    throw error;
+  }
+}
+
+function generationMatchesMetadata(metadata, expectedGeneration) {
+  return Boolean(
+    metadata &&
+      expectedGeneration &&
+      metadata.generationId === expectedGeneration.expectedGenerationId &&
+      metadata.startedAtMs === expectedGeneration.expectedStartedAtMs
+  );
 }
 
 function normalizeForPathCompare(value) {
@@ -368,8 +547,14 @@ function createSessionSummaryState() {
     workflowLastObservedAt: "",
     pendingWorkflowCount: null,
     pendingWorkflowUpdatedAt: "",
+    workflowPendingCounterObservation: null,
     activeWorkflowTaskIds: new Set(),
+    activeWorkflowRunIds: new Map(),
+    activeWorkflowLaunchTimestamps: new Map(),
     unidentifiedPendingWorkflowCount: 0,
+    workflowSnapshotCandidates: new Map(),
+    workflowSnapshotConflicts: new Set(),
+    workflowSnapshotCompletionCount: 0,
     workflowObservationUncertain: false,
     searchTextParts: [],
   };
@@ -388,6 +573,8 @@ const WORKFLOW_TERMINAL_RETRIEVAL_STATUSES = new Set([
   "canceled",
   "interrupted",
 ]);
+// Claude's task notifications report a stopped task as "killed" (CLI
+// 2.1.289). Any other status, such as "blocked", keeps the workflow pending.
 const WORKFLOW_TERMINAL_TASK_STATUSES = new Set([
   "completed",
   "succeeded",
@@ -396,38 +583,115 @@ const WORKFLOW_TERMINAL_TASK_STATUSES = new Set([
   "cancelled",
   "canceled",
   "interrupted",
+  "killed",
 ]);
 const WORKFLOW_LAUNCH_STATUSES = new Set([
   ...WORKFLOW_PENDING_LAUNCH_STATUSES,
   "completed",
   "succeeded",
 ]);
+const MAX_WORKFLOW_SNAPSHOT_CANDIDATES = 32;
+// Measured on this owner's CLI 2.1.247-2.1.288 history: snapshot start precedes
+// the async_launched record by 3-55 ms. The window binds the snapshot to that
+// launch while tolerating slow hosts and small clock adjustments.
+const WORKFLOW_SNAPSHOT_START_BEFORE_LAUNCH_MS = 30_000;
+const WORKFLOW_SNAPSHOT_START_AFTER_LAUNCH_MS = 5_000;
 
 function completeTrackedWorkflowTask(state, taskId, timestamp = "") {
   if (!taskId || !state.activeWorkflowTaskIds.has(taskId)) return false;
   state.activeWorkflowTaskIds.delete(taskId);
+  state.activeWorkflowRunIds.delete(taskId);
+  state.activeWorkflowLaunchTimestamps.delete(taskId);
+  state.workflowSnapshotCandidates.delete(taskId);
+  state.workflowSnapshotConflicts.delete(taskId);
   state.pendingWorkflowCount = Math.max(
     state.activeWorkflowTaskIds.size + state.unidentifiedPendingWorkflowCount,
     Math.max(0, (state.pendingWorkflowCount ?? 1) - 1)
   );
-  state.pendingWorkflowUpdatedAt = timestamp;
-  state.workflowLastObservedAt = timestamp;
+  recordWorkflowObservedAt(state, timestamp);
+  state.pendingWorkflowUpdatedAt = state.workflowLastObservedAt;
   return true;
 }
 
+// CLI 2.1.289 has no TaskOutput tool. It reports a finished background task
+// with a <task-notification> that Claude itself records, either as a user
+// record or as a queued_command attachment, marked by the record-level
+// origin {kind: "task-notification"} that typed prompt text cannot set. Only
+// the leading header is read (task ID, optional tool-use ID and output file,
+// then status), so worker output later in the notification cannot supply it.
+const TASK_NOTIFICATION_HEADER_RE =
+  /^\s*<task-notification>\s*<task-id>([A-Za-z0-9_-]{1,128})<\/task-id>\s*(?:<tool-use-id>[^<]{0,256}<\/tool-use-id>\s*)?(?:<output-file>[^<]{0,2048}<\/output-file>\s*)?<status>([a-z_]{1,32})<\/status>/;
+
+export function workflowTaskNotification(record) {
+  let text = null;
+  if (
+    record?.type === "user" &&
+    record.origin?.kind === "task-notification" &&
+    record.isSidechain !== true
+  ) {
+    text = firstTextFromMessage(record.message);
+  } else if (
+    record?.type === "attachment" &&
+    record.attachment?.type === "queued_command" &&
+    record.attachment.commandMode === "task-notification" &&
+    record.attachment.origin?.kind === "task-notification"
+  ) {
+    text = record.attachment.prompt;
+  }
+  if (typeof text !== "string") return null;
+  const match = TASK_NOTIFICATION_HEADER_RE.exec(text);
+  return match ? { taskId: match[1], status: match[2] } : null;
+}
+
+// The real TaskOutput retrievals on record (CLI 2.1.275) carry task_id but no run
+// ID, while every async_launched record carries both and each task ID maps to
+// one run. A retrieval may therefore omit the run ID when its task matches a
+// launch that bound one; a run ID that is present must still match.
+function workflowTerminalIdentityMatches(
+  state,
+  taskId,
+  runId = "",
+  { allowMissingRunId = false } = {}
+) {
+  if (!taskId || !state.activeWorkflowTaskIds.has(taskId)) return false;
+  if (
+    !state.activeWorkflowRunIds.has(taskId) ||
+    !state.activeWorkflowLaunchTimestamps.has(taskId)
+  ) {
+    return false;
+  }
+  const expectedRunId = state.activeWorkflowRunIds.get(taskId);
+  const launchTimestampMs = state.activeWorkflowLaunchTimestamps.get(taskId);
+  return (
+    Boolean(expectedRunId) &&
+    (runId ? runId === expectedRunId : allowMissingRunId) &&
+    Number.isFinite(launchTimestampMs)
+  );
+}
+
+function timestampMs(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string" || !value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function workflowReleaseIsCurrent(state, timestamp = "") {
+  const candidateTimestampMs = Date.parse(timestamp);
+  if (!Number.isFinite(candidateTimestampMs) || candidateTimestampMs > Date.now()) {
+    return false;
+  }
   const latestTimestampMs = Date.parse(state.workflowLastObservedAt);
   if (!Number.isFinite(latestTimestampMs)) return true;
-  const candidateTimestampMs = Date.parse(timestamp);
-  return (
-    Number.isFinite(candidateTimestampMs) &&
-    candidateTimestampMs >= latestTimestampMs
-  );
+  return candidateTimestampMs >= latestTimestampMs;
 }
 
 function recordWorkflowObservedAt(state, timestamp = "") {
   const currentTimestampMs = Date.parse(state.workflowLastObservedAt);
   const candidateTimestampMs = Date.parse(timestamp);
+  if (!Number.isFinite(candidateTimestampMs) || candidateTimestampMs > Date.now()) {
+    return;
+  }
   if (
     !Number.isFinite(currentTimestampMs) ||
     (Number.isFinite(candidateTimestampMs) &&
@@ -517,15 +781,22 @@ function recordUltraEffortTransition(state, direction, timestamp = "") {
 async function withManagedMutationLock(
   sessionName,
   operation,
-  { allowMissingBackend = false } = {}
+  { allowMissingBackend = false, expectedGeneration = null, startsSession = false } = {}
 ) {
   return withSessionOperationLock(sessionName, async () => {
-    if (!IS_NATIVE_WINDOWS) return operation();
+    if (!IS_NATIVE_WINDOWS) return operation({});
+    if (expectedGeneration !== null) {
+      expectedStopGeneration(expectedGeneration);
+    }
     const leaseId = randomUUID();
     const deadline = Date.now() + 30000;
     let leaseReservedForStart = false;
     let hasBrokerLease = false;
-    let queuedGenerationId = null;
+    let queuedGenerationId = expectedGeneration?.expectedGenerationId ?? null;
+    let queuedStartedAtMs = expectedGeneration?.expectedStartedAtMs ?? null;
+    let leasedGeneration = null;
+    let awaitingStartedGeneration = false;
+    let startTransitionBegun = false;
     for (;;) {
       let result;
       try {
@@ -536,6 +807,8 @@ async function withManagedMutationLock(
             leaseId,
             ttlMs: BROKER_LEASE_TTL_MS,
             expectedGenerationId: queuedGenerationId,
+            expectedStartedAtMs: queuedStartedAtMs,
+            requireExactPair: Boolean(expectedGeneration),
           },
           { startIfMissing: false }
         );
@@ -548,10 +821,17 @@ async function withManagedMutationLock(
               leaseId,
               ttlMs: BROKER_LEASE_TTL_MS,
               expectedGenerationId: queuedGenerationId,
+              expectedStartedAtMs: queuedStartedAtMs,
+              requireExactPair: Boolean(expectedGeneration),
             },
             { startIfMissing: true }
           );
         } else if (brokerUnavailable(error)) {
+          if (expectedGeneration) {
+            // A generation-bound operation must never fall through to a local
+            // name-only operation when the broker cannot prove its lease.
+            throw error;
+          }
           if (allowMissingBackend) {
             brokerMutationLeases.set(sessionName, leaseId);
             leaseReservedForStart = true;
@@ -565,12 +845,62 @@ async function withManagedMutationLock(
       if (!queuedGenerationId && result.generationId) {
         queuedGenerationId = result.generationId;
       }
+      if (queuedStartedAtMs === null && Number.isSafeInteger(result.startedAtMs)) {
+        queuedStartedAtMs = result.startedAtMs;
+      }
       if (result.status === "acquired") {
+        if (
+          typeof result.generationId !== "string" ||
+          !result.generationId ||
+          !Number.isSafeInteger(result.startedAtMs)
+        ) {
+          const error = new Error("Broker lease did not return a complete generation binding.");
+          error.code = "ELEASE";
+          throw error;
+        }
+        leasedGeneration = {
+          expectedGenerationId: result.generationId,
+          expectedStartedAtMs: result.startedAtMs,
+        };
+        if (
+          expectedGeneration &&
+          (result.generationId !== expectedGeneration.expectedGenerationId ||
+            result.startedAtMs !== expectedGeneration.expectedStartedAtMs)
+        ) {
+          // An older or inconsistent broker must not turn an exact caller
+          // binding into a name-only mutation lease.
+          try {
+            await windowsBrokerRequest(
+              "releaseLease",
+              {
+                sessionName,
+                leaseId,
+                ...leasedGeneration,
+                requireExactPair: Boolean(expectedGeneration),
+              },
+              { startIfMissing: false, timeoutMs: 5000 }
+            );
+          } catch {
+            // The broker lease is bounded. Refuse the mutation either way.
+          }
+          const error = new Error(
+            `Managed session generation changed for ${sessionName}; refusing a stale mutation lease.`
+          );
+          error.code = "ESTALE";
+          throw error;
+        }
         brokerMutationLeases.set(sessionName, leaseId);
         hasBrokerLease = true;
         break;
       }
       if (result.status === "not_running") {
+        if (expectedGeneration) {
+          const error = new Error(
+            `Managed session generation changed for ${sessionName}; refusing a stale mutation lease.`
+          );
+          error.code = "ESTALE";
+          throw error;
+        }
         if (allowMissingBackend) {
           brokerMutationLeases.set(sessionName, leaseId);
           leaseReservedForStart = true;
@@ -587,6 +917,8 @@ async function withManagedMutationLock(
     let renewalPromise = Promise.resolve();
     const renewalTimer = hasBrokerLease ? setInterval(() => {
       if (
+        awaitingStartedGeneration ||
+        !leasedGeneration ||
         renewalError ||
         brokerMutationLeases.get(sessionName) !== leaseId
       ) {
@@ -596,7 +928,13 @@ async function withManagedMutationLock(
         try {
           const result = await windowsBrokerRequest(
             "renewLease",
-            { sessionName, leaseId, ttlMs: BROKER_LEASE_TTL_MS },
+            {
+              sessionName,
+              leaseId,
+              ttlMs: BROKER_LEASE_TTL_MS,
+              ...leasedGeneration,
+              requireExactPair: Boolean(expectedGeneration),
+            },
             { startIfMissing: false, timeoutMs: 5000 }
           );
           if (
@@ -618,7 +956,36 @@ async function withManagedMutationLock(
     }, BROKER_LEASE_RENEW_INTERVAL_MS) : null;
     renewalTimer?.unref?.();
     try {
-      const result = await operation();
+      const result = await operation({
+        beginStartTransition: async () => {
+          if (!startsSession || startTransitionBegun) {
+            throw new Error("Broker start transition is not available for this mutation.");
+          }
+          startTransitionBegun = true;
+          awaitingStartedGeneration = true;
+          await renewalPromise;
+          if (renewalError) throw renewalError;
+        },
+        bindStartedGeneration: (generationId, startedAtMs) => {
+          if (!startsSession || !startTransitionBegun) {
+            throw new Error("Only a broker start may replace its lease binding.");
+          }
+          const binding = expectedManagedGeneration({
+            expectedGenerationId: generationId,
+            expectedStartedAtMs: startedAtMs,
+          });
+          if (!binding) {
+            const error = new Error("Broker start did not return a complete generation binding.");
+            error.code = "ELEASE";
+            throw error;
+          }
+          leasedGeneration = binding;
+          queuedGenerationId = binding.expectedGenerationId;
+          queuedStartedAtMs = binding.expectedStartedAtMs;
+          leaseReservedForStart = false;
+          awaitingStartedGeneration = false;
+        },
+      });
       await renewalPromise;
       if (renewalError) throw renewalError;
       return result;
@@ -627,14 +994,21 @@ async function withManagedMutationLock(
       await renewalPromise;
       if (brokerMutationLeases.get(sessionName) === leaseId) {
         brokerMutationLeases.delete(sessionName);
-        try {
-          await windowsBrokerRequest(
-            "releaseLease",
-            { sessionName, leaseId },
-            { startIfMissing: false, timeoutMs: 5000 }
-          );
-        } catch {
-          // The broker or session may have exited with the operation.
+        if (leasedGeneration) {
+          try {
+            await windowsBrokerRequest(
+              "releaseLease",
+              {
+                sessionName,
+                leaseId,
+                ...leasedGeneration,
+                requireExactPair: Boolean(expectedGeneration),
+              },
+              { startIfMissing: false, timeoutMs: 5000 }
+            );
+          } catch {
+            // The broker or original generation may have exited or changed.
+          }
         }
       }
     }
@@ -1046,6 +1420,49 @@ function addSessionRecord(
     typeof workflowResult?.taskId === "string" && workflowResult.taskId
       ? workflowResult.taskId
       : "";
+  const workflowRunId =
+    typeof workflowResult?.runId === "string" && workflowResult.runId
+      ? workflowResult.runId
+      : "";
+  const retrievedWorkflowTaskId =
+    typeof workflowResult?.task?.task_id === "string"
+      ? workflowResult.task.task_id
+      : "";
+  const retrievedWorkflowRunId =
+    typeof workflowResult?.task?.run_id === "string" &&
+    workflowResult.task.run_id
+      ? workflowResult.task.run_id
+      : typeof workflowResult?.task?.runId === "string" &&
+          workflowResult.task.runId
+        ? workflowResult.task.runId
+        : typeof workflowResult?.runId === "string" && workflowResult.runId
+          ? workflowResult.runId
+          : "";
+  const directWorkflowTerminal =
+    workflowResult?.taskType === "local_workflow" &&
+    WORKFLOW_TERMINAL_TASK_STATUSES.has(workflowResult.status);
+  const retrievedWorkflowTaskStatus =
+    typeof workflowResult?.task?.status === "string"
+      ? workflowResult.task.status
+      : "";
+  const retrievedWorkflowTerminal =
+    Boolean(retrievedWorkflowTaskId) &&
+    WORKFLOW_TERMINAL_RETRIEVAL_STATUSES.has(workflowResult?.retrieval_status) &&
+    (!retrievedWorkflowTaskStatus ||
+      WORKFLOW_TERMINAL_TASK_STATUSES.has(retrievedWorkflowTaskStatus));
+  const directTerminalIdentityMatches =
+    !directWorkflowTerminal ||
+    workflowTerminalIdentityMatches(state, workflowTaskId, workflowRunId);
+  const retrievedTerminalIdentityMatches =
+    !retrievedWorkflowTerminal ||
+    workflowTerminalIdentityMatches(
+      state,
+      retrievedWorkflowTaskId,
+      retrievedWorkflowRunId,
+      { allowMissingRunId: true }
+    );
+  const terminalIdentityConflict =
+    !directTerminalIdentityMatches || !retrievedTerminalIdentityMatches;
   if (
     workflowResult?.taskType === "local_workflow" &&
     typeof workflowResult.workflowName === "string" &&
@@ -1057,8 +1474,61 @@ function addSessionRecord(
     state.workflowLaunchUpdatedAt = record.timestamp ?? "";
     if (WORKFLOW_PENDING_LAUNCH_STATUSES.has(workflowResult.status)) {
       recordWorkflowObservedAt(state, record.timestamp ?? "");
-      if (workflowTaskId) state.activeWorkflowTaskIds.add(workflowTaskId);
-      else state.unidentifiedPendingWorkflowCount += 1;
+      if (workflowTaskId) {
+        const workflowTaskAlreadyActive =
+          state.activeWorkflowTaskIds.has(workflowTaskId);
+        const launchTimestampMs = timestampMs(record.timestamp ?? "");
+        state.activeWorkflowTaskIds.add(workflowTaskId);
+        if (workflowRunId) {
+          if (
+            (workflowTaskAlreadyActive &&
+              !state.activeWorkflowRunIds.has(workflowTaskId)) ||
+            (state.activeWorkflowRunIds.has(workflowTaskId) &&
+              state.activeWorkflowRunIds.get(workflowTaskId) !== workflowRunId)
+          ) {
+            state.activeWorkflowRunIds.set(workflowTaskId, "");
+            state.activeWorkflowLaunchTimestamps.set(workflowTaskId, null);
+          } else if (!state.activeWorkflowRunIds.has(workflowTaskId)) {
+            state.activeWorkflowRunIds.set(workflowTaskId, workflowRunId);
+            state.activeWorkflowLaunchTimestamps.set(
+              workflowTaskId,
+              Number.isFinite(launchTimestampMs) && launchTimestampMs <= Date.now()
+                ? launchTimestampMs
+                : null
+            );
+          }
+        } else if (
+          workflowTaskAlreadyActive ||
+          state.activeWorkflowRunIds.has(workflowTaskId)
+        ) {
+          state.activeWorkflowRunIds.set(workflowTaskId, "");
+          state.activeWorkflowLaunchTimestamps.set(workflowTaskId, null);
+        } else {
+          state.activeWorkflowRunIds.set(workflowTaskId, "");
+          state.activeWorkflowLaunchTimestamps.set(workflowTaskId, null);
+        }
+      } else state.unidentifiedPendingWorkflowCount += 1;
+      const launchTimestampMs = timestampMs(record.timestamp ?? "");
+      // Only the asynchronous launch record is snapshot-release evidence.
+      // Later launched/running updates for the same task and run are normal
+      // status transitions, not competing workflow starts.
+      if (
+        workflowResult.status === "async_launched" &&
+        workflowTaskId &&
+        workflowRunId &&
+        Number.isFinite(launchTimestampMs)
+      ) {
+        const existing = state.workflowSnapshotCandidates.get(workflowTaskId);
+        if (existing) {
+          state.workflowSnapshotConflicts.add(workflowTaskId);
+        } else if (state.workflowSnapshotCandidates.size < MAX_WORKFLOW_SNAPSHOT_CANDIDATES) {
+          state.workflowSnapshotCandidates.set(workflowTaskId, {
+            taskId: workflowTaskId,
+            runId: workflowRunId,
+            launchTimestampMs,
+          });
+        }
+      }
       state.pendingWorkflowCount = Math.max(
         state.pendingWorkflowCount ?? 0,
         state.activeWorkflowTaskIds.size +
@@ -1068,8 +1538,8 @@ function addSessionRecord(
     }
   }
   if (
-    workflowResult?.taskType === "local_workflow" &&
-    WORKFLOW_TERMINAL_TASK_STATUSES.has(workflowResult.status) &&
+    directWorkflowTerminal &&
+    directTerminalIdentityMatches &&
     workflowReleaseIsCurrent(state, record.timestamp ?? "")
   ) {
     completeTrackedWorkflowTask(
@@ -1083,32 +1553,37 @@ function addSessionRecord(
   if (
     Number.isInteger(pendingWorkflowCount) &&
     pendingWorkflowCount >= 0 &&
+    !terminalIdentityConflict &&
     workflowReleaseIsCurrent(state, record.timestamp ?? "")
   ) {
-    const previousPendingWorkflowCount = state.pendingWorkflowCount;
-    const mixedIdentityPopulation =
-      state.activeWorkflowTaskIds.size > 0 &&
-      state.unidentifiedPendingWorkflowCount > 0;
-    const mixedPopulationShrank =
-      mixedIdentityPopulation &&
-      Number.isInteger(previousPendingWorkflowCount) &&
-      pendingWorkflowCount < previousPendingWorkflowCount;
-    state.pendingWorkflowCount = pendingWorkflowCount;
+    // An aggregate counter cannot identify which tracked workflow ended. Keep
+    // every known pending workflow until it has identity-bound terminal
+    // evidence, rather than clearing task/run bindings from the counter alone.
+    const knownPendingWorkflowCount =
+      state.activeWorkflowTaskIds.size + state.unidentifiedPendingWorkflowCount;
+    // Keep the raw count with the workflows known at that moment. A later
+    // count can then hold back one workflow's snapshot release only when the
+    // other known work cannot account for it.
+    state.workflowPendingCounterObservation = Object.freeze({
+      timestampMs: timestampMs(record.timestamp ?? ""),
+      count: pendingWorkflowCount,
+      activeTaskIds: Object.freeze([...state.activeWorkflowTaskIds]),
+      unidentifiedCount: state.unidentifiedPendingWorkflowCount,
+    });
+    const effectivePendingWorkflowCount = Math.max(
+      pendingWorkflowCount,
+      knownPendingWorkflowCount
+    );
+    state.pendingWorkflowCount = effectivePendingWorkflowCount;
     state.pendingWorkflowUpdatedAt = record.timestamp ?? "";
     recordWorkflowObservedAt(state, record.timestamp ?? "");
+    // The counter conflict is fail-closed in the retained pending count and
+    // task/run bindings. It does not itself create a history gap.
     state.workflowObservationUncertain = false;
-    if (
-      mixedPopulationShrank ||
-      state.activeWorkflowTaskIds.size > pendingWorkflowCount
-    ) {
-      state.activeWorkflowTaskIds.clear();
-      state.unidentifiedPendingWorkflowCount = pendingWorkflowCount;
-    } else {
-      state.unidentifiedPendingWorkflowCount = Math.max(
-        0,
-        pendingWorkflowCount - state.activeWorkflowTaskIds.size
-      );
-    }
+    state.unidentifiedPendingWorkflowCount = Math.max(
+      state.unidentifiedPendingWorkflowCount,
+      effectivePendingWorkflowCount - state.activeWorkflowTaskIds.size
+    );
   } else if (
     Number.isInteger(pendingWorkflowCount) &&
     pendingWorkflowCount > (state.pendingWorkflowCount ?? 0)
@@ -1119,24 +1594,29 @@ function addSessionRecord(
       pendingWorkflowCount - state.activeWorkflowTaskIds.size
     );
   }
-  const retrievedWorkflowTaskId =
-    typeof workflowResult?.task?.task_id === "string"
-      ? workflowResult.task.task_id
-      : "";
-  const retrievedWorkflowTaskStatus =
-    typeof workflowResult?.task?.status === "string"
-      ? workflowResult.task.status
-      : "";
   if (
-    retrievedWorkflowTaskId &&
-    WORKFLOW_TERMINAL_RETRIEVAL_STATUSES.has(workflowResult.retrieval_status) &&
-    (!retrievedWorkflowTaskStatus ||
-      WORKFLOW_TERMINAL_TASK_STATUSES.has(retrievedWorkflowTaskStatus)) &&
+    retrievedWorkflowTerminal &&
+    retrievedTerminalIdentityMatches &&
     workflowReleaseIsCurrent(state, record.timestamp ?? "")
   ) {
     completeTrackedWorkflowTask(
       state,
       retrievedWorkflowTaskId,
+      record.timestamp ?? ""
+    );
+  }
+  const notification = workflowTaskNotification(record);
+  if (
+    notification &&
+    WORKFLOW_TERMINAL_TASK_STATUSES.has(notification.status) &&
+    workflowTerminalIdentityMatches(state, notification.taskId, "", {
+      allowMissingRunId: true,
+    }) &&
+    workflowReleaseIsCurrent(state, record.timestamp ?? "")
+  ) {
+    completeTrackedWorkflowTask(
+      state,
+      notification.taskId,
       record.timestamp ?? ""
     );
   }
@@ -1149,6 +1629,10 @@ function addSessionRecord(
       state.unidentifiedPendingWorkflowCount > 0)
   ) {
     state.activeWorkflowTaskIds.clear();
+    state.activeWorkflowRunIds.clear();
+    state.activeWorkflowLaunchTimestamps.clear();
+    state.workflowSnapshotCandidates.clear();
+    state.workflowSnapshotConflicts.clear();
     state.unidentifiedPendingWorkflowCount = 0;
     state.pendingWorkflowCount = 0;
     state.pendingWorkflowUpdatedAt = record.timestamp ?? "";
@@ -1482,41 +1966,47 @@ function archiveMarkerPath(projectDir, sessionId, stateDir = railConnectorStateD
 async function withArchiveMutationLock(marker, operation) {
   const lockFile = `${marker}.lock`;
   await fs.promises.mkdir(path.dirname(marker), { recursive: true, mode: 0o700 });
-  const deadline = Date.now() + 10000;
+  const deadline = performance.now() + 10000;
   let handle;
   for (;;) {
     try {
       handle = await fs.promises.open(lockFile, "wx", 0o600);
-      try {
-        await handle.writeFile(`${process.pid}\n`);
-      } catch (error) {
-        await handle.close();
-        handle = undefined;
-        try {
-          await fs.promises.unlink(lockFile);
-        } catch {
-          // Preserve the original write failure.
-        }
-        throw error;
-      }
       break;
     } catch (error) {
-      if (error.code !== "EEXIST") throw error;
+      // Windows can report EPERM while another owner closes/deletes this exact
+      // lock. Only acquisition retries; permission errors from writing an
+      // acquired lock or inspecting/removing it still propagate.
+      if (error.code !== "EEXIST" && !(IS_NATIVE_WINDOWS && error.code === "EPERM")) {
+        throw error;
+      }
       try {
         const stat = await fs.promises.stat(lockFile);
         if (Date.now() - stat.mtimeMs > 60000) {
           await fs.promises.unlink(lockFile);
-          continue;
         }
       } catch (statError) {
-        if (statError.code === "ENOENT") continue;
-        throw statError;
+        if (statError.code !== "ENOENT") throw statError;
       }
-      if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for archive catalog lock: ${lockFile}`);
+      // Every retry, including disappearing/stale lock races, shares this
+      // monotonic bound. Keep the acquisition error as evidence on exhaustion.
+      if (performance.now() >= deadline) {
+        const timeout = new Error(`Timed out waiting for archive catalog lock: ${lockFile}`, { cause: error });
+        timeout.code = "ETIMEDOUT";
+        throw timeout;
       }
       await sleep(25);
     }
+  }
+  try {
+    await handle.writeFile(`${process.pid}\n`);
+  } catch (error) {
+    await handle.close();
+    try {
+      await fs.promises.unlink(lockFile);
+    } catch {
+      // Preserve the original write failure.
+    }
+    throw error;
   }
   try {
     return await operation();
@@ -2412,11 +2902,39 @@ export function claudeChildLaunchEnvironmentStatus(env = process.env) {
   );
 }
 
+// Launched Claude processes get prompt suggestions off unless the caller opts
+// in: generated suggestion text in an idle composer cannot be told apart from
+// a real unsent draft. Only this one variable is set; every other inherited
+// variable passes through unchanged. Windows variable names are
+// case-insensitive, so a differently cased inherited copy is removed first.
+export function claudeChildEnvironment(
+  baseEnv,
+  { configDir = CLAUDE_CONFIG_DIR, promptSuggestions = false } = {}
+) {
+  const env = { ...baseEnv };
+  for (const name of Object.keys(env)) {
+    if (name.toUpperCase() === PROMPT_SUGGESTION_ENV) delete env[name];
+  }
+  return {
+    ...env,
+    CLAUDE_CONFIG_DIR: configDir,
+    FORCE_COLOR: "1",
+    [PROMPT_SUGGESTION_ENV]: promptSuggestions === true ? "true" : "false",
+  };
+}
+
 export function tmuxChildEnvironmentArgs(env = process.env) {
+  // An existing tmux server keeps its own environment, so the suggestion
+  // setting is always passed explicitly; anything but "true" means off.
   return CLAUDE_CHILD_ENVIRONMENT_KEYS.flatMap((name) => [
     "-e",
     `${name}=${typeof env[name] === "string" ? env[name] : ""}`,
-  ]).concat(["-e", "FORCE_COLOR=1"]);
+  ]).concat([
+    "-e",
+    `${PROMPT_SUGGESTION_ENV}=${env[PROMPT_SUGGESTION_ENV] === "true" ? "true" : "false"}`,
+    "-e",
+    "FORCE_COLOR=1",
+  ]);
 }
 
 export function assertBypassPolicy(permissionMode, env = process.env) {
@@ -3144,7 +3662,12 @@ async function forceCleanupIncompatibleWindowsBrokerSession(
       try {
         await windowsBrokerCleanupRequest(
           "releaseCleanupLease",
-          { sessionName, leaseId },
+          {
+            sessionName,
+            leaseId,
+            expectedGenerationId: session.generationId,
+            expectedStartedAtMs: session.startedAtMs,
+          },
           { timeoutMs: 5000 }
         );
       } catch {
@@ -3172,12 +3695,135 @@ async function backendLaunchMetadata(sessionName) {
         ? { launchEnvironment: session.launchEnvironment }
         : {}),
       resolvedSessionId: session.resolvedSessionId ?? null,
+      snapshotIdentityBinding: session.snapshotIdentityBinding ?? null,
       observedPosture: session.observedPosture ?? null,
       exited: Boolean(session.exited),
       exitCode: session.exitCode ?? null,
     };
   }
   return managedTmuxMetadata(sessionName);
+}
+
+export async function freshWorkflowSnapshotLogIdentity(
+  cwd,
+  { sessionId, startedAtMs, beforeSessionIds = [], logFile } = {}
+) {
+  if (
+    !SESSION_ID_RE.test(String(sessionId ?? "")) ||
+    !Number.isSafeInteger(startedAtMs) ||
+    startedAtMs <= 0 ||
+    !Array.isArray(beforeSessionIds) ||
+    beforeSessionIds.includes(sessionId)
+  ) return null;
+  const expected = path.join(projectDirFromCwd(cwd), `${sessionId}.jsonl`);
+  if (!logFile || path.resolve(logFile) !== path.resolve(expected)) return null;
+  let handle;
+  try {
+    const pathStat = await fs.promises.lstat(expected);
+    if (
+      !pathStat.isFile() ||
+      pathStat.isSymbolicLink() ||
+      !Number.isFinite(pathStat.birthtimeMs) ||
+      pathStat.birthtimeMs < startedAtMs
+    ) return null;
+    handle = await fs.promises.open(expected, "r");
+    const before = await handle.stat();
+    if (!sameFileIdentity(pathStat, before) || before.size < 2) return null;
+    const length = Math.min(before.size, 256 * 1024);
+    const first = Buffer.alloc(length);
+    const second = Buffer.alloc(length);
+    if ((await handle.read(first, 0, length, 0)).bytesRead !== length ||
+        (await handle.read(second, 0, length, 0)).bytesRead !== length ||
+        !first.equals(second)) return null;
+    const after = await handle.stat();
+    const afterPath = await fs.promises.lstat(expected);
+    if (!sameFileIdentity(before, after) ||
+        !sameFileIdentity(before, afterPath) ||
+        afterPath.isSymbolicLink()) return null;
+    const completeBytes = first.lastIndexOf(0x0a) + 1;
+    if (completeBytes === 0) return null;
+    let matched = false;
+    for (const line of first.subarray(0, completeBytes).toString("utf8").split(/\r?\n/)) {
+      if (!line) continue;
+      const record = JSON.parse(line);
+      const recordedId = record?.sessionId ?? record?.session_id;
+      if (recordedId === undefined || recordedId === null || recordedId === "") continue;
+      if (recordedId !== sessionId) return null;
+      matched = true;
+    }
+    return matched ? `${before.dev}:${before.ino}:${before.birthtimeMs}` : null;
+  } catch {
+    return null;
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function conditionalWindowsStopMetadata(sessionName, expectedGeneration) {
+  const result = await windowsBrokerRequest(
+    "conditionalStopMetadata",
+    {
+      sessionName,
+      leaseId: brokerMutationLeases.get(sessionName),
+      expectedStartedAtMs: expectedGeneration.expectedStartedAtMs,
+      expectedGenerationId: expectedGeneration.expectedGenerationId,
+      requireExactPair: true,
+      ...(expectedGeneration.expectedResolvedSessionId
+        ? {
+            expectedResolvedSessionId: expectedGeneration.expectedResolvedSessionId,
+            expectedCanonicalCwd: expectedGeneration.expectedCanonicalCwd,
+          }
+        : {}),
+    },
+    { startIfMissing: false, timeoutMs: 5000 }
+  );
+  const metadata = result?.metadata;
+  if (
+    !metadata ||
+    metadata.generationId !== expectedGeneration.expectedGenerationId ||
+    metadata.startedAtMs !== expectedGeneration.expectedStartedAtMs
+  ) {
+    const error = new Error(
+      `Managed session generation changed for ${sessionName}; refusing a stale stop.`
+    );
+    error.code = "ESTALE";
+    throw error;
+  }
+  return {
+    ...metadata,
+    schemaVersion: metadata.launchEnvironment ? 4 : 3,
+    cwd: resolveAllowedManagedCwd(metadata.cwd, metadata.canonicalCwd),
+  };
+}
+
+async function conditionalWindowsMetadata(sessionName, expectedGeneration) {
+  const result = await windowsBrokerRequest(
+    "conditionalMetadata",
+    {
+      sessionName,
+      expectedStartedAtMs: expectedGeneration.expectedStartedAtMs,
+      expectedGenerationId: expectedGeneration.expectedGenerationId,
+      requireExactPair: true,
+    },
+    { startIfMissing: false, timeoutMs: 5000 }
+  );
+  const metadata = result?.metadata;
+  if (
+    !metadata ||
+    metadata.generationId !== expectedGeneration.expectedGenerationId ||
+    metadata.startedAtMs !== expectedGeneration.expectedStartedAtMs
+  ) {
+    const error = new Error(
+      `Managed session generation changed for ${sessionName}; refusing a stale read.`
+    );
+    error.code = "ESTALE";
+    throw error;
+  }
+  return {
+    ...metadata,
+    schemaVersion: metadata.launchEnvironment ? 4 : 3,
+    cwd: resolveAllowedManagedCwd(metadata.cwd, metadata.canonicalCwd),
+  };
 }
 
 export function publicLaunchMetadata(
@@ -3212,6 +3858,11 @@ async function backendUpdateMetadata(
         ...updates,
         expectedStartedAtMs,
         expectedGenerationId,
+        requireExactPair:
+          expectedStartedAtMs !== null &&
+          expectedStartedAtMs !== undefined &&
+          expectedGenerationId !== null &&
+          expectedGenerationId !== undefined,
         leaseId: observationOnly
           ? undefined
           : brokerMutationLeases.get(sessionName),
@@ -3339,8 +3990,10 @@ async function managedPostureReport(
   );
 }
 
-async function assertManagedMutationPolicy(sessionName) {
-  const metadata = await backendLaunchMetadata(sessionName);
+async function assertManagedMutationPolicy(sessionName, expectedGeneration = null) {
+  const metadata = expectedGeneration
+    ? await conditionalWindowsMetadata(sessionName, expectedGeneration)
+    : await backendLaunchMetadata(sessionName);
   const permissionMode =
     metadata?.resolvedPosture?.permissionMode ??
     metadata?.requestedPosture?.permissionMode ??
@@ -3700,6 +4353,8 @@ export function captureSignals(capture) {
   return {
     remoteUrl: remoteUrlFromCapture(capture),
     likelyBusy,
+    // Busy evidence other than the dynamic-workflow waiting row.
+    terminalBusy,
     sessionLimitWarning,
     approvalRequired,
     pastePlaceholder,
@@ -3722,14 +4377,30 @@ export function captureSignals(capture) {
 }
 
 export function signalsWithWorkflowActivity(signals = {}, workflowActivity = {}) {
-  const baseState = signals.state || "idle";
   const logUncertain = workflowActivity.observationUncertain === true;
   const logPendingCount = Number.isInteger(workflowActivity.pendingCount)
     ? workflowActivity.pendingCount
     : null;
   const logPending =
     !logUncertain && logPendingCount !== null && logPendingCount > 0;
-  const terminalPending = signals.workflowPending === true;
+  // Claude renders "Waiting for N dynamic workflows to finish" as a permanent
+  // turn-summary row from the same session-log record (pendingWorkflowCount)
+  // the reducer reads, and a short later turn prints no newer "<verb> for Ns"
+  // row. Once the complete, certain log is tracking workflow launches, that
+  // stale row must not override the log's identity-bound release.
+  const terminalWorkflowSuperseded =
+    !logUncertain &&
+    logPendingCount !== null &&
+    workflowActivity.observationCoverage === "full" &&
+    workflowActivity.launchObserved === true;
+  const baseState =
+    terminalWorkflowSuperseded &&
+    signals.state === "busy" &&
+    signals.terminalState === "idle"
+      ? "idle"
+      : signals.state || "idle";
+  const terminalPending =
+    signals.workflowPending === true && !terminalWorkflowSuperseded;
   const workflowPending = logPending || terminalPending || logUncertain;
   const workflowPendingEvidence = logPending
     ? workflowActivity.evidence || "claude_session_log"
@@ -3745,9 +4416,14 @@ export function signalsWithWorkflowActivity(signals = {}, workflowActivity = {})
       : logUncertain
         ? null
         : logPendingCount;
+  // When the log supersedes the waiting row, keep only the screen's other busy
+  // evidence, whatever the terminal state (a paste placeholder, a draft, ...).
+  const terminalLikelyBusy = terminalWorkflowSuperseded
+    ? Boolean(signals.terminalBusy ?? signals.terminalState === "busy")
+    : Boolean(signals.likelyBusy);
   return {
     ...signals,
-    likelyBusy: Boolean(signals.likelyBusy || workflowPending),
+    likelyBusy: Boolean(terminalLikelyBusy || workflowPending),
     workflowPending,
     workflowPendingCount,
     workflowPendingEvidence,
@@ -4186,15 +4862,27 @@ async function backendExists(sessionName) {
   return Boolean(await managedTmuxMetadata(sessionName));
 }
 
-async function backendCapture(sessionName, lines = 120, expectedMetadata = null) {
+async function backendCapture(
+  sessionName,
+  lines = 120,
+  expectedMetadata = null,
+  expectedGeneration = null
+) {
   if (IS_NATIVE_WINDOWS) {
-    const session =
-      expectedMetadata ?? (await managedWindowsBrokerSession(sessionName));
-    if (!session) {
+    const session = expectedMetadata ??
+      (expectedGeneration ? null : await managedWindowsBrokerSession(sessionName));
+    if (!session && !expectedGeneration) {
       const error = new Error(
         `No managed native Windows Claude session found: ${sessionName}`
       );
       error.code = "ENOENT";
+      throw error;
+    }
+    if (expectedMetadata && expectedGeneration && !generationMatchesMetadata(expectedMetadata, expectedGeneration)) {
+      const error = new Error(
+        `Managed session generation changed for ${sessionName}; refusing a stale capture.`
+      );
+      error.code = "ESTALE";
       throw error;
     }
     const result = await windowsBrokerRequest(
@@ -4202,8 +4890,11 @@ async function backendCapture(sessionName, lines = 120, expectedMetadata = null)
       {
         sessionName,
         lines,
-        expectedStartedAtMs: session.startedAtMs,
-        expectedGenerationId: session.generationId,
+        expectedStartedAtMs:
+          expectedGeneration?.expectedStartedAtMs ?? session?.startedAtMs,
+        expectedGenerationId:
+          expectedGeneration?.expectedGenerationId ?? session?.generationId,
+        requireExactPair: Boolean(expectedGeneration),
       },
       { startIfMissing: false }
     );
@@ -4212,13 +4903,28 @@ async function backendCapture(sessionName, lines = 120, expectedMetadata = null)
   return tmuxCapture(sessionName, lines);
 }
 
-async function backendStopUnlocked(sessionName, { graceful = false, force = true } = {}) {
+async function backendStopUnlocked(
+  sessionName,
+  {
+    graceful = false,
+    force = true,
+    expectedGeneration = null,
+    metadata: knownMetadata = null,
+  } = {}
+) {
   if (IS_NATIVE_WINDOWS) {
     try {
-      const session = await managedWindowsBrokerSession(sessionName, {
+      const session = knownMetadata ?? (await managedWindowsBrokerSession(sessionName, {
         allowMissingCwdForStop: true,
-      });
+      }));
       if (!session) {
+        if (expectedGeneration) {
+          const error = new Error(
+            `Managed session generation changed for ${sessionName}; refusing a stale stop.`
+          );
+          error.code = "ESTALE";
+          throw error;
+        }
         return { status: "not_running", managedSession: sessionName };
       }
       const cleanupOnly = !fs.existsSync(session.cwd);
@@ -4229,14 +4935,28 @@ async function backendStopUnlocked(sessionName, { graceful = false, force = true
           graceful,
           force,
           omitCapture: cleanupOnly,
-          expectedStartedAtMs: session.startedAtMs,
-          expectedGenerationId: session.generationId,
+          // A caller who supplied a pair owns the generation decision. Do not
+          // replace it with a later name lookup before the broker stop.
+          expectedStartedAtMs:
+            expectedGeneration?.expectedStartedAtMs ?? session.startedAtMs,
+          expectedGenerationId:
+            expectedGeneration?.expectedGenerationId ?? session.generationId,
           leaseId: brokerMutationLeases.get(sessionName),
+          requireExactPair: Boolean(expectedGeneration),
+          ...(expectedGeneration?.expectedResolvedSessionId
+            ? {
+                expectedResolvedSessionId: expectedGeneration.expectedResolvedSessionId,
+                expectedCanonicalCwd: expectedGeneration.expectedCanonicalCwd,
+              }
+            : {}),
         },
         { startIfMissing: false, timeoutMs: 20000 }
       );
     } catch (error) {
       if (brokerUnavailable(error)) {
+        // A caller-bound stop cannot treat loss of the broker as proof that
+        // the exact managed generation ended.
+        if (expectedGeneration) throw error;
         return { status: "not_running", managedSession: sessionName };
       }
       throw error;
@@ -4339,8 +5059,8 @@ async function backendSendText(sessionName, value, submit, options = {}) {
   const chunkSize = options.chunkSize ?? DEFAULT_TEXT_CHUNK_SIZE;
   const chunkDelayMs = options.chunkDelayMs ?? DEFAULT_TEXT_CHUNK_DELAY_MS;
   if (IS_NATIVE_WINDOWS) {
-    const session =
-      options.metadata ?? (await managedWindowsBrokerSession(sessionName));
+    const session = options.metadata ??
+      (options.expectedGeneration ? null : await managedWindowsBrokerSession(sessionName));
     if (!session || session.exited) {
       const error = new Error(
         `No running managed native Windows Claude session found: ${sessionName}`
@@ -4348,10 +5068,22 @@ async function backendSendText(sessionName, value, submit, options = {}) {
       error.code = "ENOENT";
       throw error;
     }
+    if (options.expectedGeneration && !generationMatchesMetadata(session, options.expectedGeneration)) {
+      const error = new Error(
+        `Managed session generation changed for ${sessionName}; refusing stale text input.`
+      );
+      error.code = "ESTALE";
+      throw error;
+    }
     const textValue = String(value);
     const chunkCount = Math.max(1, Math.ceil(textValue.length / chunkSize));
+    // Keyword delivery settles after the prefix and waits after every body
+    // chunk (at least KEYWORD_MODE_OBSERVATION_MS in the broker).
+    const pacingMs = options.keywordPrefix
+      ? (chunkCount + 1) * Math.max(chunkDelayMs, KEYWORD_MODE_OBSERVATION_MS)
+      : Math.max(0, chunkCount - 1) * chunkDelayMs;
     const estimatedMs =
-      Math.max(0, chunkCount - 1) * chunkDelayMs +
+      pacingMs +
       (submit ? options.submitSettleMs ?? 100 : 0) +
       5000;
     return windowsBrokerRequest(
@@ -4361,15 +5093,22 @@ async function backendSendText(sessionName, value, submit, options = {}) {
         text: textValue,
         submit: Boolean(submit),
         bracketedPaste: Boolean(options.bracketedPaste),
+        keywordPrefix: Boolean(options.keywordPrefix),
         chunkSize,
         chunkDelayMs,
         submitSettleMs: options.submitSettleMs ?? 100,
-        expectedStartedAtMs: session.startedAtMs,
-        expectedGenerationId: session.generationId,
+        expectedStartedAtMs:
+          options.expectedGeneration?.expectedStartedAtMs ?? session.startedAtMs,
+        expectedGenerationId:
+          options.expectedGeneration?.expectedGenerationId ?? session.generationId,
         leaseId: brokerMutationLeases.get(sessionName),
+        requireExactPair: Boolean(options.expectedGeneration),
       },
       { timeoutMs: Math.max(30000, estimatedMs) }
     );
+  }
+  if (options.keywordPrefix) {
+    throw new Error("Keyword prefix delivery currently requires native Windows.");
   }
   const metadata = await requireManagedTmuxSession(sessionName);
   const textValue = String(value);
@@ -4396,10 +5135,15 @@ async function backendSendText(sessionName, value, submit, options = {}) {
   };
 }
 
-async function backendSendKey(sessionName, key, expectedMetadata = null) {
+async function backendSendKey(
+  sessionName,
+  key,
+  expectedMetadata = null,
+  expectedGeneration = null
+) {
   if (IS_NATIVE_WINDOWS) {
-    const session =
-      expectedMetadata ?? (await managedWindowsBrokerSession(sessionName));
+    const session = expectedMetadata ??
+      (expectedGeneration ? null : await managedWindowsBrokerSession(sessionName));
     if (!session || session.exited) {
       const error = new Error(
         `No running managed native Windows Claude session found: ${sessionName}`
@@ -4407,12 +5151,22 @@ async function backendSendKey(sessionName, key, expectedMetadata = null) {
       error.code = "ENOENT";
       throw error;
     }
+    if (expectedGeneration && !generationMatchesMetadata(session, expectedGeneration)) {
+      const error = new Error(
+        `Managed session generation changed for ${sessionName}; refusing a stale keypress.`
+      );
+      error.code = "ESTALE";
+      throw error;
+    }
     await windowsBrokerRequest("sendKey", {
       sessionName,
       key,
-      expectedStartedAtMs: session.startedAtMs,
-      expectedGenerationId: session.generationId,
+      expectedStartedAtMs:
+        expectedGeneration?.expectedStartedAtMs ?? session.startedAtMs,
+      expectedGenerationId:
+        expectedGeneration?.expectedGenerationId ?? session.generationId,
       leaseId: brokerMutationLeases.get(sessionName),
+      requireExactPair: Boolean(expectedGeneration),
     });
     return;
   }
@@ -5063,6 +5817,25 @@ export function runtimeObservationFromRecords(records, metadata = {}) {
   });
 }
 
+function workflowRecordCarriesRunIdentity(record) {
+  const result = record?.toolUseResult;
+  const direct =
+    result?.taskType === "local_workflow" &&
+    typeof result.taskId === "string" &&
+    Boolean(result.taskId) &&
+    typeof result.runId === "string" &&
+    Boolean(result.runId);
+  const retrieved =
+    typeof result?.task?.task_id === "string" &&
+    Boolean(result.task.task_id) &&
+    (typeof result.task?.run_id === "string"
+      ? Boolean(result.task.run_id)
+      : typeof result.task?.runId === "string"
+        ? Boolean(result.task.runId)
+        : typeof result?.runId === "string" && Boolean(result.runId));
+  return direct || retrieved;
+}
+
 function addRuntimeObservationRecord(state, record, metadata = {}) {
   const launchStartedAtMs = Number(metadata?.startedAtMs);
   if (Number.isFinite(launchStartedAtMs)) {
@@ -5086,7 +5859,9 @@ function addRuntimeObservationRecord(state, record, metadata = {}) {
       }
       return;
     }
-    const currentLaunchRecord = recordTimestampMs >= launchStartedAtMs - 5000;
+    const currentLaunchRecord =
+      recordTimestampMs >=
+      launchStartedAtMs - (workflowRecordCarriesRunIdentity(record) ? 0 : 5000);
     const pendingRecords = state.runtimeUntimestampedRecords.splice(0);
     if (!currentLaunchRecord) {
       state.runtimeUntimestampedRecordsDropped = 0;
@@ -5182,6 +5957,11 @@ function runtimeObservationFromState(
       observationUncertain,
       observationCoverage: coverage,
       observationSkippedBytes: skippedBytes,
+      completionEvidence:
+        state.workflowSnapshotCompletionCount > 0
+          ? "claude_workflow_snapshot"
+          : "",
+      completedSnapshotCount: state.workflowSnapshotCompletionCount,
     },
     evidence: {
       permissionMode: permissionMode ? "claude_session_log" : "",
@@ -5210,6 +5990,8 @@ const RUNTIME_OBSERVATION_FULL_GUARD_BYTES =
   RUNTIME_OBSERVATION_INITIAL_SCAN_BYTES;
 const RUNTIME_OBSERVATION_MAX_TRAILING_RECORD_BYTES = 8 * 1024 * 1024;
 const MAX_RUNTIME_OBSERVATION_BUFFERED_RECORD_BYTES = 32 * 1024 * 1024;
+const MAX_WORKFLOW_SNAPSHOT_BYTES = 128 * 1024;
+const WORKFLOW_SNAPSHOT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 function runtimeObservationLogFile(metadata) {
   if (!metadata?.cwd || !metadata?.resolvedSessionId) return "";
@@ -5223,7 +6005,234 @@ function runtimeObservationCacheKey(metadata, file) {
     file,
     metadata?.resolvedSessionId ?? "",
     Number(metadata?.startedAtMs) || 0,
+    metadata?.generationId ?? "",
   ].join("\0");
+}
+
+function workflowSnapshotPath(metadata, runId) {
+  if (
+    !metadata?.cwd ||
+    !metadata?.resolvedSessionId ||
+    typeof metadata?.generationId !== "string" ||
+    !metadata.generationId ||
+    !Number.isSafeInteger(Number(metadata?.startedAtMs)) ||
+    Number(metadata.startedAtMs) <= 0 ||
+    !SESSION_ID_RE.test(String(metadata.resolvedSessionId)) ||
+    !WORKFLOW_SNAPSHOT_ID_RE.test(String(runId))
+  ) {
+    return null;
+  }
+  const root = projectDirFromCwd(metadata.cwd);
+  const expected = path.join(
+    root,
+    String(metadata.resolvedSessionId),
+    "workflows",
+    `${runId}.json`
+  );
+  const relative = path.relative(root, expected).split(path.sep);
+  return relative.length === 3 &&
+    relative[0] === String(metadata.resolvedSessionId) &&
+    relative[1] === "workflows" &&
+    relative[2] === `${runId}.json`
+    ? { root, expected, relative }
+    : null;
+}
+
+function verifiedWorkflowSnapshotBinding(metadata, logFileIdentity) {
+  const binding = metadata?.snapshotIdentityBinding;
+  return binding?.mode === "fresh" &&
+    binding.generationId === metadata?.generationId &&
+    binding.startedAtMs === metadata?.startedAtMs &&
+    binding.resolvedSessionId === metadata?.resolvedSessionId &&
+    binding.logFileIdentity === logFileIdentity;
+}
+
+function sameFileIdentity(left, right) {
+  return left && right &&
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.birthtimeMs === right.birthtimeMs;
+}
+
+async function readWorkflowCompletionSnapshot(metadata, candidate) {
+  const location = workflowSnapshotPath(metadata, candidate?.runId);
+  if (!location) return null;
+  let ancestor = location.root;
+  let expectedFileStat = null;
+  try {
+    const rootStat = await fs.promises.lstat(ancestor);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return null;
+    for (const segment of location.relative) {
+      ancestor = path.join(ancestor, segment);
+      const stat = await fs.promises.lstat(ancestor);
+      if (stat.isSymbolicLink()) return null;
+      const finalSegment = segment === location.relative.at(-1);
+      if (finalSegment ? !stat.isFile() : !stat.isDirectory()) return null;
+      if (finalSegment) expectedFileStat = stat;
+    }
+    const generationStartedAtMs = Number(metadata?.startedAtMs);
+    if (
+      !expectedFileStat ||
+      !Number.isSafeInteger(generationStartedAtMs) ||
+      !Number.isFinite(expectedFileStat.birthtimeMs) ||
+      expectedFileStat.birthtimeMs <= 0 ||
+      expectedFileStat.birthtimeMs < generationStartedAtMs
+    ) {
+      return null;
+    }
+    const rootRealPath = await fs.promises.realpath(location.root);
+    const fileRealPath = await fs.promises.realpath(location.expected);
+    const realRelative = path.relative(rootRealPath, fileRealPath).split(path.sep);
+    if (
+      realRelative.length !== 3 ||
+      realRelative[0] !== location.relative[0] ||
+      realRelative[1] !== "workflows" ||
+      realRelative[2] !== location.relative[2]
+    ) {
+      return null;
+    }
+    const handle = await fs.promises.open(location.expected, "r");
+    try {
+      const before = await handle.stat();
+      if (
+        !before.isFile() ||
+        !sameFileIdentity(before, expectedFileStat) ||
+        before.size < 2 ||
+        before.size > MAX_WORKFLOW_SNAPSHOT_BYTES
+      ) {
+        return null;
+      }
+      const buffer = Buffer.alloc(before.size);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      const after = await handle.stat();
+      if (
+        bytesRead !== before.size ||
+        after.size !== before.size ||
+        after.mtimeMs !== before.mtimeMs ||
+        after.ctimeMs !== before.ctimeMs
+      ) {
+        return null;
+      }
+      const afterPathStat = await fs.promises.lstat(location.expected);
+      const afterRealPath = await fs.promises.realpath(location.expected);
+      if (
+        afterPathStat.isSymbolicLink() ||
+        !sameFileIdentity(before, afterPathStat) ||
+        afterRealPath !== fileRealPath
+      ) {
+        return null;
+      }
+      try {
+        return JSON.parse(buffer.toString("utf8"));
+      } catch {
+        return null;
+      }
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+function matchingSnapshotCompletion(state, metadata, candidate, snapshot) {
+  if (
+    !snapshot ||
+    snapshot.status !== "completed" ||
+    snapshot.taskId !== candidate.taskId ||
+    snapshot.runId !== candidate.runId ||
+    snapshot.error !== undefined ||
+    snapshot.failure !== undefined ||
+    snapshot.timedOut === true ||
+    snapshot.cancelled === true ||
+    snapshot.killed === true
+  ) {
+    return null;
+  }
+  const startTimeMs = timestampMs(snapshot.startTime);
+  const completedAtMs = timestampMs(snapshot.timestamp);
+  // Claude registers the run (snapshot startTime) before it writes the
+  // async_launched record, so the snapshot normally starts a few
+  // milliseconds before that record. Accept a bounded window around it.
+  if (
+    !Number.isFinite(startTimeMs) ||
+    !Number.isFinite(completedAtMs) ||
+    startTimeMs < Number(metadata?.startedAtMs) ||
+    startTimeMs <
+      candidate.launchTimestampMs - WORKFLOW_SNAPSHOT_START_BEFORE_LAUNCH_MS ||
+    startTimeMs >
+      candidate.launchTimestampMs + WORKFLOW_SNAPSHOT_START_AFTER_LAUNCH_MS ||
+    completedAtMs < startTimeMs ||
+    completedAtMs < candidate.launchTimestampMs ||
+    pendingCounterContradictsCompletion(state, candidate.taskId, completedAtMs) ||
+    completedAtMs > Date.now()
+  ) {
+    return null;
+  }
+  return { timestamp: new Date(completedAtMs).toISOString() };
+}
+
+// An aggregate pending count written after a workflow's completion holds that
+// release back only when the count exceeds the other work known at that
+// moment. A zero count, or one explained by another tracked or unidentified
+// workflow, does not reopen a completed workflow.
+function pendingCounterContradictsCompletion(state, taskId, completedAtMs) {
+  const observation = state.workflowPendingCounterObservation;
+  if (
+    !observation ||
+    !Number.isFinite(observation.timestampMs) ||
+    observation.timestampMs <= completedAtMs
+  ) {
+    return false;
+  }
+  const otherKnownPending =
+    observation.activeTaskIds.filter((id) => id !== taskId).length +
+    observation.unidentifiedCount;
+  return observation.count > otherKnownPending;
+}
+
+async function applyWorkflowCompletionSnapshots(
+  state,
+  metadata,
+  { observationUncertain = false, coverage = "none", logFileIdentity = "" } = {}
+) {
+  if (
+    observationUncertain ||
+    state.workflowObservationUncertain ||
+    coverage !== "full" ||
+    !verifiedWorkflowSnapshotBinding(metadata, logFileIdentity) ||
+    state.workflowSnapshotCandidates.size === 0
+  ) return;
+  for (const candidate of state.workflowSnapshotCandidates.values()) {
+    if (
+      !state.activeWorkflowTaskIds.has(candidate.taskId) ||
+      state.workflowSnapshotConflicts.has(candidate.taskId) ||
+      !workflowTerminalIdentityMatches(
+        state,
+        candidate.taskId,
+        candidate.runId
+      )
+    ) {
+      continue;
+    }
+    const snapshot = await readWorkflowCompletionSnapshot(metadata, candidate);
+    const completion = matchingSnapshotCompletion(state, metadata, candidate, snapshot);
+    if (!completion) continue;
+    if (completeTrackedWorkflowTask(state, candidate.taskId, completion.timestamp)) {
+      state.workflowSnapshotCompletionCount += 1;
+    }
+  }
+}
+
+function snapshotOverlayState(state) {
+  return {
+    ...state,
+    activeWorkflowTaskIds: new Set(state.activeWorkflowTaskIds),
+    activeWorkflowRunIds: new Map(state.activeWorkflowRunIds),
+    activeWorkflowLaunchTimestamps: new Map(state.activeWorkflowLaunchTimestamps),
+    workflowSnapshotCandidates: new Map(state.workflowSnapshotCandidates),
+    workflowSnapshotConflicts: new Set(state.workflowSnapshotConflicts),
+  };
 }
 
 function newRuntimeObservationCacheEntry(stat) {
@@ -5546,6 +6555,11 @@ function markRuntimeObservationGap(state) {
   });
   state.runtimeUntimestampedRecords = [];
   state.activeWorkflowTaskIds.clear();
+  state.activeWorkflowRunIds.clear();
+  state.activeWorkflowLaunchTimestamps.clear();
+  state.workflowSnapshotCandidates.clear();
+  state.workflowSnapshotConflicts.clear();
+  state.workflowPendingCounterObservation = null;
   state.unidentifiedPendingWorkflowCount = Math.max(
     0,
     state.pendingWorkflowCount ?? 0
@@ -5607,6 +6621,8 @@ async function loadRuntimeObservation(metadata, file, key) {
   let entry = runtimeObservationCache.get(key);
   runtimeObservationCache.delete(key);
   let cacheCommitted = false;
+  let observedState = null;
+  let observationUncertain = false;
 
   try {
     const handle = await fs.promises.open(file, "r");
@@ -5671,6 +6687,17 @@ async function loadRuntimeObservation(metadata, file, key) {
         metadata,
         historyHash
       );
+      observationUncertain = Boolean(
+        runtimeObservationHasRemainder(entry) ||
+        entry.discardUntilNewline ||
+        entry.recordOverflowed
+      );
+      observedState = snapshotOverlayState(entry.state);
+      await applyWorkflowCompletionSnapshots(observedState, metadata, {
+        observationUncertain,
+        coverage: entry.coverage,
+        logFileIdentity: entry.fileIdentity,
+      });
       await updateRuntimeObservationCacheGuards(handle, entry, stat, {
         historyHash,
         preserveFullGuard,
@@ -5686,14 +6713,12 @@ async function loadRuntimeObservation(metadata, file, key) {
       runtimeObservationCache.delete(oldestKey);
       disposeRuntimeObservationCacheEntry(oldestEntry);
     }
-    const result = runtimeObservationFromState(entry.state, {
+    const result = runtimeObservationFromState(observedState ?? entry.state, {
       scope: "current_launch",
       coverage: entry.coverage,
       skippedBytes: entry.skippedBytes,
       trailingRecordIncomplete: Boolean(
-        runtimeObservationHasRemainder(entry) ||
-        entry.discardUntilNewline ||
-        entry.recordOverflowed
+        observationUncertain
       ),
       recordOverflowed: entry.recordOverflowed,
     });
@@ -5745,9 +6770,23 @@ async function promptAcknowledgedInSession(
     }
     const timestampMs = Date.parse(record.timestamp ?? "");
     if (!Number.isFinite(timestampMs) || timestampMs < sinceMs - 2000) continue;
-    if (firstTextFromMessage(record.message) === String(promptText)) return true;
+    if (loggedPromptMatches(firstTextFromMessage(record.message), promptText)) return true;
   }
   return false;
+}
+
+// CLI 2.1.289 logs bracketed-paste input inside a matching
+// <pasted_content id="..."> pair, preceded by a blank line. Unwrap only exact,
+// id-matched pairs; the content must then equal the submitted text byte for
+// byte.
+const PASTED_CONTENT_BLOCK_RE =
+  /(?:\n\n)?<pasted_content id=("?)([A-Za-z0-9_-]{1,128})\1>\n([\s\S]*?)\n<\/pasted_content id=\1\2\1>\n?/g;
+
+export function loggedPromptMatches(loggedText, promptText) {
+  const expected = String(promptText);
+  if (typeof loggedText !== "string") return false;
+  if (loggedText === expected) return true;
+  return loggedText.replace(PASTED_CONTENT_BLOCK_RE, "$3") === expected;
 }
 
 async function managedSessionTitle(metadata) {
@@ -5916,6 +6955,7 @@ export function createPortableWaitCursor(
     t: Number(submittedAfterMs),
     s: metadata?.resolvedSessionId || "",
     g: metadata?.generationId || "",
+    r: Number.isSafeInteger(metadata?.startedAtMs) ? metadata.startedAtMs : null,
   };
   return `${PORTABLE_WAIT_CURSOR_PREFIX}${Buffer.from(
     JSON.stringify(payload),
@@ -5933,6 +6973,7 @@ export function parsePortableWaitCursor(value) {
       submittedAfterMs: null,
       resolvedSessionId: "",
       generationId: "",
+      startedAtMs: null,
     };
   }
   try {
@@ -5953,6 +6994,13 @@ export function parsePortableWaitCursor(value) {
     if (!Number.isFinite(payload.t) || payload.t <= 0) {
       throw new Error("invalid t");
     }
+    if (
+      payload.r !== undefined &&
+      payload.r !== null &&
+      (!Number.isSafeInteger(payload.r) || payload.r <= 0)
+    ) {
+      throw new Error("invalid r");
+    }
     return {
       portable: true,
       assistantCursor: payload.a || NO_ASSISTANT_CURSOR,
@@ -5960,6 +7008,7 @@ export function parsePortableWaitCursor(value) {
       submittedAfterMs: payload.t,
       resolvedSessionId: payload.s,
       generationId: payload.g,
+      startedAtMs: payload.r ?? null,
     };
   } catch {
     const error = new Error(
@@ -6049,16 +7098,23 @@ export async function runSubmitPrompt(
     delay = sleep,
     promptAcknowledged = promptAcknowledgedInSession,
     runtimeObservation = async () => ({ workflowActivity: emptyWorkflowActivity() }),
+    isNativeWindows = IS_NATIVE_WINDOWS,
   } = {}
 ) {
   const sessionName = managedSessionName(input);
   const requestedPasteMode = input.pasteMode ?? "auto";
+  const keywordPrefix = requestedPasteMode === "keyword";
+  if (keywordPrefix) {
+    if (!isNativeWindows) throw new Error("Keyword prefix delivery currently requires native Windows.");
+    workflowKeywordPrefixLength(input.text);
+  }
   const lines = clampInteger(input.lines, 160, 20, 1000);
-  const submitRetries = clampInteger(input.submitRetries, 1, 0, 2);
+  // A second Enter could start another keyword turn under ambiguous UI evidence.
+  const submitRetries = keywordPrefix ? 0 : clampInteger(input.submitRetries, 1, 0, 2);
   const retryDelayMs = clampInteger(input.retryDelayMs, DEFAULT_SUBMIT_RETRY_DELAY_MS, 250, 5000);
   const chunkSize = clampInteger(input.chunkSize, DEFAULT_TEXT_CHUNK_SIZE, 256, 8192);
   const chunkDelayMs = clampInteger(input.chunkDelayMs, DEFAULT_TEXT_CHUNK_DELAY_MS, 0, 100);
-  const bracketedPaste = requestedPasteMode === "bracketed" || requestedPasteMode === "auto";
+  const bracketedPaste = keywordPrefix || requestedPasteMode === "bracketed" || requestedPasteMode === "auto";
   const observedSignals = async (captureText) => {
     const observation = await runtimeObservation();
     return signalsWithWorkflowActivity(
@@ -6069,13 +7125,21 @@ export async function runSubmitPrompt(
   let capturedText = await capture(sessionName, lines);
   const preflightSignals = await observedSignals(capturedText);
   const preflightReason = submitPreflightReason(preflightSignals);
-  if (preflightReason && !input.force) {
+  // A literal keyword prefix is only leading input in an empty composer.
+  // Inspect both signals directly: pending workflows can mask draft state.
+  const keywordComposerReason = keywordPrefix
+    ? preflightSignals.pastePlaceholder
+      ? "paste_pending"
+      : preflightSignals.activeInputHasText ? "active_input_not_empty" : ""
+    : "";
+  if (keywordComposerReason || (preflightReason && !input.force)) {
     return {
       status: "preflight_blocked",
-      reason: preflightReason,
+      reason: keywordComposerReason || preflightReason,
       managedSession: sessionName,
       forceUsed: false,
-      pasteMode: bracketedPaste ? "bracketed" : "literal",
+      ...(keywordComposerReason && input.force ? { forceRefused: true } : {}),
+      pasteMode: keywordPrefix ? "keyword" : bracketedPaste ? "bracketed" : "literal",
       requestedPasteMode,
       retriesUsed: 0,
       capture: capturedText,
@@ -6086,6 +7150,7 @@ export async function runSubmitPrompt(
   const submittedAtMs = Date.now();
   const sendResult = await sendText(sessionName, input.text, true, {
     bracketedPaste,
+    ...(keywordPrefix ? { keywordPrefix: true } : {}),
     chunkSize,
     chunkDelayMs,
   });
@@ -6093,6 +7158,11 @@ export async function runSubmitPrompt(
     sendResult?.bracketedPasteUsed === undefined
       ? bracketedPaste
       : Boolean(sendResult.bracketedPasteUsed);
+  if (keywordPrefix && (sendResult?.bracketedPasteUsed !== true || sendResult?.literalPrefixCharacters !== 10)) {
+    const error = new Error("Keyword delivery was not confirmed by the backend; inspect the session before any retry.");
+    error.code = "EPASTEMODE";
+    throw error;
+  }
   const deliveryWarning =
     bracketedPaste && !bracketedPasteUsed
       ? "Bracketed paste was requested but unavailable; the prompt used literal chunked input. Transcript acknowledgement remains the integrity check for the submitted text."
@@ -6145,7 +7215,8 @@ export async function runSubmitPrompt(
     forceUsed: Boolean(input.force && preflightReason),
     forcedPastReason:
       input.force && preflightReason ? preflightReason : undefined,
-    pasteMode: bracketedPasteUsed ? "bracketed" : "literal",
+    pasteMode: keywordPrefix ? "keyword" : bracketedPasteUsed ? "bracketed" : "literal",
+    ...(keywordPrefix ? { literalPrefixCharacters: 10 } : {}),
     requestedPasteMode,
     bracketedPasteRequested: bracketedPaste,
     bracketedPasteUsed,
@@ -6167,6 +7238,7 @@ async function pollCapture(
     intervalMs = 250,
     lines = 140,
     expectedMetadata = null,
+    expectedGeneration = null,
   }
 ) {
   const deadline = Date.now() + timeoutMs;
@@ -6176,7 +7248,8 @@ async function pollCapture(
       pane = await backendCapture(
         sessionName,
         lines,
-        expectedMetadata
+        expectedMetadata,
+        expectedGeneration
       );
     } catch {
       // Session may have just died; keep the last good capture.
@@ -6489,51 +7562,40 @@ export function resolveCommandFromPath(
     pathExtValue = process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD",
   } = {}
 ) {
-  const requested = String(command);
-  if (path.isAbsolute(requested)) {
-    return existingExecutable(requested, platform) ? normalizeForPathCompare(requested) : "";
-  }
-
-  const pathEntries = String(pathValue)
-    .split(platform === "win32" ? ";" : ":")
-    .map((entry) => entry.trim().replace(/^"(.*)"$/, "$1"))
-    .filter((entry) => entry && path.isAbsolute(entry));
-  const requestedExtension = path.extname(requested);
-  let extensions = [""];
-  if (platform === "win32" && !requestedExtension) {
-    const configured = String(pathExtValue)
-      .split(";")
-      .map((value) => value.trim().toLowerCase())
-      .filter(Boolean);
-    extensions = [...new Set([".exe", ".cmd", ".bat", ".com", ...configured])];
-  }
-
-  for (const directory of pathEntries) {
-    for (const extension of extensions) {
-      const candidate = path.resolve(directory, `${requested}${extension}`);
-      if (existingExecutable(candidate, platform)) return normalizeForPathCompare(candidate);
-    }
-  }
-  return "";
+  return resolveNormalLaunchDescriptor(command, {
+    platform,
+    pathValue,
+    pathExtValue,
+    isExecutable: existingExecutable,
+    normalizePath: normalizeForPathCompare,
+  })?.path ?? "";
 }
 
-function resolveClaudeCommand() {
-  const configured = process.env[CLAUDE_COMMAND_ENV];
-  if (configured) {
-    if (!path.isAbsolute(configured)) {
-      throw new Error(`${CLAUDE_COMMAND_ENV} must be an absolute executable path: ${configured}`);
-    }
-    const resolved = resolveCommandFromPath(configured);
-    if (!resolved) throw new Error(`${CLAUDE_COMMAND_ENV} does not point to an executable file: ${configured}`);
-    return resolved;
-  }
-  const resolved = resolveCommandFromPath("claude");
+export function resolveClaudeLaunchDescriptor({
+  env = process.env,
+  platform = process.platform,
+  pathValue = env.PATH ?? "",
+  pathExtValue = env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD",
+} = {}) {
+  const resolved = resolveProductClaudeLaunchDescriptor({
+    env,
+    commandEnvironmentVariable: CLAUDE_COMMAND_ENV,
+    platform,
+    pathValue,
+    pathExtValue,
+    isExecutable: existingExecutable,
+    normalizePath: normalizeForPathCompare,
+  });
   if (!resolved) {
     throw new Error(
       `Unable to resolve Claude from PATH entries. Install Claude Code in this OS context or set ${CLAUDE_COMMAND_ENV} to its absolute executable path.`
     );
   }
   return resolved;
+}
+
+function resolveClaudeCommand() {
+  return resolveClaudeLaunchDescriptor().path;
 }
 
 function windowsCommandLineValue(value) {
@@ -6807,6 +7869,8 @@ async function backendStartUnlocked({
   cwd,
   killExisting,
   forceKillExisting = false,
+  beforeBrokerStart = null,
+  promptSuggestions = false,
   ...launchOptions
 }) {
   const resolvedCwd = resolveAllowedCwd(cwd);
@@ -6914,6 +7978,18 @@ async function backendStartUnlocked({
   }
 
   const sessionLogSnapshot = snapshotSessionLogs(resolvedCwd);
+  const freshSessionId = preparedLaunchOptions.newSessionId &&
+    !sessionLogSnapshot.sessionIds.includes(preparedLaunchOptions.newSessionId) &&
+    !fs.lstatSync(
+      path.join(sessionLogSnapshot.projectDir, `${preparedLaunchOptions.newSessionId}.jsonl`),
+      { throwIfNoEntry: false }
+    ) &&
+    !fs.lstatSync(
+      path.join(sessionLogSnapshot.projectDir, preparedLaunchOptions.newSessionId),
+      { throwIfNoEntry: false }
+    )
+      ? preparedLaunchOptions.newSessionId
+      : null;
   const startedAtMs = Date.now();
   const debugFilePlaceholder = preparedLaunchOptions.debug
     ? path.join(
@@ -6937,11 +8013,9 @@ async function backendStartUnlocked({
     );
     bindPreparedClaudeDebugCapture(debugCapture, args);
   }
-  const childEnvironment = {
-    ...process.env,
-    CLAUDE_CONFIG_DIR,
-    FORCE_COLOR: "1",
-  };
+  const childEnvironment = claudeChildEnvironment(process.env, {
+    promptSuggestions,
+  });
   const launchEnvironment =
     claudeChildLaunchEnvironmentStatus(childEnvironment);
   const launchMetadata = createLaunchMetadata({
@@ -6965,6 +8039,12 @@ async function backendStartUnlocked({
     }
     let brokerResult;
     try {
+      if (beforeBrokerStart) await beforeBrokerStart();
+    } catch (error) {
+      discardPreparedClaudeDebugCapture(debugCapture);
+      throw error;
+    }
+    try {
       brokerResult = await windowsBrokerRequest(brokerOperation, {
         sessionName,
         ...ptyLaunch,
@@ -6977,6 +8057,7 @@ async function backendStartUnlocked({
         resolvedPosture: launchMetadata.resolvedPosture,
         launchEnvironment,
         resolvedSessionId: launchMetadata.resolvedSessionId,
+        freshSessionId,
         expectedStartedAtMs:
           windowsReplacement?.expectedStartedAtMs ?? undefined,
         expectedGenerationId:
@@ -7027,6 +8108,7 @@ async function backendStartUnlocked({
       claudeCliVersion: preparedLaunchOptions.claudeCliVersion,
       launchMetadata,
       sessionLogSnapshot,
+      freshSessionId,
       replacementAudit,
     };
   }
@@ -7142,6 +8224,10 @@ const claudeToolRuleSchema = z
 const claudeToolListSchema = z
   .union([claudeToolRuleSchema, z.array(claudeToolRuleSchema.max(200)).min(1).max(50)])
   .optional();
+const EXPECTED_GENERATION_ID_DESCRIPTION =
+  "Optional native-Windows broker generation UUID from start_remote_control sessionBinding or status. Must be paired with expectedStartedAtMs; the call fails with ESTALE if the managed name now belongs to another generation.";
+const EXPECTED_STARTED_AT_MS_DESCRIPTION =
+  "Optional native-Windows broker start timestamp from sessionBinding or status. Must be paired with expectedGenerationId.";
 
 server.registerTool(
   "list_claude_sessions",
@@ -7306,7 +8392,9 @@ server.registerTool(
         .regex(/^[A-Za-z0-9_.:-]{1,128}$/)
         .refine((value) => !value.startsWith("-"), "Model cannot begin with '-'.")
         .optional()
-        .describe("Optional Claude model alias or full model name passed as --model."),
+        .describe(
+          "Optional Claude model alias or full model ID passed as --model, such as claude-fable-5-1 or claude-opus-5."
+        ),
       effort: z.enum(CLAUDE_EFFORT_LEVELS).optional().describe("Optional Claude effort passed as --effort."),
       ultracode: z
         .boolean()
@@ -7361,12 +8449,16 @@ server.registerTool(
         .enum(["none", "summary", "full", "dont_ask"])
         .default("none")
         .describe("If Claude asks how to resume a large session, optionally choose summary, full, or don't ask again."),
+      promptSuggestions: z
+        .boolean()
+        .default(false)
+        .describe("Keep Claude's prompt suggestions on for this launch. By default every launched Claude gets CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false, replacing any value the MCP process inherited, because a generated suggestion in the composer looks like an unsent draft and blocks prompts and graceful stop. true sets it to true instead, which overrides Claude's promptSuggestionEnabled setting and keeps suggestions on until the usage limit is reached rather than pausing near it. An env entry for this variable in Claude settings usually takes precedence over either value, and Claude Code before 2.1.238 ignores it. Applies only when a managed Claude session is launched; an already-running session keeps its environment."),
     },
   },
   async (input) =>
     withManagedMutationLock(
       managedSessionName(input),
-      async () => {
+      async ({ beginStartTransition, bindStartedGeneration }) => {
     const {
       sessionId: requestedSessionId,
       resumeSessionName,
@@ -7431,6 +8523,7 @@ server.registerTool(
 
     const started = await backendStart({
       sessionName,
+      beforeBrokerStart: beginStartTransition,
       sessionId: resolvedResumeSessionId,
       newSessionId: effectiveNewSessionId,
       continueLatest: false,
@@ -7454,7 +8547,11 @@ server.registerTool(
       debugFilter: input.debugFilter,
       killExisting,
       forceKillExisting,
+      promptSuggestions: input.promptSuggestions === true,
     });
+    if (IS_NATIVE_WINDOWS && started.status === "started") {
+      bindStartedGeneration(started.generationId, started.startedAtMs);
+    }
     if (started.status === "already_running") {
       const existingMetadata = await backendLaunchMetadata(sessionName);
       const observation = await sessionRuntimeObservation(existingMetadata);
@@ -7485,17 +8582,33 @@ server.registerTool(
       });
     }
     pendingTurnAnchors.delete(sessionName);
+    const startedGeneration = IS_NATIVE_WINDOWS
+      ? expectedManagedGeneration({
+          expectedGenerationId: started.generationId,
+          expectedStartedAtMs: started.startedAtMs,
+        })
+      : null;
 
     // Let Claude settle, then verify it actually stayed up. The most common
     // failure (Claude not authenticated on this OS account) makes it exit
     // immediately; surface that captured error instead of "no session found".
     await sleep(1500);
-    if (!(await backendExists(sessionName))) {
+    const initialMetadata = IS_NATIVE_WINDOWS
+      ? await conditionalWindowsMetadata(sessionName, startedGeneration)
+      : null;
+    if (IS_NATIVE_WINDOWS ? initialMetadata.exited : !(await backendExists(sessionName))) {
       let deadCapture = "";
-      const deadMetadata = await backendLaunchMetadata(sessionName);
+      const deadMetadata = IS_NATIVE_WINDOWS
+        ? initialMetadata
+        : await backendLaunchMetadata(sessionName);
       const exitCode = deadMetadata?.exitCode ?? null;
       try {
-        deadCapture = await backendCapture(sessionName, 140, deadMetadata);
+        deadCapture = await backendCapture(
+          sessionName,
+          140,
+          deadMetadata,
+          startedGeneration
+        );
       } catch {
         // No terminal capture remains available.
       }
@@ -7507,6 +8620,12 @@ server.registerTool(
         status: "exited_during_startup",
         backend,
         managedSession: sessionName,
+        sessionBinding: startedGeneration
+          ? {
+              generationId: startedGeneration.expectedGenerationId,
+              startedAtMs: startedGeneration.expectedStartedAtMs,
+            }
+          : undefined,
         claudeCliVersion: started.claudeCliVersion ?? null,
         sessionId: resolvedResumeSessionId ?? effectiveNewSessionId ?? null,
         cwd: resolvedCwd,
@@ -7536,7 +8655,9 @@ server.registerTool(
       });
     }
 
-    const startupMetadata = await backendLaunchMetadata(sessionName);
+    const startupMetadata = IS_NATIVE_WINDOWS
+      ? await conditionalWindowsMetadata(sessionName, startedGeneration)
+      : await backendLaunchMetadata(sessionName);
     let pane = await pollCapture(
       sessionName,
       (p) => REMOTE_URL_RE.test(p) || p.includes("Resume from summary") || workspaceTrustPromptFromCapture(p),
@@ -7610,13 +8731,19 @@ server.registerTool(
         : "";
     const remoteUrl = capturedRemoteUrl || currentLogRemoteUrl;
     const signals = captureSignals(pane);
-    const stillRunning = await backendExists(sessionName);
+    const finalMetadata = IS_NATIVE_WINDOWS
+      ? await conditionalWindowsMetadata(sessionName, startedGeneration)
+      : await backendLaunchMetadata(sessionName);
+    const stillRunning = IS_NATIVE_WINDOWS
+      ? !finalMetadata.exited
+      : await backendExists(sessionName);
     needsWorkspaceTrust = signals.state === "workspace_trust_required";
     const requestedPosture = started.launchMetadata?.requestedPosture ?? requestedLaunchPosture(input);
     const resolvedPosture =
       started.launchMetadata?.resolvedPosture ?? resolvedLaunchPosture({ ...input, permissionMode });
     const resolvedSessionId = logSummary?.sessionId ?? expectedSessionId ?? null;
     let metadataWarning = started.metadataWarning ?? null;
+    let metadataUpdateSucceeded = false;
     if (resolvedSessionId) {
       try {
         await backendUpdateMetadata(
@@ -7629,13 +8756,47 @@ server.registerTool(
           started.startedAtMs,
           started.generationId
         );
+        metadataUpdateSucceeded = true;
       } catch (error) {
         if (error?.code === "ESTALE") throw error;
         metadataWarning =
           `Claude started, but resolved session metadata could not be persisted: ${error?.message || String(error)}`;
       }
     }
-    const currentMetadata = await backendLaunchMetadata(sessionName);
+    if (
+      IS_NATIVE_WINDOWS &&
+      metadataUpdateSucceeded &&
+      started.freshSessionId &&
+      logResult.bindingStatus === "resolved" &&
+      !logResult.ambiguous &&
+      logSummary?.sessionId === started.freshSessionId
+    ) {
+      const logFileIdentity = await freshWorkflowSnapshotLogIdentity(resolvedCwd, {
+        sessionId: started.freshSessionId,
+        startedAtMs: started.launchMetadata.startedAtMs,
+        beforeSessionIds: started.sessionLogSnapshot.sessionIds,
+        logFile: logSummary.file,
+      });
+      if (logFileIdentity) {
+        try {
+          await windowsBrokerRequest("bindWorkflowSnapshotIdentity", {
+            sessionName,
+            leaseId: brokerMutationLeases.get(sessionName),
+            expectedGenerationId: startedGeneration.expectedGenerationId,
+            expectedStartedAtMs: startedGeneration.expectedStartedAtMs,
+            requestedSessionId: started.freshSessionId,
+            resolvedSessionId,
+            logFileIdentity,
+          }, { startIfMissing: false, timeoutMs: 5000 });
+        } catch (error) {
+          if (error?.code === "ESTALE") throw error;
+          metadataWarning = "Claude started, but fresh workflow-snapshot identity could not be bound.";
+        }
+      }
+    }
+    const currentMetadata = IS_NATIVE_WINDOWS
+      ? await conditionalWindowsMetadata(sessionName, startedGeneration)
+      : finalMetadata;
     const posture = await managedPostureReport(
       sessionName,
       signals,
@@ -7653,6 +8814,12 @@ server.registerTool(
       status: readiness.status,
       backend,
       managedSession: sessionName,
+      sessionBinding: startedGeneration
+        ? {
+            generationId: startedGeneration.expectedGenerationId,
+            startedAtMs: startedGeneration.expectedStartedAtMs,
+          }
+        : undefined,
       sessionId: resolvedResumeSessionId ?? effectiveNewSessionId ?? null,
       resolvedSessionId,
       logFile: logSummary?.file ?? null,
@@ -7690,7 +8857,7 @@ server.registerTool(
       posture,
     });
       },
-      { allowMissingBackend: true }
+      { allowMissingBackend: true, startsSession: true }
     )
 );
 
@@ -7701,13 +8868,29 @@ server.registerTool(
     inputSchema: {
       managedSession: z.string().default(DEFAULT_MANAGED_SESSION),
       tmuxSession: z.string().optional().describe("Deprecated alias for managedSession."),
+      expectedGenerationId: z.string().uuid().optional().describe(EXPECTED_GENERATION_ID_DESCRIPTION),
+      expectedStartedAtMs: z.number().int().positive().optional().describe(EXPECTED_STARTED_AT_MS_DESCRIPTION),
       lines: z.number().int().min(20).max(1000).default(160),
     },
   },
   async (input) => {
     const sessionName = managedSessionName(input);
-    const metadata = await backendLaunchMetadata(sessionName);
-    const capture = await backendCapture(sessionName, input.lines, metadata);
+    const expectedGeneration = expectedManagedGeneration(input);
+    requireNativeGenerationBinding(expectedGeneration);
+    const metadata = expectedGeneration
+      ? await conditionalWindowsMetadata(sessionName, expectedGeneration)
+      : await backendLaunchMetadata(sessionName);
+    await pairedBoundaryTestHook(
+      "capture_after_metadata",
+      sessionName,
+      expectedGeneration
+    );
+    const capture = await backendCapture(
+      sessionName,
+      input.lines,
+      metadata,
+      expectedGeneration
+    );
     const observation = await sessionRuntimeObservation(metadata);
     const signals = signalsWithWorkflowActivity(
       captureSignals(capture),
@@ -7736,6 +8919,8 @@ server.registerTool(
     inputSchema: {
       managedSession: z.string().default(DEFAULT_MANAGED_SESSION),
       tmuxSession: z.string().optional().describe("Deprecated alias for managedSession."),
+      expectedGenerationId: z.string().uuid().optional().describe(EXPECTED_GENERATION_ID_DESCRIPTION),
+      expectedStartedAtMs: z.number().int().positive().optional().describe(EXPECTED_STARTED_AT_MS_DESCRIPTION),
       afterCursor: z
         .string()
         .min(1)
@@ -7749,11 +8934,15 @@ server.registerTool(
   },
   async (input) => {
     const sessionName = managedSessionName(input);
+    const expectedGeneration = expectedManagedGeneration(input);
+    requireNativeGenerationBinding(expectedGeneration);
     const deadline = Date.now() + input.timeoutSeconds * 1000;
     const explicitCursor = input.afterCursor
       ? parsePortableWaitCursor(input.afterCursor)
       : null;
-    const pendingAnchor = rememberedTurnAnchor(sessionName);
+    const pendingAnchor = expectedGeneration
+      ? null
+      : rememberedTurnAnchor(sessionName);
     let anchor =
       input.afterCursor && pendingAnchor?.afterCursor !== input.afterCursor
         ? null
@@ -7761,6 +8950,19 @@ server.registerTool(
     const effectiveCursor =
       explicitCursor ??
       (anchor ? parsePortableWaitCursor(anchor.afterCursor) : null);
+    if (
+      expectedGeneration &&
+      (!effectiveCursor?.portable ||
+        !SESSION_ID_RE.test(String(effectiveCursor.resolvedSessionId ?? "")) ||
+        effectiveCursor.generationId !== expectedGeneration.expectedGenerationId ||
+        effectiveCursor.startedAtMs !== expectedGeneration.expectedStartedAtMs)
+    ) {
+      const error = new Error(
+        "afterCursor must be the exact cursor returned for the supplied managed session generation."
+      );
+      error.code = "ESTALE";
+      throw error;
+    }
     let baselineTranscript =
       anchor?.baselineTranscript ??
       (effectiveCursor?.portable
@@ -7779,14 +8981,19 @@ server.registerTool(
     let transcript = {};
     let metadata = null;
     while (Date.now() <= deadline) {
-      metadata = await backendLaunchMetadata(sessionName);
+      metadata = expectedGeneration
+        ? await conditionalWindowsMetadata(sessionName, expectedGeneration)
+        : await backendLaunchMetadata(sessionName);
       if (
         effectiveCursor?.portable &&
-        ((effectiveCursor.resolvedSessionId &&
-          metadata?.resolvedSessionId !==
-            effectiveCursor.resolvedSessionId) ||
+        (
+          ((expectedGeneration || effectiveCursor.resolvedSessionId) &&
+            metadata?.resolvedSessionId !==
+              effectiveCursor.resolvedSessionId) ||
           (effectiveCursor.generationId &&
-            metadata?.generationId !== effectiveCursor.generationId))
+            metadata?.generationId !== effectiveCursor.generationId) ||
+          (effectiveCursor.startedAtMs &&
+            metadata?.startedAtMs !== effectiveCursor.startedAtMs))
       ) {
         const error = new Error(
           "afterCursor belongs to a different managed session generation."
@@ -7806,7 +9013,17 @@ server.registerTool(
         anchor = null;
         baselineTranscript = null;
       }
-      capture = await backendCapture(sessionName, input.lines, metadata);
+      await pairedBoundaryTestHook(
+        "wait_after_metadata",
+        sessionName,
+        expectedGeneration
+      );
+      capture = await backendCapture(
+        sessionName,
+        input.lines,
+        metadata,
+        expectedGeneration
+      );
       const observation = await sessionRuntimeObservation(metadata);
       signals = signalsWithWorkflowActivity(
         captureSignals(capture),
@@ -8009,11 +9226,13 @@ server.registerTool(
     inputSchema: {
       managedSession: z.string().default(DEFAULT_MANAGED_SESSION),
       tmuxSession: z.string().optional().describe("Deprecated alias for managedSession."),
+      expectedGenerationId: z.string().uuid().optional().describe(EXPECTED_GENERATION_ID_DESCRIPTION),
+      expectedStartedAtMs: z.number().int().positive().optional().describe(EXPECTED_STARTED_AT_MS_DESCRIPTION),
       text: z.string().min(1).max(65536),
       pasteMode: z
-        .enum(["auto", "bracketed", "literal"])
+        .enum(["auto", "bracketed", "literal", "keyword"])
         .default("auto")
-        .describe("Use bracketed paste on Windows by default; literal mode sends plain terminal input."),
+        .describe("Auto uses bracketed paste. Literal sends plain terminal input and is unsuitable for multiline text. Native-Windows keyword mode requires explicit workflow intent and a leading ultracode: prefix: only that unchanged prefix is literal; the body stays bracketed. It changes no effort, permissions, or origin metadata."),
       submitRetries: z
         .number()
         .int()
@@ -8021,7 +9240,7 @@ server.registerTool(
         .max(2)
         .default(1)
         .describe(
-          "Maximum extra Enter retries when prompt or pasted-text evidence remains visible. Each retry may wait through four retryDelayMs visibility polls."
+          "Maximum extra Enter retries for ordinary modes when prompt or pasted-text evidence remains visible. Keyword mode always sends one Enter without retries. Each ordinary retry may wait through four retryDelayMs visibility polls."
         ),
       retryDelayMs: z
         .number()
@@ -8036,20 +9255,50 @@ server.registerTool(
       force: z
         .boolean()
         .default(false)
-        .describe("Bypass preflight blocks for busy or non-idle captures. Use only after inspecting the session."),
+        .describe("Bypass ordinary preflight blocks after inspecting the session. Keyword mode never bypasses an existing composer draft or paste placeholder, even with force."),
     },
   },
   async (input) => {
     const sessionName = managedSessionName(input);
+    const expectedGeneration = expectedManagedGeneration(input);
+    requireNativeGenerationBinding(expectedGeneration);
     return withManagedMutationLock(sessionName, async () => {
-      const metadata = await assertManagedMutationPolicy(sessionName);
+      const metadata = await assertManagedMutationPolicy(
+        sessionName,
+        expectedGeneration
+      );
+      // A generation-bound caller must receive a cursor tied to the concrete
+      // Claude conversation as well as the broker generation/start pair. Do
+      // this before any transcript, capture, or terminal input so a paired
+      // review cannot continue with a cursor that has no session identity.
+      if (
+        expectedGeneration &&
+        !SESSION_ID_RE.test(String(metadata?.resolvedSessionId ?? ""))
+      ) {
+        const error = new Error(
+          "A generation-bound submission requires a resolved Claude session identity."
+        );
+        error.code = "ESTALE";
+        throw error;
+      }
+      await pairedBoundaryTestHook(
+        "submit_after_lease",
+        sessionName,
+        expectedGeneration
+      );
       const baselineTranscript = await sessionTranscriptSnapshot(metadata);
       const submittedAtMs = Date.now();
       const result = await runSubmitPrompt(input, {
-        capture: (name, lines) => backendCapture(name, lines, metadata),
+        capture: (name, lines) =>
+          backendCapture(name, lines, metadata, expectedGeneration),
         sendText: (name, value, submit, options) =>
-          backendSendText(name, value, submit, { ...options, metadata }),
-        sendKey: (name, key) => backendSendKey(name, key, metadata),
+          backendSendText(name, value, submit, {
+            ...options,
+            metadata,
+            expectedGeneration,
+          }),
+        sendKey: (name, key) =>
+          backendSendKey(name, key, metadata, expectedGeneration),
         promptAcknowledged: (name, prompt, sinceMs) =>
           promptAcknowledgedInSession(name, prompt, sinceMs, metadata),
         runtimeObservation: () => sessionRuntimeObservation(metadata),
@@ -8066,7 +9315,9 @@ server.registerTool(
       } else if (result.status !== "preflight_blocked") {
         pendingTurnAnchors.delete(sessionName);
       }
-      const currentMetadata = await backendLaunchMetadata(sessionName);
+      const currentMetadata = expectedGeneration
+        ? await conditionalWindowsMetadata(sessionName, expectedGeneration)
+        : await backendLaunchMetadata(sessionName);
       const currentObservation = await sessionRuntimeObservation(currentMetadata);
       const currentSignals = signalsWithWorkflowActivity(
         captureSignals(result.capture || ""),
@@ -8088,7 +9339,7 @@ server.registerTool(
           currentObservation
         ),
       });
-    });
+    }, { expectedGeneration });
   }
 );
 
@@ -8211,6 +9462,8 @@ server.registerTool(
     inputSchema: {
       managedSession: z.string().default(DEFAULT_MANAGED_SESSION),
       tmuxSession: z.string().optional().describe("Deprecated alias for managedSession."),
+      expectedGenerationId: z.string().uuid().optional().describe(EXPECTED_GENERATION_ID_DESCRIPTION),
+      expectedStartedAtMs: z.number().int().positive().optional().describe(EXPECTED_STARTED_AT_MS_DESCRIPTION),
       title: z
         .string()
         .regex(/^[A-Za-z0-9 _.:@()#-]{1,80}$/)
@@ -8223,8 +9476,13 @@ server.registerTool(
   },
   async (input) => {
     const sessionName = managedSessionName(input);
+    const expectedGeneration = expectedManagedGeneration(input);
+    requireNativeGenerationBinding(expectedGeneration);
     return withManagedMutationLock(sessionName, async () => {
-      const metadata = await assertManagedMutationPolicy(sessionName);
+      const metadata = await assertManagedMutationPolicy(
+        sessionName,
+        expectedGeneration
+      );
       if (!metadata?.resolvedSessionId) {
         throw new Error(`Managed session ${sessionName} has no resolved Claude session id yet.`);
       }
@@ -8239,7 +9497,12 @@ server.registerTool(
           titleSource: currentTitle.titleSource,
         });
       }
-      const before = await backendCapture(sessionName, 100, metadata);
+      const before = await backendCapture(
+        sessionName,
+        100,
+        metadata,
+        expectedGeneration
+      );
       const beforeObservation = await sessionRuntimeObservation(metadata);
       const beforeSignals = signalsWithWorkflowActivity(
         captureSignals(before),
@@ -8264,6 +9527,7 @@ server.registerTool(
           bracketedPaste: false,
           submitSettleMs: 100,
           metadata,
+          expectedGeneration,
         }
       );
       const deadline = Date.now() + 6000;
@@ -8273,7 +9537,12 @@ server.registerTool(
         if (observed.title === input.title) break;
         await sleep(200);
       }
-      const capture = await backendCapture(sessionName, 100, metadata);
+      const capture = await backendCapture(
+        sessionName,
+        100,
+        metadata,
+        expectedGeneration
+      );
       const observation = await sessionRuntimeObservation(metadata);
       const signals = signalsWithWorkflowActivity(
         captureSignals(capture),
@@ -8292,7 +9561,7 @@ server.registerTool(
         capture,
         signals,
       });
-    });
+    }, { expectedGeneration });
   }
 );
 
@@ -8349,11 +9618,26 @@ server.registerTool(
       tmuxSession: z.string().optional().describe("Deprecated alias for managedSession."),
       graceful: z.boolean().default(true).describe("Ask an idle Claude session to exit cleanly before force termination."),
       force: z.boolean().default(false).describe("Stop even when Claude appears busy or graceful exit times out."),
+      expectedGenerationId: z.string().optional().describe("Optional native-Windows broker generation UUID. Must be paired with expectedStartedAtMs to refuse a replacement session."),
+      expectedStartedAtMs: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional().describe("Optional native-Windows broker start timestamp. Must be paired with expectedGenerationId."),
+      expectedResolvedSessionId: z.string().uuid().optional().describe("Optional exact Claude conversation UUID. Requires the complete native-Windows stop identity."),
+      expectedCanonicalCwd: z.string().optional().describe("Optional exact canonical workspace path. Requires the complete native-Windows stop identity."),
     },
   },
   async (input) => {
     const sessionName = managedSessionName(input);
-    if (IS_NATIVE_WINDOWS) {
+    const expectedGeneration = expectedStopIdentity(input);
+    if (expectedGeneration && !IS_NATIVE_WINDOWS) {
+      const error = new Error(
+        "expectedGenerationId and expectedStartedAtMs are supported only by the native Windows broker."
+      );
+      error.code = "EUNSUPPORTED";
+      throw error;
+    }
+    // Conditional stops intentionally skip all name-based broker status,
+    // capture, and metadata work until the broker has leased this exact pair.
+    // The legacy name-only path remains available when no pair is supplied.
+    if (IS_NATIVE_WINDOWS && !expectedGeneration) {
       const brokerStatus = await probeWindowsBroker();
       if (brokerStatus?.compatible === false) {
         if (
@@ -8386,10 +9670,34 @@ server.registerTool(
     }
     return withManagedMutationLock(sessionName, async () => {
       let capture = "";
+      let metadata = null;
       try {
-        capture = await backendCapture(sessionName, 120);
+        if (expectedGeneration) {
+          // The broker validates the frozen pair while it returns the one
+          // metadata object used below. Do not perform a name-based status
+          // lookup between lease acquisition and the conditional capture.
+          metadata = await conditionalWindowsStopMetadata(
+            sessionName,
+            expectedGeneration
+          );
+          await pairedBoundaryTestHook(
+            "stop_after_metadata",
+            sessionName,
+            expectedGeneration
+          );
+          capture = await backendCapture(
+            sessionName,
+            120,
+            metadata,
+            expectedGeneration
+          );
+        } else {
+          capture = await backendCapture(sessionName, 120);
+          metadata = await backendLaunchMetadata(sessionName);
+        }
       } catch (error) {
         if (brokerUnavailable(error)) {
+          if (expectedGeneration) throw error;
           return text({ status: "not_running", managedSession: sessionName });
         }
         if (
@@ -8409,11 +9717,11 @@ server.registerTool(
                   : "The persisted project directory is unavailable. Retry with force=true to terminate the broker session without reading its terminal.",
             });
           }
+          if (expectedGeneration) throw error;
           return text(await backendCleanupStopUnlocked(sessionName));
         }
         throw error;
       }
-      const metadata = await backendLaunchMetadata(sessionName);
       const observation = await sessionRuntimeObservation(metadata);
       const signals = signalsWithWorkflowActivity(
         captureSignals(capture),
@@ -8424,6 +9732,8 @@ server.registerTool(
           await backendStopUnlocked(sessionName, {
             graceful: false,
             force: false,
+            expectedGeneration,
+            metadata,
           })
         );
       }
@@ -8441,6 +9751,8 @@ server.registerTool(
       const stopped = await backendStopUnlocked(sessionName, {
           graceful: input.graceful && !stopBlockReason,
           force: input.force,
+          expectedGeneration,
+          metadata,
         });
       return text({
         ...stopped,
@@ -8449,7 +9761,7 @@ server.registerTool(
           input.force && signals.workflowPending
         ),
       });
-    });
+    }, { expectedGeneration });
   }
 );
 

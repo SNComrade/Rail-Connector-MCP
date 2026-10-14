@@ -70,7 +70,11 @@ and index state before and after, and use an explicit prompt prohibiting edits,
 installs, commits, pushes, configuration changes, and commands that create
 artifacts. `dontAsk`
 automatically denies new permission requests while allowing read-only
-inspection. `plan` is a compatibility fallback, but its approval workflow is
+inspection. `dontAsk` also denies the Workflow tool unless it is allowed, which
+this MCP does only at launch (see `docs/USAGE.md` Permission Modes). Allowing
+it lets Claude start worker agents whose tool use under that allowance is not
+verified, so report-only reviews keep the before-and-after repository checks.
+`plan` is a compatibility fallback, but its approval workflow is
 not the report: never approve implementation from a report-only review. No
 interactive mode is a zero-write OS sandbox; Claude and the MCP still maintain
 local logs, terminal state, and caches.
@@ -167,8 +171,10 @@ operation exposes and receives an explicit force choice. A
 workflow task ID is retained only inside the process-local reducer so a later
 matching terminal retrieval can clear the pending count; IDs and workflow names
 are never returned. Unidentified launches remain counted when an identified
-peer completes, and a bound interruption or explicit zero count clears the
-tracked set. Enter-equivalent aliases such as `C-m` and `C-j` use the same gate.
+peer completes. An aggregate counter, including zero, cannot clear known
+pending workflows without identity-bound terminal evidence. A current bound
+interruption can clear the tracked set. Enter-equivalent aliases such as `C-m`
+and `C-j` use the same gate.
 A session-log read error fails the mutation instead of silently treating the
 session as idle. An absent or not-yet-bound log is reported as not observed and
 leaves the terminal signal as the available lifecycle evidence. Explicit force
@@ -221,10 +227,12 @@ parsed, and an unchanged observation does not hash the complete history again.
 Stored prefix and offset-anchor guards are still compared before unchanged
 metadata can reuse cached state; change-time drift resets same-length entries.
 Oversized logs retain prefix and offset-anchor guards without rehashing the
-skipped middle on each observation. An explicit workflow checkpoint in the
-observed tail is only a candidate release: the MCP performs one complete replay
-before restoring certainty, so newer hidden-middle evidence cannot be erased by
-an older tail record. This bounded design treats Claude's session log as
+skipped middle on each observation. A current explicit workflow counter or
+bound interruption in the observed tail can restore current-state certainty,
+but a counter alone cannot clear known pending workflows. The MCP does not
+replay the skipped middle or change that history coverage to `full`; aggregate
+snapshot completion therefore remains unavailable for that observation.
+This bounded design treats Claude's session log as
 append-only; it does not claim to authenticate against another local process
 deliberately rewriting an oversized skipped middle while preserving both
 boundary guards. Trailing JSON records are buffered in chunks with an 8 MiB
@@ -250,9 +258,22 @@ the raw effort override value. New managed launches persist those sanitized
 categories as `launchEnvironment`; posture reports show that snapshot
 separately from `currentMcpEnvironment` after an MCP refresh. Linux/macOS tmux
 launches explicitly set `CLAUDE_CONFIG_DIR`, the two UltraCode-relevant Claude
-environment variables, and `FORCE_COLOR` for the child instead of trusting a
-possibly older tmux-server copy. No raw value is added to public posture or
-managed metadata.
+environment variables, the prompt-suggestion setting, and `FORCE_COLOR` for the
+child instead of trusting a possibly older tmux-server copy. No raw value is
+added to public posture or managed metadata.
+
+On both backends the launched Claude gets
+`CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` unless the caller passes
+`promptSuggestions: true` to `start_remote_control`, which sets it to `true`. An
+inherited value of that name, in any letter case, is replaced. No other
+variable is added or removed; removing host Claude Code session variables from
+the child is a separate change. Launch evidence, audit receipts and launch
+comparison do not record this setting, so for an existing session, and above
+all one started before the setting existed or by an MCP process not yet
+restarted, whether suggestions are off cannot be read from MCP output. A Claude
+settings `env` entry for the same variable usually takes precedence over the
+launched environment, and Claude Code before 2.1.238 ignores the variable.
+Version and help probes and session listing keep the MCP process environment.
 
 For current native Windows launches, the Claude child inherits the MCP process
 environment plus explicit launch overrides. For current Linux/macOS launches,
@@ -285,6 +306,11 @@ absolute, operator-selected Claude executable or wrapper. A persistent broker
 started with one configured path will reject a later client that requests a
 different path. The MCP compares a launch-policy fingerprint and restarts an
 idle broker when that policy changes; active sessions must be stopped first.
+This variable selects an operator-controlled command whose own update behavior
+is outside the MCP's ordinary launcher contract. Leave it unset to use ordinary
+`claude` launcher resolution. Issue 66 rolling-runtime qualification strips the
+key case-insensitively before starting its isolated MCP child, so a configured
+override cannot satisfy the rolling-latest evidence contract.
 
 ## Sensitive Local Data
 

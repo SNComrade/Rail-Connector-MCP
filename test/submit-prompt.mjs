@@ -3,6 +3,7 @@ import {
   activeInputContainsText,
   captureSignals,
   lifecycleBlockReason,
+  loggedPromptMatches,
   signalsWithWorkflowActivity,
   submitPreflightReason,
   submitResultStatus,
@@ -126,5 +127,17 @@ assert.deepEqual(
     reason: "approval_required",
   }
 );
+
+// CLI 2.1.289 logs bracketed-paste input inside an id-matched <pasted_content> pair.
+const keywordPrompt = "ultracode: Run one workflow.\n\nKeep résumé 🧪 漢字.";
+const wrappedKeyword = "ultracode:\n\n<pasted_content id=\"ab12\">\n Run one workflow.\n\nKeep résumé 🧪 漢字.\n</pasted_content id=\"ab12\">\n";
+assert.equal(loggedPromptMatches(wrappedKeyword, keywordPrompt), true);
+assert.equal(loggedPromptMatches(`\n\n<pasted_content id="fe69">\n${prompt}\n</pasted_content id="fe69">\n`, prompt), true);
+assert.equal(loggedPromptMatches(`<pasted_content id=p1>\n${prompt}\n</pasted_content id=p1>\n`, prompt), true);
+assert.equal(loggedPromptMatches(prompt, prompt), true);
+assert.equal(loggedPromptMatches(wrappedKeyword.replace("Keep", "Kept"), keywordPrompt), false, "changed pasted text must not match");
+assert.equal(loggedPromptMatches(wrappedKeyword.replace("</pasted_content id=\"ab12\">", "</pasted_content id=\"other\">"), keywordPrompt), false, "mismatched tag ids must not unwrap");
+assert.equal(loggedPromptMatches(wrappedKeyword.replace("</pasted_content id=\"ab12\">", "</pasted_content id=ab12>"), keywordPrompt), false, "mismatched tag quoting must not unwrap");
+assert.equal(loggedPromptMatches(undefined, prompt), false);
 
 console.log("submit-prompt ok");

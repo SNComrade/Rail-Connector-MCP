@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createTerminalRenderer } from "../src/terminal.js";
 import {
   activeInputContainsText,
   captureSignals,
@@ -15,6 +16,15 @@ import {
 
 const cursorStyleProbe = "\x1b[>0q\x1b]0;claude\x07\x1b[38;2;215;119;87mHello";
 assert.equal(await renderCapture(cursorStyleProbe), "Hello");
+const styledComposer = createTerminalRenderer({ cols: 80, rows: 5 });
+await styledComposer.write("> \x1b[2mexample\x1b[0m\r\x1b[2C");
+assert.equal(await styledComposer.capture(), "> example");
+const composerStyle = await styledComposer.cursorLineStyle();
+assert.equal(composerStyle.cursorX, 2);
+assert.equal(composerStyle.spans[0].style.dim, false);
+assert.equal(composerStyle.spans[1].style.dim, true);
+assert.doesNotMatch(JSON.stringify(composerStyle), /example/);
+await styledComposer.dispose();
 
 const cursorRight = "A\x1b[3CB";
 assert.equal(await renderCapture(cursorRight), "A   B");
@@ -242,8 +252,8 @@ assert.equal(
   "ultracode"
 );
 const currentClaudeLaunchBanner = [
-  "Claude Code v2.1.251",
-  "Fable 5 with xhigh effort · Claude Max",
+  "Claude Code v2.1.252",
+  "Fable 5.1 with xhigh effort · Claude Max",
   "bypass permissions on (shift+tab to cycle)  ·  PR #53",
   "effort: ultracode · xhigh effort + dynamic workflows for maximum thoroughness",
   "/rc",
@@ -270,18 +280,18 @@ assert.equal(
 );
 assert.equal(
   captureSignals(
-    "> Fable 5 with xhigh effort · Claude Max\n> bypass permissions on\n> effort: ultracode · xhigh effort + dynamic workflows"
+    "> Fable 5.1 with xhigh effort · Claude Max\n> bypass permissions on\n> effort: ultracode · xhigh effort + dynamic workflows"
   ).effortIndicator,
   ""
 );
 assert.equal(
   captureSignals(
-    "> Fable 5 with xhigh effort · Claude Max\n> bypass permissions on\n> effort: ultracode · xhigh effort + dynamic workflows"
+    "> Fable 5.1 with xhigh effort · Claude Max\n> bypass permissions on\n> effort: ultracode · xhigh effort + dynamic workflows"
   ).permissionModeIndicator,
   ""
 );
 assert.equal(
-  captureSignals("- Fable 5 with xhigh effort · Claude Max\nyou: bypass permissions on").effortIndicator,
+  captureSignals("- Fable 5.1 with xhigh effort · Claude Max\nyou: bypass permissions on").effortIndicator,
   ""
 );
 assert.equal(
@@ -779,7 +789,7 @@ const ultracodeRuntimeObservation = runtimeObservationFromRecords(
       effort: "xhigh",
       message: {
         role: "assistant",
-        model: "claude-fable-5",
+        model: "claude-fable-5-1",
         content: [{ type: "text", text: "working" }],
       },
     },
@@ -820,6 +830,8 @@ assert.deepEqual(ultracodeRuntimeObservation.workflowActivity, {
   observationUncertain: false,
   observationCoverage: "full",
   observationSkippedBytes: 0,
+  completionEvidence: "",
+  completedSnapshotCount: 0,
 });
 assert.doesNotMatch(
   JSON.stringify(ultracodeRuntimeObservation),
@@ -848,6 +860,7 @@ const completedWorkflowObservation = runtimeObservationFromRecords(
         taskType: "local_workflow",
         workflowName: "another-private-name",
         taskId: "workflow-task-private-id",
+        runId: "workflow-run-private-id",
       },
     },
     {
@@ -855,7 +868,7 @@ const completedWorkflowObservation = runtimeObservationFromRecords(
       sessionId: postureSessionId,
       toolUseResult: {
         retrieval_status: "timeout",
-        task: { task_id: "workflow-task-private-id" },
+        task: { task_id: "workflow-task-private-id", run_id: "workflow-run-private-id" },
       },
     },
     {
@@ -865,6 +878,7 @@ const completedWorkflowObservation = runtimeObservationFromRecords(
         retrieval_status: "success",
         task: {
           task_id: "workflow-task-private-id",
+          run_id: "workflow-run-private-id",
           status: "completed",
         },
       },
@@ -889,6 +903,95 @@ assert.equal(completedWorkflowSignals.workflowPending, false);
 assert.equal(completedWorkflowSignals.workflowPendingCount, 0);
 assert.equal(completedWorkflowSignals.workflowPendingEvidence, "");
 assert.equal(completedWorkflowSignals.workflowPendingObservedAt, "");
+// CLI 2.1.289 keeps "Waiting for N dynamic workflows to finish" on screen as a
+// permanent turn-summary row; a short final turn prints no newer completion row.
+const staleWaitingRowCapture = "✻ Waiting for 1 dynamic workflow to finish\n\n● WORKFLOW_FOLLOWUP_COMPLETE\n\n> ";
+assert.equal(captureSignals(staleWaitingRowCapture).workflowPending, true, "the screen heuristic alone still reports the row");
+const staleRowWithCompleteLog = signalsWithWorkflowActivity(captureSignals(staleWaitingRowCapture), completedWorkflowObservation.workflowActivity);
+assert.equal(staleRowWithCompleteLog.workflowPending, false, "a complete, certain log release supersedes the stale screen row");
+assert.equal(staleRowWithCompleteLog.state, "idle");
+assert.equal(staleRowWithCompleteLog.likelyBusy, false);
+const staleRowWithoutLog = signalsWithWorkflowActivity(captureSignals(staleWaitingRowCapture), { ...completedWorkflowObservation.workflowActivity, observationCoverage: "none" });
+assert.equal(staleRowWithoutLog.workflowPending, true, "without a complete log the screen row still holds pending");
+assert.equal(staleRowWithoutLog.state, "busy");
+const staleRowWithoutTrackedLaunch = signalsWithWorkflowActivity(captureSignals(staleWaitingRowCapture), { ...completedWorkflowObservation.workflowActivity, launchObserved: false });
+assert.equal(staleRowWithoutTrackedLaunch.workflowPending, true, "a log that never saw a launch cannot supersede the screen row");
+// A superseded stale row must not make any other composer state look busy:
+// likelyBusy decides submit retries and whether send_text/send_key started a turn.
+const staleRowWithPastePlaceholder = signalsWithWorkflowActivity(
+  captureSignals("✻ Waiting for 1 dynamic workflow to finish\n\n● WORKFLOW_FOLLOWUP_COMPLETE\n\n> [Pasted text #1 +2 lines]"),
+  { observationUncertain: false, pendingCount: 0, observationCoverage: "full", launchObserved: true }
+);
+assert.equal(staleRowWithPastePlaceholder.state, "paste_pending");
+assert.equal(staleRowWithPastePlaceholder.workflowPending, false);
+assert.equal(staleRowWithPastePlaceholder.likelyBusy, false, "a superseded stale row must not mark a stuck paste as busy");
+const staleRowWithDraft = signalsWithWorkflowActivity(
+  captureSignals("✻ Waiting for 1 dynamic workflow to finish\n\n● WORKFLOW_FOLLOWUP_COMPLETE\n\n> unsent draft"),
+  { observationUncertain: false, pendingCount: 0, observationCoverage: "full", launchObserved: true }
+);
+assert.equal(staleRowWithDraft.state, "awaiting_input");
+assert.equal(staleRowWithDraft.likelyBusy, false, "a superseded stale row must not mark a draft as busy");
+const realBusyAfterStaleRow = signalsWithWorkflowActivity(
+  captureSignals("✻ Waiting for 1 dynamic workflow to finish\n\nMisting...   ( 1s  ·  1 tokens )\n> "),
+  { observationUncertain: false, pendingCount: 0, observationCoverage: "full", launchObserved: true }
+);
+assert.equal(realBusyAfterStaleRow.likelyBusy, true, "other busy evidence still counts");
+assert.equal(realBusyAfterStaleRow.state, "busy");
+const pendingLogWithStaleRow = signalsWithWorkflowActivity(
+  captureSignals("✻ Waiting for 1 dynamic workflow to finish\n\n> [Pasted text #1 +2 lines]"),
+  { observationUncertain: false, pendingCount: 1, observationCoverage: "full", launchObserved: true }
+);
+assert.equal(pendingLogWithStaleRow.workflowPending, true, "log pending work still holds");
+assert.equal(pendingLogWithStaleRow.likelyBusy, true);
+// Sanitized CLI 2.1.274 shape: worker results and parent end_turn do not
+// constitute an aggregate completion. No terminal/idle heuristic may release it.
+const missingAggregateRecords = [
+  { sessionId: postureSessionId, timestamp: "2026-07-29T12:01:00Z", version: "2.1.274", toolUseResult: {
+    taskType: "local_workflow", status: "async_launched", taskId: "synthetic-task", runId: "synthetic-run",
+    workflowName: "synthetic", scriptPath: "synthetic/script.js", transcriptDir: "synthetic/workers",
+  } },
+  { sessionId: postureSessionId, timestamp: "2026-07-29T12:01:01Z", pendingWorkflowCount: 1 },
+  ...["a", "b"].map(agentId => ({ sessionId: postureSessionId, timestamp: "2026-07-29T12:01:02Z",
+    type: "agent", agentId, phase: "result", result: { text: "completed" } })),
+  { sessionId: postureSessionId, timestamp: "2026-07-29T12:01:03Z", message: {
+    role: "assistant", model: "claude-fable-5-1", stop_reason: "end_turn", content: [{ type: "text", text: "Both workers completed." }],
+  } },
+];
+const missingAggregate = runtimeObservationFromRecords(missingAggregateRecords, {
+  resolvedSessionId: postureSessionId, startedAtMs: postureLaunchMs,
+});
+assert.equal(missingAggregate.workflowActivity.pendingCount, 1);
+assert.equal(signalsWithWorkflowActivity(captureSignals("✻ Worked for 2s\n> "), missingAggregate.workflowActivity).workflowPending, true);
+const terminalRetrieval = (taskId, runId = "") => ({ sessionId: postureSessionId, timestamp: "2026-07-29T12:01:04Z",
+  toolUseResult: { retrieval_status: "success", task: { task_id: taskId, ...(runId ? { run_id: runId } : {}), status: "completed" } },
+});
+assert.equal(runtimeObservationFromRecords([...missingAggregateRecords, terminalRetrieval("other-task")], {
+  resolvedSessionId: postureSessionId, startedAtMs: postureLaunchMs,
+}).workflowActivity.pendingCount, 1);
+// The 2.1.275 live control used this already-supported identity-bound retrieval.
+assert.equal(runtimeObservationFromRecords([...missingAggregateRecords, terminalRetrieval("synthetic-task", "synthetic-run")], {
+  resolvedSessionId: postureSessionId, startedAtMs: postureLaunchMs,
+}).workflowActivity.pendingCount, 0);
+// Matching completion releases only its identified workflow, never an active
+// peer; wrong-conversation, duplicate and older results cannot release B.
+const concurrentLaunches = ["a", "b"].map((taskId, i) => ({
+  sessionId: postureSessionId, timestamp: `2026-07-29T12:01:0${i}Z`,
+  toolUseResult: { taskType: "local_workflow", status: "async_launched", taskId, runId: `run-${taskId}`, workflowName: `synthetic-${taskId}` },
+}));
+const pendingAfter = rows => runtimeObservationFromRecords(rows, {
+  resolvedSessionId: postureSessionId, startedAtMs: postureLaunchMs,
+}).workflowActivity.pendingCount;
+assert.equal(pendingAfter(concurrentLaunches), 2);
+const completedA = [...concurrentLaunches, terminalRetrieval("a", "run-a")];
+assert.equal(pendingAfter(completedA), 1);
+for (const irrelevant of [
+  terminalRetrieval("a", "run-a"),
+  { ...terminalRetrieval("b"), sessionId: "different-synthetic-conversation" },
+  { ...terminalRetrieval("b"), timestamp: "2026-07-29T12:00:59Z" },
+]) assert.equal(pendingAfter([...completedA, irrelevant]), 1);
+assert.equal(pendingAfter([...completedA, {
+  ...terminalRetrieval("b", "run-b"), timestamp: "2026-07-29T12:01:05Z",
+}]), 0);
 assert.deepEqual(
   workflowObservationStatusFields({
     pendingCount: null,
@@ -947,7 +1050,7 @@ const mixedIdentityWorkflowObservation = runtimeObservationFromRecords(
   }
 );
 assert.equal(mixedIdentityWorkflowObservation.workflowActivity.state, "pending");
-assert.equal(mixedIdentityWorkflowObservation.workflowActivity.pendingCount, 1);
+assert.equal(mixedIdentityWorkflowObservation.workflowActivity.pendingCount, 2);
 assert.doesNotMatch(
   JSON.stringify(mixedIdentityWorkflowObservation),
   /unidentified-private-workflow|identified-private-workflow|identified-private-task/
@@ -1040,6 +1143,7 @@ assert.equal(maxConflictPosture.ultracodeAssessment.status, "conflicting_effort_
 assert.deepEqual(maxConflictPosture.ultracodeAssessment.conflictSources, [
   { source: "terminal_heuristic", effort: "max" },
 ]);
+assert.equal(captureSignals("Fable 5.1  Extra").effortIndicator, "");
 assert.equal(captureSignals("Fable 5  Extra").effortIndicator, "");
 const unavailableUltracodeSignals = captureSignals("Ultracode needs dynamic workflows enabled (see /config).\n> ");
 assert.equal(unavailableUltracodeSignals.ultracodeUnavailable, true);

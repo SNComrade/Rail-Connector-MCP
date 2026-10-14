@@ -62,18 +62,39 @@ residual risks or test gaps.
 - Ask for final-quality review output, not a performance report about Claude.
 - Keep effort, Ultracode, and permission selection in the
   `start_remote_control` call. Do not use prompt wording as a substitute for
-  launch controls. A report-only prompt can run with explicitly requested
-  Ultracode or bypass posture, but the reviewer must preserve the no-edit
-  constraints, report the elevated posture, and never elevate independently.
+  launch controls. A leading `ultracode:` sent with native-Windows
+  `pasteMode: "keyword"` requests a workflow only; it changes no effort,
+  permissions, or workspace trust, and session Ultracode remains a separate
+  launch control. A report-only prompt can run with
+  explicitly requested Ultracode or bypass posture, but the reviewer must
+  preserve the no-edit constraints, report the elevated posture, and never
+  elevate independently.
 - Pass `disallowedTools: ["Edit", "Write", "NotebookEdit"]`, keep
-  `trustWorkspace: false` unless trust was explicitly authorized, and verify the
-  repository/index before and after the turn.
+  `trustWorkspace: false` unless trust was explicitly authorized, leave
+  `promptSuggestions` unset (default `false`) so a newly launched Claude starts
+  with prompt suggestions off, and verify the repository/index before and after
+  the turn. Suggestion text can still appear in some cases: a Claude settings
+  `env` entry or wrapper can override the setting, Claude before 2.1.238
+  ignores it, and a reused session keeps the environment it was launched with.
+  The MCP cannot tell that text from a draft, so it blocks prompts
+  (`active_input_not_empty`) and graceful stop (`awaiting_input`).
 - State that those flags constrain built-in tools only. Connected MCP and
   connector tools can remain available, so inspect the effective roster when
   possible and use an isolated worktree or read-only copy for hard write
   isolation.
 - Prefer `permissionMode: "dontAsk"` for report-only inspection when Claude
   advertises it. If a compatibility fallback uses `plan`, never approve the
-  plan or implementation; restart the review in `dontAsk` when possible.
+  plan or implementation; restart the review in `dontAsk` when possible. A
+  keyword workflow review under `dontAsk` also needs a Workflow allowance at
+  launch; without one Claude denies the workflow (seen live). The verified
+  allowance is `tools: ["Workflow"]` plus `allowedTools: ["Workflow"]`, which
+  leaves Workflow as the only built-in tool, so a review that reads code must
+  also list its read tools (not verified); `allowedTools` alone is not
+  verified.
 - If Claude previously gave a weak answer, ask it to perform a fresh pass using
   the structure above instead of asking it to defend the earlier result.
+- Keyword mode needs an empty composer: a draft or paste placeholder returns
+  `preflight_blocked` even with `force: true`, and nothing is sent. Do not ask
+  Claude to call `TaskOutput` on CLI 2.1.289, which has no such tool; there a
+  finished workflow is released by Claude's own task notification or, in a
+  fresh native-Windows conversation, the workflow snapshot.

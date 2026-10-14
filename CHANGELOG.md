@@ -5,6 +5,50 @@ Semantic Versioning after the first stable release.
 
 ## [Unreleased]
 
+## [1.0.0-beta.4] - 2026-10-14
+
+### Added
+
+- Portable checks that an idle stdio server exits when its client closes input,
+  including independent clients, closure before protocol initialization, and
+  draining an active capability request before exit
+- Generation-bound mutation and wait tests that reject stale session identities
+  during managed Windows session replacement
+- Exact process-identity checks and cleanup for synthetic Windows test children,
+  including preservation of a foreign process using the same executable/fixture
+
+### Changed
+
+- Current Claude CLI capability probing, safe keyword delivery, workflow
+  completion observations, and operator/debugger/reviewer guidance
+- Reviewed dependency ranges aligned with the development source
+
+### Fixed
+
+- Include the command-resolution runtime module and transitive Windows broker
+  test loaders, hooks, and timeout fixture in the sanitized source tree
+- Keep runtime package checks and the broker compatibility rewrite aligned with
+  the exported source
+- Extend the precise synthetic UUID allowlist for deterministic regression
+  fixtures while preserving privacy scan rules
+- Bound every archive-lock acquisition retry and tolerate transient Windows
+  sharing failures while retaining genuine permission failures and timeout causes
+- Validate deterministic replacement-launch metadata before stopping an existing
+  managed generation, preserving its process, state and mutation lease on rejection
+
+### Known Limitations
+
+- Completing or stopping a Claude turn does not close its host MCP client's
+  connection. Idle stdio servers exit when that client closes input; client
+  connection retention still requires separate host investigation.
+
+### Security
+
+- Use MCP SDK 1.32.1 and Zod 4.6.5 with reviewed transitive fixes for fast-uri
+  3.1.8, qs 6.16.0, Hono 4.13.11, and ip-address 10.7.4
+- Update SHA-pinned setup-node 7.1.0, CodeQL 4.38.3, and upload-artifact 7.0.2
+  in the public CI and package workflows
+
 ## [1.0.0-beta.3] - 2026-08-31
 
 ### Added
@@ -164,7 +208,8 @@ interpret `lastKnownPendingCount` as a current count.
 - Absolute Claude-path registration, optional allowed roots, and tagged-source
   installation guidance
 
-[Unreleased]: https://github.com/SNComrade/Rail-Connector-MCP/compare/v1.0.0-beta.3...HEAD
+[Unreleased]: https://github.com/SNComrade/Rail-Connector-MCP/compare/v1.0.0-beta.4...HEAD
+[1.0.0-beta.4]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.4
 [1.0.0-beta.3]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.3
 [1.0.0-beta.2]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.1

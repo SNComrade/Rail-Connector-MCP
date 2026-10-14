@@ -40,7 +40,7 @@ claude
 ## Install
 
 ```powershell
-git clone --branch v1.0.0-beta.3 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.4 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 .\install-windows.ps1
 ```
@@ -113,6 +113,15 @@ an older token-derived broker still owns active sessions. A refreshed client
 can call `stop_remote_control` with `force: true` to use the authenticated,
 generation-bound compatibility cleanup path. That path cannot capture terminal
 content or launch commands. Ordinary cross-version mutations remain blocked.
+For a running session, a stop request must ask for either graceful or forced
+shutdown; `graceful: false` with `force: false` is blocked. Forced shutdown
+requests termination through the broker's owned ConPTY session. The broker no
+longer adds a separate `taskkill` by PID if node-pty cannot confirm exit;
+node-pty's default Windows force-stop path may itself enumerate console PIDs.
+On `stop_timeout`, the session remains tracked as recovery-only (`status`
+shows `recoveryOnly: true`) and requires its original generation ID and start
+timestamp, returned in the `stop_timeout` reply, before another cleanup lease
+or stop.
 The current build does not contact the historical predictable pipe, because
 doing so would expose the token to a pipe-name squatter. A historical broker can
 coexist until it is stopped through its original MCP process.
@@ -144,6 +153,11 @@ rejects those launch-argument shapes on batch shims instead of silently
 changing them. This applies to launch options such as titles and tool rules,
 not prompt text sent through the PTY. Configure `RAIL_CONNECTOR_CLAUDE_PATH` to a
 native Claude executable when those argument values are required.
+The variable selects an operator-controlled executable or wrapper whose own
+update behavior is outside the MCP's normal launcher contract. Leave it unset
+to follow ordinary `claude.exe` launcher resolution. The Issue 66
+rolling-runtime harness removes every case variant of the key from its isolated
+child environment before qualification or live acceptance.
 
 `status` omits machine-wide Claude agent inventory by default. Pass
 `includeAgentDetails: true` only for deliberate host-wide diagnosis.
