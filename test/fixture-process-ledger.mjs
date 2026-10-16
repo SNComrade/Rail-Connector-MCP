@@ -471,7 +471,17 @@ public static class PmeFixtureProcess {
   const nativeBlock = /\$nativeSource = @'[\s\S]*?\n'@/g;
   assert.equal([...sourceScript.matchAll(nativeBlock)].length, 1);
   let doubledScript = sourceScript.replace(nativeBlock, () => `$nativeSource = @'\n${nativeDouble}\n'@`);
-  const serveEntry = "try {\n  Write-InspectPhase 'before-add-type'";
+  // Synthetic PIDs/handles must never reach the real emitted Inspect APIs.
+  // Replace the complete unique binder definition, not just its call site.
+  const inspectBindingBlock = /^# INSPECT_NATIVE_BINDINGS_BEGIN\n[\s\S]*?^# INSPECT_NATIVE_BINDINGS_END$/gm;
+  assert.equal([...doubledScript.matchAll(inspectBindingBlock)].length, 1,
+    "the complete real Inspect binder must be uniquely identified before any synthetic launch");
+  doubledScript = doubledScript.replace(inspectBindingBlock, () => `
+# NATIVE_FIXTURE_BINDING_DOUBLE
+function Initialize-InspectNativeBindings {
+  Add-Type -TypeDefinition $nativeSource | Out-Null
+}`.trim());
+  const serveEntry = "try {\n  if ($Operation -eq 'Inspect') {";
   assert.equal(doubledScript.split(serveEntry).length, 2);
   doubledScript = doubledScript.replace(serveEntry, `
 function Get-CimInstance {
@@ -481,6 +491,12 @@ function Get-CimInstance {
 }
 ${serveEntry}`);
   assert.ok(doubledScript.includes("NATIVE_FIXTURE_API_DOUBLE"));
+  assert.ok(doubledScript.includes("NATIVE_FIXTURE_BINDING_DOUBLE"));
+  assert.doesNotMatch(doubledScript, /INSPECT_NATIVE_BINDINGS_(?:BEGIN|END)|Reflection\.Emit|DefineDynamicAssembly|DefinePInvokeMethod|DefineMethod|PmeFixtureInspectNative/,
+    "a protocol double must contain no real emitted native binding path");
+  assert.deepEqual([...doubledScript.matchAll(/\[DllImport\([^)]*\)\]/g)].map((match) => match[0]),
+    ['[DllImport("kernel32.dll", EntryPoint="SetLastError", SetLastError=true)]'],
+    "SetLastError must be the only native import left in a synthetic protocol copy");
   assert.doesNotMatch(doubledScript, /extern\s+(?:IntPtr\s+(?:OpenProcess|GetCurrentProcess)|bool\s+(?:TerminateProcess|DuplicateHandle)|uint\s+GetProcessId)/,
     "a protocol double must never retain real process-open or termination P/Invokes");
   const doubledFile = path.join(nativeRegressionRoot, "native-protocol-double.ps1");

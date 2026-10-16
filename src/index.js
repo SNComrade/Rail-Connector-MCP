@@ -190,17 +190,47 @@ async function pairedBoundaryTestHook(stage, sessionName, expectedGeneration) {
     throw error;
   }
   const token = randomUUID();
-  fs.writeFileSync(
-    enteredPath,
-    `${JSON.stringify({
+  const stagingPath = path.join(hookDir, stage + ".entered." + token + ".tmp");
+  let stagingFd = null;
+  let ownsStaging = false;
+  let publicationError = null;
+  const publicationCleanupErrors = [];
+  try {
+    stagingFd = fs.openSync(stagingPath, "wx");
+    ownsStaging = true;
+    fs.writeFileSync(stagingFd, JSON.stringify({
       stage,
       sessionName,
       expectedGenerationId: expectedGeneration.expectedGenerationId,
       expectedStartedAtMs: expectedGeneration.expectedStartedAtMs,
       token,
-    })}\n`,
-    { flag: "wx" }
-  );
+    }) + "\n");
+    fs.closeSync(stagingFd);
+    stagingFd = null;
+    // A closed complete staging file becomes visible atomically. Hard linking
+    // also retains the original exclusive-create rule for an existing entry.
+    fs.linkSync(stagingPath, enteredPath);
+  } catch (error) {
+    publicationError = error;
+  } finally {
+    if (stagingFd !== null) {
+      try { fs.closeSync(stagingFd); } catch (error) { publicationCleanupErrors.push(error); }
+    }
+    if (ownsStaging) {
+      try { fs.unlinkSync(stagingPath); } catch (error) { publicationCleanupErrors.push(error); }
+    }
+  }
+  if (publicationError && !publicationCleanupErrors.length) throw publicationError;
+  if (publicationCleanupErrors.length) {
+    const errors = publicationError
+      ? [publicationError, ...publicationCleanupErrors] : publicationCleanupErrors;
+    const error = new AggregateError(errors,
+      "Synthetic paired-boundary publication cleanup failed" +
+        (publicationError ? ": " + publicationError.message : ""),
+      { cause: publicationError ?? publicationCleanupErrors[0] });
+    error.code = publicationError?.code ?? publicationCleanupErrors[0].code;
+    throw error;
+  }
   const deadline = Date.now() + 10000;
   while (Date.now() <= deadline) {
     if (fs.existsSync(releasePath)) {
@@ -8950,6 +8980,19 @@ server.registerTool(
     const effectiveCursor =
       explicitCursor ??
       (anchor ? parsePortableWaitCursor(anchor.afterCursor) : null);
+    // Keep caller-supplied binding validation separate: older portable cursors
+    // may bind the broker pair without containing a conversation UUID.
+    const waitGenerationBinding = expectedGeneration ?? (
+      IS_NATIVE_WINDOWS && effectiveCursor?.portable &&
+      BROKER_GENERATION_ID_RE.test(effectiveCursor.generationId) &&
+      Number.isSafeInteger(effectiveCursor.startedAtMs) &&
+      effectiveCursor.startedAtMs > 0
+        ? {
+            expectedGenerationId: effectiveCursor.generationId,
+            expectedStartedAtMs: effectiveCursor.startedAtMs,
+          }
+        : null
+    );
     if (
       expectedGeneration &&
       (!effectiveCursor?.portable ||
@@ -8963,6 +9006,24 @@ server.registerTool(
       error.code = "ESTALE";
       throw error;
     }
+    const validateWaitCursorMetadata = (currentMetadata) => {
+      if (
+        effectiveCursor?.portable &&
+        (
+          ((expectedGeneration || effectiveCursor.resolvedSessionId) &&
+            currentMetadata?.resolvedSessionId !== effectiveCursor.resolvedSessionId) ||
+          (effectiveCursor.generationId &&
+            currentMetadata?.generationId !== effectiveCursor.generationId) ||
+          (effectiveCursor.startedAtMs &&
+            currentMetadata?.startedAtMs !== effectiveCursor.startedAtMs))
+      ) {
+        const error = new Error(
+          "afterCursor belongs to a different managed session generation."
+        );
+        error.code = "ESTALE";
+        throw error;
+      }
+    };
     let baselineTranscript =
       anchor?.baselineTranscript ??
       (effectiveCursor?.portable
@@ -8980,27 +9041,47 @@ server.registerTool(
     let signals = {};
     let transcript = {};
     let metadata = null;
-    while (Date.now() <= deadline) {
-      metadata = expectedGeneration
-        ? await conditionalWindowsMetadata(sessionName, expectedGeneration)
-        : await backendLaunchMetadata(sessionName);
-      if (
-        effectiveCursor?.portable &&
-        (
-          ((expectedGeneration || effectiveCursor.resolvedSessionId) &&
-            metadata?.resolvedSessionId !==
-              effectiveCursor.resolvedSessionId) ||
-          (effectiveCursor.generationId &&
-            metadata?.generationId !== effectiveCursor.generationId) ||
-          (effectiveCursor.startedAtMs &&
-            metadata?.startedAtMs !== effectiveCursor.startedAtMs))
-      ) {
-        const error = new Error(
-          "afterCursor belongs to a different managed session generation."
-        );
-        error.code = "ESTALE";
-        throw error;
+    const terminalWaitResult = async (result, observation = null) => {
+      // The deadline can elapse before the first poll. Do not let posture's
+      // name-based fallback adopt a replacement in that zero-iteration case.
+      if (IS_NATIVE_WINDOWS && !metadata &&
+          (waitGenerationBinding || effectiveCursor?.portable)) {
+        metadata = waitGenerationBinding
+          ? await conditionalWindowsMetadata(sessionName, waitGenerationBinding)
+          : await backendLaunchMetadata(sessionName);
+        validateWaitCursorMetadata(metadata);
       }
+      const posture = await managedPostureReport(
+        sessionName, signals, metadata, observation
+      );
+      await pairedBoundaryTestHook(
+        "wait_before_terminal_check", sessionName, waitGenerationBinding
+      );
+      if (waitGenerationBinding) {
+        const currentMetadata = await conditionalWindowsMetadata(
+          sessionName, waitGenerationBinding
+        );
+        validateWaitCursorMetadata(currentMetadata);
+      }
+      // Commit completion state only after the final generation check succeeds.
+      // A stale wait must retain its anchor so an implicit retry stays bound,
+      // and an older wait must never erase a newer submission's anchor.
+      if (result.status === "completed" && anchor &&
+          pendingTurnAnchors.get(sessionName) === anchor) {
+        pendingTurnAnchors.delete(sessionName);
+      }
+      // All local reads, posture work and test barriers precede the last broker
+      // check. No asynchronous operation may follow it before this response.
+      return text({ ...result, posture });
+    };
+    await pairedBoundaryTestHook(
+      "wait_before_poll", sessionName, waitGenerationBinding
+    );
+    while (Date.now() <= deadline) {
+      metadata = waitGenerationBinding
+        ? await conditionalWindowsMetadata(sessionName, waitGenerationBinding)
+        : await backendLaunchMetadata(sessionName);
+      validateWaitCursorMetadata(metadata);
       if (
         anchor &&
         (metadata?.startedAtMs !== anchor.startedAtMs ||
@@ -9022,7 +9103,10 @@ server.registerTool(
         sessionName,
         input.lines,
         metadata,
-        expectedGeneration
+        waitGenerationBinding
+      );
+      await pairedBoundaryTestHook(
+        "wait_after_capture", sessionName, waitGenerationBinding
       );
       const observation = await sessionRuntimeObservation(metadata);
       signals = signalsWithWorkflowActivity(
@@ -9031,25 +9115,19 @@ server.registerTool(
       );
       transcript = await sessionTranscriptSnapshot(metadata);
       if (transcript.read?.attentionReason) {
-        return text({
+        return terminalWaitResult({
           status: "needs_attention",
           reason: transcript.read.attentionReason,
           managedSession: sessionName,
           capture,
           signals,
           transcript,
-          posture: await managedPostureReport(
-            sessionName,
-            signals,
-            metadata,
-            observation
-          ),
           note:
             transcript.read.attentionReason ===
             "session_record_exceeds_bounded_reader"
               ? "Claude's newest JSONL record exceeds the bounded transcript reader. Inspect the session log size before retrying or changing limits."
               : "Claude transcript identity or its regular session-log source is unavailable; inspect the managed session metadata before retrying.",
-        });
+        }, observation);
       }
       baselineTranscript ??= transcriptCursorBaseline(transcript);
       const decision = waitTurnDecision({
@@ -9066,10 +9144,7 @@ server.registerTool(
           null,
       });
       if (decision.status === "completed") {
-        if (anchor && pendingTurnAnchors.get(sessionName) === anchor) {
-          pendingTurnAnchors.delete(sessionName);
-        }
-        return text({
+        return terminalWaitResult({
           status: "completed",
           completionEvidence: decision.evidence,
           attention: decision.attention || undefined,
@@ -9077,39 +9152,26 @@ server.registerTool(
           capture,
           signals,
           transcript,
-          posture: await managedPostureReport(
-            sessionName,
-            signals,
-            metadata,
-            observation
-          ),
-        });
+        }, observation);
       }
       if (decision.status === "needs_attention") {
-        return text({
+        return terminalWaitResult({
           status: "needs_attention",
           reason: decision.evidence,
           managedSession: sessionName,
           capture,
           signals,
           transcript,
-          posture: await managedPostureReport(
-            sessionName,
-            signals,
-            metadata,
-            observation
-          ),
-        });
+        }, observation);
       }
       await sleep(input.pollIntervalMs);
     }
-    return text({
+    return terminalWaitResult({
       status: "timeout",
       managedSession: sessionName,
       capture,
       signals,
       transcript,
-      posture: await managedPostureReport(sessionName, signals, metadata),
     });
   }
 );

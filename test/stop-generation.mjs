@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { windowsBrokerRequest } from "../src/windows-broker-client.js";
@@ -118,9 +118,16 @@ const environment = {
   RAIL_FAKE_CLAUDE_EXIT_TRACE: path.join(root, "fixture-exit-trace.jsonl"),
 };
 const cleanupEnvironments = [environment];
+const publicationProbePath = path.join(root, "boundary-publication-probe.mjs");
+fs.writeFileSync(publicationProbePath, [
+  'import fs from "node:fs";',
+  'import path from "node:path";',
+  "(" + installBoundaryPublicationProbe.toString() + ")(" + JSON.stringify(boundaryHookDir) + ");",
+  "",
+].join("\n"));
 const transport = new StdioClientTransport({
   command: process.execPath,
-  args: ["src/index.js"],
+  args: ["--import", pathToFileURL(publicationProbePath).href, "src/index.js"],
   cwd: repoRoot,
   env: environment,
   stderr: "pipe",
@@ -778,6 +785,185 @@ async function publicGracefulTimeoutIdentityCoverage() {
       }
     }
     if (cleanupError) appendCleanupFailure(primaryError, cleanupError);
+  }
+}
+
+function installBoundaryPublicationProbe(hookDir) {
+  const entryPath = path.join(hookDir, "capture_after_metadata.entered.json");
+  const armPath = path.join(hookDir, "publication-probe.arm.json");
+  const observedPath = path.join(hookDir, "publication-probe.observed.json");
+  const pausedPath = path.join(hookDir, "publication-probe.paused");
+  const resumePath = path.join(hookDir, "publication-probe.resume");
+  const original = { open: fs.openSync, write: fs.writeFileSync, writeBytes: fs.writeSync,
+    link: fs.linkSync, rename: fs.renameSync, close: fs.closeSync };
+  let probe = null;
+  const fds = new Map();
+  function observe(data) {
+    original.write(observedPath, JSON.stringify(data), { flag: "wx" });
+    original.write(pausedPath, "", { flag: "wx" });
+  }
+  fs.openSync = (file, flags, ...rest) => {
+    const target = typeof file === "string" ? file : "";
+    const eligible = target === entryPath || (
+      path.dirname(target) === hookDir &&
+      path.basename(target).startsWith("capture_after_metadata.entered.") && target.endsWith(".tmp")
+    );
+    if (eligible && flags === "wx" && fs.existsSync(armPath)) {
+      const control = JSON.parse(fs.readFileSync(armPath, "utf8"));
+      if (control.entryPath !== entryPath) throw new Error("foreign publication probe arm");
+      original.rename(armPath, armPath + ".claimed");
+      probe = { ...control, target };
+      if (probe.mode === "staging-collision" && target !== entryPath) {
+        original.write(target, "synthetic preexisting staging sentinel", { flag: "wx" });
+        observe({ mode: probe.mode, target, entryExists: fs.existsSync(entryPath) });
+      }
+    }
+    const fd = original.open(file, flags, ...rest);
+    if (probe?.target === target) fds.set(fd, probe);
+    return fd;
+  };
+  fs.closeSync = (fd) => {
+    try { return original.close(fd); } finally { fds.delete(fd); }
+  };
+  fs.writeFileSync = (file, data, ...rest) => {
+    if (file === entryPath && fs.existsSync(armPath)) {
+      const fd = fs.openSync(file, rest[0]?.flag ?? "w", rest[0]?.mode);
+      try { return fs.writeFileSync(fd, data, ...rest); } finally { fs.closeSync(fd); }
+    }
+    const current = typeof file === "number" ? fds.get(file) : null;
+    if (current?.mode !== "partial") return original.write(file, data, ...rest);
+    const bytes = Buffer.from(data);
+    const split = Math.floor(bytes.length / 2);
+    original.writeBytes(file, bytes.subarray(0, split));
+    observe({ mode: current.mode, target: current.target,
+      partialBytes: fs.statSync(current.target).size, entryExists: fs.existsSync(entryPath) });
+    const deadline = Date.now() + 5000;
+    while (!fs.existsSync(resumePath)) {
+      if (Date.now() > deadline) throw new Error("publication probe was not released within its existing readiness budget");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+    original.writeBytes(file, bytes.subarray(split));
+  };
+  fs.linkSync = (source, target) => {
+    if (probe?.mode === "link-failure" && source === probe.target && target === entryPath) {
+      const error = new Error("synthetic publication link failure");
+      error.code = "EIO";
+      throw error;
+    }
+    return original.link(source, target);
+  };
+}
+
+async function pairedBoundaryPublicationCoverage() {
+  const stage = "capture_after_metadata";
+  const sessionName = "boundary_publication_" + process.pid;
+  const sessionId = "67676767-6767-4676-8676-676767676767";
+  const startLease = "boundary-publication-start";
+  const tracked = { metadata: null, leaseId: startLease };
+  const failures = [];
+  let primaryError = null;
+  try {
+    const started = await windowsBrokerRequest("start", directFixtureLaunch(sessionName, startLease, { sessionId }),
+      { env: environment, startIfMissing: false });
+    assert.equal(started.status, "started");
+    tracked.metadata = started.metadata;
+    const pair = brokerGenerationPair(started.metadata);
+    await waitForDirectFixtureReady(sessionName, started.metadata, "Fake Claude TUI");
+    await releaseDirectFixtureLease(sessionName, startLease, started.metadata);
+    tracked.leaseId = null;
+    for (const mode of ["partial", "preexisting-entry", "link-failure", "staging-collision"]) {
+      const observedPath = path.join(boundaryHookDir, "publication-probe.observed.json");
+      const pausedPath = path.join(boundaryHookDir, "publication-probe.paused");
+      const resumePath = path.join(boundaryHookDir, "publication-probe.resume");
+      const entryPath = boundaryPath(stage, "entered");
+      let capturing = null;
+      let settled = false;
+      let observation = null;
+      let caseError = null;
+      try {
+        for (const suffix of ["arm.json", "arm.json.claimed", "observed.json", "paused", "resume"]) {
+          fs.rmSync(path.join(boundaryHookDir, "publication-probe." + suffix), { force: true });
+        }
+        armPairedBoundary(stage, sessionName, pair);
+        const sentinel = JSON.stringify({ synthetic: "preexisting entered marker" });
+        if (mode === "preexisting-entry") fs.writeFileSync(entryPath, sentinel, { flag: "wx" });
+        fs.writeFileSync(path.join(boundaryHookDir, "publication-probe.arm.json"),
+          JSON.stringify({ mode, entryPath }), { flag: "wx" });
+        capturing = callTool("capture_remote_control", { managedSession: sessionName, ...pair });
+        capturing.catch(() => {});
+        if (mode === "partial") {
+          for (let attempt = 0; attempt < 200 && !fs.existsSync(pausedPath); attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          assert.ok(fs.existsSync(pausedPath), "the actual publisher must enter the controlled partial write");
+          observation = JSON.parse(fs.readFileSync(observedPath, "utf8"));
+          assert.ok(observation.partialBytes > 0);
+          assert.equal(observation.entryExists, false, "the actual publisher exposed its final marker before completing the write");
+          assert.equal(fs.existsSync(entryPath), false);
+          fs.writeFileSync(resumePath, "", { flag: "wx" });
+          const entered = await waitForPairedBoundary(stage);
+          assert.equal(entered.sessionName, sessionName);
+          assert.equal(entered.expectedGenerationId, pair.expectedGenerationId);
+          assert.equal(entered.expectedStartedAtMs, pair.expectedStartedAtMs);
+          assert.ok(entered.token);
+          releasePairedBoundary(stage, entered.token);
+        }
+        const result = await capturing;
+        settled = true;
+        if (mode === "partial") {
+          assert.equal(result.isError, undefined, contentText(result));
+          assert.equal(JSON.parse(fs.readFileSync(entryPath, "utf8")).sessionName, sessionName);
+        } else {
+          assert.equal(result.isError, true, mode + " unexpectedly published an entry");
+          assert.match(contentText(result), mode === "link-failure" ? /synthetic publication link failure/ : /EEXIST/);
+          if (mode === "preexisting-entry") assert.equal(fs.readFileSync(entryPath, "utf8"), sentinel);
+          else assert.equal(fs.existsSync(entryPath), false);
+        }
+        const staging = fs.readdirSync(boundaryHookDir).filter((name) =>
+          name.startsWith("capture_after_metadata.entered.") && name.endsWith(".tmp"));
+        if (mode === "staging-collision") {
+          observation = JSON.parse(fs.readFileSync(observedPath, "utf8"));
+          assert.deepEqual(staging, [path.basename(observation.target)]);
+          const sentinelPath = path.join(boundaryHookDir, staging[0]);
+          assert.equal(path.resolve(observation.target), path.resolve(sentinelPath));
+          assert.equal(fs.readFileSync(sentinelPath, "utf8"), "synthetic preexisting staging sentinel");
+          fs.unlinkSync(sentinelPath); // The probe owns this sentinel; the publisher did not create it.
+        } else assert.deepEqual(staging, [], mode + " left owned staging behind");
+        console.log("boundary-publication evidence " + JSON.stringify({ mode, status: "passed", finalHiddenDuringPartial: observation?.entryExists === false }));
+      } catch (error) {
+        caseError = error;
+        failures.push(error);
+      } finally {
+        const cleanupErrors = [];
+        if (capturing && !settled) {
+          try {
+            if (mode === "partial") {
+              if (!fs.existsSync(resumePath)) fs.writeFileSync(resumePath, "", { flag: "wx" });
+              const entered = await waitForPairedBoundary(stage);
+              releasePairedBoundary(stage, entered.token);
+            }
+          } catch (error) { cleanupErrors.push(error); }
+          try { await capturing; } catch (error) { cleanupErrors.push(error); }
+        }
+        if (cleanupErrors.length) {
+          if (caseError) for (const error of cleanupErrors) appendCleanupFailure(caseError, error);
+          else failures.push(new AggregateError(cleanupErrors, "publication probe cleanup failed"));
+          break;
+        }
+      }
+    }
+    if (failures.length) throw new AggregateError(failures, "paired boundary publication failed", { cause: failures[0] });
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    try {
+      if (tracked.metadata) await forceStopExactDirectFixture(sessionName,
+        { resolvedSessionId: sessionId, canonicalCwd: canonicalWorkspace }, tracked);
+    } catch (error) {
+      if (primaryError) appendCleanupFailure(primaryError, error);
+      else throw error;
+    }
   }
 }
 
@@ -1602,8 +1788,284 @@ async function exactPairReplacementInjectionCoverage() {
   );
 }
 
-let primaryError = null;
-try {
+async function waitTerminalGenerationCoverage() {
+  await windowsBrokerRequest("ping", {}, { env: environment });
+  await pairedBoundaryPublicationCoverage();
+  const cases = [
+    { name: "completed-after-capture", stage: "wait_after_capture", completion: "after_capture" },
+    { name: "cursor-only-completed-after-capture", stage: "wait_after_capture", completion: "after_capture", explicitPair: false },
+    { name: "completed-after-posture", stage: "wait_before_terminal_check", completion: "before_wait" },
+    { name: "remembered-anchor-stale-retry", stage: "wait_before_terminal_check", completion: "before_wait", rememberedAnchor: true, retryWait: true },
+    { name: "newer-remembered-anchor-control", stage: "wait_before_terminal_check", completion: "before_wait", rememberedAnchor: true, replace: false, resubmitAtBoundary: true, retryWait: true, retryExpectedStatus: "timeout", expectedStatus: "completed" },
+    { name: "read-attention-after-posture", stage: "wait_before_terminal_check", nonRegularLog: true },
+    { name: "decision-attention-after-posture", stage: "wait_before_terminal_check", approval: true },
+    { name: "timeout-after-posture", stage: "wait_before_terminal_check" },
+    { name: "zero-iteration-timeout", stage: "wait_before_poll", expireBeforePoll: true },
+    { name: "zero-iteration-cursor-mismatch", stage: "wait_before_poll", expireBeforePoll: true, cursorMismatch: true, replace: false },
+    { name: "cursor-only-completion-control", stage: "wait_after_capture", completion: "after_capture", explicitPair: false, replace: false, expectedStatus: "completed" },
+    { name: "empty-conversation-cursor-control", stage: "wait_after_capture", completion: "after_capture", explicitPair: false, cursorSessionId: "", replace: false, expectedStatus: "completed" },
+    { name: "partial-pair-cursor-control", completion: "before_wait", explicitPair: false, partialCursorPair: true, replace: false, expectedStatus: "completed" },
+    { name: "invalid-generation-cursor-control", explicitPair: false, invalidCursorGeneration: true, replace: false },
+    { name: "legacy-cursor-timeout-control", legacyCursor: true, replace: false, expectedStatus: "timeout" },
+    { name: "unbound-timeout-control", unbound: true, replace: false, expectedStatus: "timeout" },
+  ];
+  const failures = [];
+  for (const testCase of cases) {
+    try {
+      await waitTerminalGenerationCase(testCase);
+    } catch (error) {
+      failures.push(error);
+      if (error.fixtureCleanupFailed) break;
+    }
+  }
+  if (failures.length) {
+    throw new AggregateError(
+      failures,
+      `terminal wait generation failures: ${failures.map((error) => error.message).join("; ")}`,
+      { cause: failures[0] }
+    );
+  }
+}
+
+async function waitTerminalGenerationCase(testCase) {
+  const sessionName = `wait_terminal_${testCase.name}_${process.pid}`;
+  const startLease = `${testCase.name}-start`;
+  const replacementLease = `${testCase.name}-replacement`;
+  const sessionId = "67676767-6767-4676-8676-676767676767";
+  const otherSessionId = "78787878-7878-4787-8787-787878787878";
+  const expected = { resolvedSessionId: sessionId, canonicalCwd: canonicalWorkspace };
+  const tracked = { metadata: null, leaseId: startLease };
+  const logFile = path.join(
+    configDir, "projects", canonicalWorkspace.replace(/[^A-Za-z0-9]/g, "-"),
+    `${sessionId}.jsonl`
+  );
+  let nonRegularLog = false;
+  let savedLog = null;
+  let boundary = null;
+  let boundaryReleased = false;
+  let waitPromise = null;
+  let waitSettled = false;
+  let primaryError = null;
+  let completionMarker = null;
+  let completionGenerationId = null;
+  const restoreLog = () => {
+    if (!nonRegularLog) return;
+    fs.rmdirSync(logFile);
+    fs.writeFileSync(logFile, savedLog);
+    nonRegularLog = false;
+  };
+  const appendCompletion = () => {
+    completionGenerationId = tracked.metadata.generationId;
+    completionMarker = `synthetic-terminal-${testCase.name}-${completionGenerationId}`;
+    const records = [
+      { type: "user", uuid: randomUUID(), sessionId, timestamp: new Date().toISOString(), message: { role: "user", content: "synthetic terminal wait prompt" } },
+      { type: "assistant", uuid: randomUUID(), sessionId, timestamp: new Date().toISOString(), message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: completionMarker }] } },
+    ];
+    fs.appendFileSync(logFile, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+  };
+  try {
+    // Reusing the conversation is intentional: only the generation pair can
+    // distinguish the replacement from the original cursor's local log.
+    fs.rmSync(logFile, { force: true });
+    const started = await windowsBrokerRequest("start", directFixtureLaunch(
+      sessionName, startLease, {
+        sessionId,
+        banner: testCase.approval
+          ? "Do you want to proceed?\nYes, and don't ask again\nNo, and tell Claude what to do differently"
+          : "Fake Claude TUI",
+      }
+    ), { env: environment, startIfMissing: false });
+    assert.equal(started.status, "started");
+    tracked.metadata = started.metadata;
+    const pair = brokerGenerationPair(started.metadata);
+    await waitForDirectFixtureReady(sessionName, started.metadata,
+      testCase.approval ? "Do you want to proceed?" : "Fake Claude TUI");
+    await releaseDirectFixtureLease(sessionName, startLease, started.metadata);
+    tracked.leaseId = null;
+    const submitRememberedAnchor = async (label) => {
+      const submitted = await callTool("submit_prompt", {
+        managedSession: sessionName,
+        text: `synthetic remembered-anchor ${testCase.name} ${label}`,
+        submitRetries: 0, retryDelayMs: 250,
+        ...brokerGenerationPair(tracked.metadata),
+      });
+      assert.equal(submitted.isError, undefined, contentText(submitted));
+      const submittedResult = JSON.parse(contentText(submitted));
+      assert.equal(submittedResult.status, "submitted", "the public submit must create a remembered turn anchor");
+      const cursor = parsePortableWaitCursor(submittedResult.waitAfterCursor);
+      assert.equal(cursor.generationId, tracked.metadata.generationId);
+      assert.equal(cursor.startedAtMs, tracked.metadata.startedAtMs);
+      assert.equal(cursor.resolvedSessionId, sessionId);
+      return submittedResult.waitAfterCursor;
+    };
+    if (testCase.rememberedAnchor) await submitRememberedAnchor("original");
+    // Omit both the cursor and explicit pair so the public wait must consume
+    // the anchor created by the real submit, rather than a test-only map seam.
+    const afterCursor = testCase.unbound || testCase.rememberedAnchor ? undefined : testCase.legacyCursor
+      ? "legacy-terminal-wait-cursor"
+      : createPortableWaitCursor({}, {
+          ...started.metadata,
+          resolvedSessionId: testCase.cursorMismatch
+            ? otherSessionId : testCase.cursorSessionId ?? sessionId,
+          generationId: testCase.invalidCursorGeneration
+            ? "not-a-generation" : started.metadata.generationId,
+          startedAtMs: testCase.partialCursorPair ? null : started.metadata.startedAtMs,
+        }, Date.now());
+    if (testCase.completion === "before_wait") appendCompletion();
+    if (testCase.nonRegularLog) {
+      savedLog = fs.readFileSync(logFile);
+      fs.unlinkSync(logFile);
+      fs.mkdirSync(logFile);
+      nonRegularLog = true;
+    }
+    if (testCase.stage) armPairedBoundary(testCase.stage, sessionName, pair);
+    waitPromise = callTool("wait_for_claude_turn", {
+      managedSession: sessionName,
+      afterCursor,
+      timeoutSeconds: testCase.expireBeforePoll || !testCase.completion ? 1 : 3,
+      pollIntervalMs: 250,
+      ...(testCase.explicitPair !== false && !testCase.legacyCursor && !testCase.unbound && !testCase.rememberedAnchor ? pair : {}),
+    });
+    // Observe a possible transport rejection immediately; it is still awaited
+    // and propagated below, so no rejection can escape the exact cleanup.
+    waitPromise.catch(() => {});
+    if (testCase.stage) {
+      boundary = await waitForPairedBoundary(testCase.stage);
+      if (testCase.expireBeforePoll) {
+        await new Promise((resolve) => setTimeout(resolve, 1100));
+      }
+      restoreLog();
+      if (testCase.replace !== false) {
+        await acquireDirectFixtureLease(sessionName, replacementLease, started.metadata);
+        tracked.leaseId = replacementLease;
+        const replacement = await windowsBrokerRequest("replace", {
+          ...directFixtureLaunch(sessionName, replacementLease, { sessionId }),
+          ...pair,
+          graceful: false,
+          force: true,
+        }, { env: environment, startIfMissing: false });
+        assert.equal(replacement.status, "started");
+        tracked.metadata = replacement.metadata;
+        assert.equal(replacement.metadata.resolvedSessionId, sessionId);
+        assert.notEqual(replacement.metadata.generationId, started.metadata.generationId);
+        await waitForDirectFixtureReady(sessionName, replacement.metadata, "Fake Claude TUI");
+      }
+      if (testCase.completion === "after_capture") appendCompletion();
+      if (testCase.resubmitAtBoundary) await submitRememberedAnchor("newer");
+      releasePairedBoundary(testCase.stage, boundary.token);
+      boundaryReleased = true;
+    }
+    const waited = await waitPromise;
+    waitSettled = true;
+    let result;
+    try { result = JSON.parse(contentText(waited)); } catch { result = {}; }
+    const surviving = (await brokerStatus()).managedSessions.find((session) => session.name === sessionName);
+    assert.equal(surviving?.generationId, tracked.metadata.generationId);
+    assert.equal(surviving?.resolvedSessionId, sessionId);
+    assert.equal(surviving?.exited, false, "terminal waiting must preserve the exact running generation");
+    const returnedAssistant = result.transcript?.lastAssistant;
+    const returnedInjectedMarker = Boolean(
+      completionMarker && returnedAssistant?.text === completionMarker &&
+      returnedAssistant?.textSha256 === `sha256:${createHash("sha256").update(completionMarker).digest("hex")}`
+    );
+    fs.writeFileSync(path.join(root, `${testCase.name}.wait-evidence.json`), `${JSON.stringify({
+      case: testCase.name, status: result.status ?? null, isError: Boolean(waited.isError),
+      originalGenerationId: started.metadata.generationId,
+      survivingGenerationId: surviving.generationId,
+      completionGenerationId, completionMarker, returnedAssistant,
+      sameConversation: surviving.resolvedSessionId === sessionId,
+    })}\n`);
+    console.log(`wait-terminal evidence ${JSON.stringify({
+      case: testCase.name, status: result.status ?? null, isError: Boolean(waited.isError),
+      exactGenerationPreserved: true,
+      completionSource: completionGenerationId
+        ? completionGenerationId === started.metadata.generationId ? "original" : "replacement"
+        : null,
+      returnedInjectedMarker,
+    })}`);
+    if (completionMarker && !waited.isError) {
+      assert.equal(returnedInjectedMarker, true, "completion must return the exact injected generation-specific assistant marker");
+    }
+    if (testCase.expectedStatus) {
+      assert.equal(waited.isError, undefined, contentText(waited));
+      assert.equal(result.status, testCase.expectedStatus);
+    } else {
+      assert.equal(waited.isError, true,
+        `${testCase.name} accepted stale terminal status ${result.status ?? "unknown"}`);
+      assert.match(contentText(waited), /generation changed|stale|different managed session generation/i);
+    }
+    if (testCase.retryWait) {
+      if (!testCase.resubmitAtBoundary) appendCompletion();
+      const retried = await callTool("wait_for_claude_turn", {
+        managedSession: sessionName, timeoutSeconds: 1, pollIntervalMs: 250,
+      });
+      let retryResult;
+      try { retryResult = JSON.parse(contentText(retried)); } catch { retryResult = {}; }
+      const retrySurviving = (await brokerStatus()).managedSessions.find((session) => session.name === sessionName);
+      assert.equal(retrySurviving?.generationId, tracked.metadata.generationId);
+      assert.equal(retrySurviving?.resolvedSessionId, sessionId);
+      assert.equal(retrySurviving?.exited, false, "retry must preserve the exact running generation");
+      const retryAssistant = retryResult.transcript?.lastAssistant;
+      const retryReturnedMarker = Boolean(completionMarker &&
+        retryAssistant?.text === completionMarker &&
+        retryAssistant?.textSha256 === `sha256:${createHash("sha256").update(completionMarker).digest("hex")}`);
+      fs.writeFileSync(path.join(root, `${testCase.name}.retry-evidence.json`), `${JSON.stringify({
+        case: testCase.name, status: retryResult.status ?? null, isError: Boolean(retried.isError),
+        originalGenerationId: started.metadata.generationId,
+        survivingGenerationId: retrySurviving.generationId,
+        sameConversation: retrySurviving.resolvedSessionId === sessionId,
+        completionGenerationId, completionMarker, returnedAssistant: retryAssistant, retryReturnedMarker,
+        omittedCursorAndPair: true,
+      })}\n`);
+      console.log(`wait-anchor retry evidence ${JSON.stringify({
+        case: testCase.name, status: retryResult.status ?? null, isError: Boolean(retried.isError),
+        exactGenerationPreserved: true, sameConversation: true, retryReturnedMarker,
+        completionSource: completionGenerationId === started.metadata.generationId ? "original" : "replacement",
+        omittedCursorAndPair: true,
+      })}`);
+      if (testCase.retryExpectedStatus) {
+        assert.equal(retried.isError, undefined, contentText(retried));
+        assert.equal(retryResult.status, testCase.retryExpectedStatus,
+          "the original completed wait must preserve the newer remembered anchor");
+      } else {
+        assert.equal(retried.isError, true,
+          `${testCase.name} retry accepted replacement terminal status ${retryResult.status ?? "unknown"}`);
+        assert.match(contentText(retried), /generation changed|stale|different managed session generation/i);
+      }
+    }
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    const cleanupErrors = [];
+    for (const cleanup of [
+      async () => {
+      if (boundary && !boundaryReleased) releasePairedBoundary(testCase.stage, boundary.token);
+      },
+      async () => {
+      if (waitPromise && !waitSettled) await waitPromise;
+      },
+      async () => restoreLog(),
+      async () => {
+      if (tracked.metadata) await forceStopExactDirectFixture(sessionName, expected, tracked);
+      },
+    ]) {
+      try { await cleanup(); } catch (error) { cleanupErrors.push(error); }
+    }
+    if (cleanupErrors.length) {
+      if (primaryError) {
+        primaryError.fixtureCleanupFailed = true;
+        for (const error of cleanupErrors) appendCleanupFailure(primaryError, error);
+      } else {
+        const error = new AggregateError(cleanupErrors, "terminal wait fixture cleanup failed");
+        error.fixtureCleanupFailed = true;
+        throw error;
+      }
+    }
+  }
+}
+
+async function defaultStopGenerationCoverage() {
   await conditionalStopRejectsWithoutBroker();
   await pairedReviewOperationsRejectWithoutBroker();
   await client.connect(transport, { timeout: 30000 });
@@ -1611,6 +2073,7 @@ try {
   await exitedStartupRetainsOriginalBinding();
   await startRetainsOriginalBindingWhileLeaseBlocksReplacement();
   await exactPairReplacementInjectionCoverage();
+  await waitTerminalGenerationCoverage();
 
   const unpaired = await callTool("stop_remote_control", {
     managedSession,
@@ -1985,7 +2448,17 @@ try {
   await exactStopIdentityCoverage();
   await publicStopIdentityCoverage();
   await publicGracefulTimeoutIdentityCoverage();
+}
 
+const focusedWaitTerminal = process.argv.includes("--wait-terminal-generation-only");
+let primaryError = null;
+try {
+  if (focusedWaitTerminal) {
+    await client.connect(transport, { timeout: 30000 });
+    await waitTerminalGenerationCoverage();
+  } else {
+    await defaultStopGenerationCoverage();
+  }
 } catch (error) {
   primaryError = error;
   throw error;

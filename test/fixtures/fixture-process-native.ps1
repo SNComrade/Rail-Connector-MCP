@@ -11,7 +11,7 @@ $ProgressPreference = 'SilentlyContinue'
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 function Write-InspectPhase(
-  [ValidateSet('script-entry', 'before-add-type', 'after-add-type', 'open-process', 'read-identity', 'write-identity', 'exit-success', 'exit-error')]
+  [ValidateSet('script-entry', 'before-add-type', 'after-add-type', 'before-native-bind', 'after-native-bind', 'open-process', 'read-identity', 'write-identity', 'exit-success', 'exit-error')]
   [string]$Phase
 ) {
   if ($Operation -eq 'Inspect') {
@@ -66,6 +66,85 @@ public static class PmeFixtureProcess {
 }
 '@
 
+# INSPECT_NATIVE_BINDINGS_BEGIN
+function Initialize-InspectNativeBindings {
+  # Inspect needs only these query/capture APIs. Emit their reviewed signatures
+  # in memory so the first inspection does not launch the C# compiler. Serve
+  # continues to compile its unchanged source, including Arguments/termination.
+  $contracts = @(
+    @{ Name = 'GetCurrentProcess'; Return = [IntPtr]; Parameters = [Type[]]@(); LastError = $false; Unicode = $false; Out = @() },
+    @{ Name = 'GetProcessId'; Return = [uint32]; Parameters = [Type[]]@([IntPtr]); LastError = $true; Unicode = $false; Out = @() },
+    @{ Name = 'DuplicateHandle'; Return = [bool]; Parameters = [Type[]]@([IntPtr], [IntPtr], [IntPtr], [IntPtr].MakeByRefType(), [uint32], [bool], [uint32]); LastError = $true; Unicode = $false; Out = @(4) },
+    @{ Name = 'OpenProcess'; Return = [IntPtr]; Parameters = [Type[]]@([uint32], [bool], [int32]); LastError = $true; Unicode = $false; Out = @() },
+    @{ Name = 'GetProcessTimes'; Return = [bool]; Parameters = [Type[]]@([IntPtr], [long].MakeByRefType(), [long].MakeByRefType(), [long].MakeByRefType(), [long].MakeByRefType()); LastError = $true; Unicode = $false; Out = @(2, 3, 4, 5) },
+    @{ Name = 'QueryFullProcessImageName'; Return = [bool]; Parameters = [Type[]]@([IntPtr], [uint32], [Text.StringBuilder], [int32].MakeByRefType()); LastError = $true; Unicode = $true; Out = @() },
+    @{ Name = 'WaitForSingleObject'; Return = [uint32]; Parameters = [Type[]]@([IntPtr], [uint32]); LastError = $true; Unicode = $false; Out = @() },
+    @{ Name = 'CloseHandle'; Return = [bool]; Parameters = [Type[]]@([IntPtr]); LastError = $false; Unicode = $false; Out = @() }
+  )
+  $assemblyName = [Reflection.AssemblyName]::new('PmeFixtureInspectNative')
+  $assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly($assemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+  $module = $assembly.DefineDynamicModule($assemblyName.Name)
+  $type = $module.DefineType('PmeFixtureProcess',
+    [Reflection.TypeAttributes]::Public -bor [Reflection.TypeAttributes]::Abstract -bor [Reflection.TypeAttributes]::Sealed)
+  $importConstructor = [Runtime.InteropServices.DllImportAttribute].GetConstructor([Type[]]@([string]))
+  $importFields = [Reflection.FieldInfo[]]@('EntryPoint', 'SetLastError', 'CharSet', 'CallingConvention', 'ExactSpelling', 'PreserveSig' | ForEach-Object {
+    [Runtime.InteropServices.DllImportAttribute].GetField($_)
+  })
+  $marshalConstructor = [Runtime.InteropServices.MarshalAsAttribute].GetConstructor([Type[]]@([Runtime.InteropServices.UnmanagedType]))
+  foreach ($contract in $contracts) {
+    $method = $type.DefineMethod($contract.Name,
+      [Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl,
+      [Reflection.CallingConventions]::Standard, $contract.Return, $contract.Parameters)
+    $characterSet = if ($contract.Unicode) { [Runtime.InteropServices.CharSet]::Unicode } else { [Runtime.InteropServices.CharSet]::None }
+    # DllImport is a pseudoattribute. Set every import flag together so its
+    # defaults cannot reset Unicode, the entry point or the calling convention.
+    $import = [Reflection.Emit.CustomAttributeBuilder]::new($importConstructor,
+      [object[]]@('kernel32.dll'), $importFields,
+      [object[]]@($contract.Name, $contract.LastError, $characterSet, [Runtime.InteropServices.CallingConvention]::Winapi, $false, $true))
+    $method.SetCustomAttribute($import)
+    $method.SetImplementationFlags($method.GetMethodImplementationFlags() -bor [Reflection.MethodImplAttributes]::PreserveSig)
+    for ($position = 1; $position -le $contract.Parameters.Length; $position++) {
+      $attributes = if ($contract.Out -contains $position) { [Reflection.ParameterAttributes]::Out } else { [Reflection.ParameterAttributes]::None }
+      [void]$method.DefineParameter($position, $attributes, $null)
+    }
+    if ($contract.Return -eq [bool]) {
+      $returned = $method.DefineParameter(0, [Reflection.ParameterAttributes]::None, $null)
+      $returned.SetCustomAttribute([Reflection.Emit.CustomAttributeBuilder]::new($marshalConstructor,
+        [object[]]@([Runtime.InteropServices.UnmanagedType]::Bool)))
+    }
+  }
+  $created = $type.CreateType()
+  # Validate the actual emitted metadata before any native API is invoked.
+  # Int64& is the existing exact FILETIME layout; never marshal it as a double.
+  $methods = @($created.GetMethods([Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::NonPublic -bor [Reflection.BindingFlags]::Static -bor [Reflection.BindingFlags]::Instance -bor [Reflection.BindingFlags]::DeclaredOnly))
+  if ($methods.Length -ne 8 -or $methods.Name -contains 'TerminateProcess') { throw 'Inspect native API set is invalid' }
+  foreach ($contract in $contracts) {
+    $method = $created.GetMethod($contract.Name)
+    $imports = @($method.GetCustomAttributes([Runtime.InteropServices.DllImportAttribute], $false))
+    $parameters = @($method.GetParameters())
+    $characterSet = if ($contract.Unicode) { [Runtime.InteropServices.CharSet]::Unicode } else { [Runtime.InteropServices.CharSet]::None }
+    if (-not $method.IsPublic -or -not $method.IsStatic -or $method.ReturnType -ne $contract.Return -or
+        $method.CallingConvention -ne [Reflection.CallingConventions]::Standard -or
+        ($method.Attributes -band [Reflection.MethodAttributes]::PinvokeImpl) -eq 0 -or
+        ($method.GetMethodImplementationFlags() -band [Reflection.MethodImplAttributes]::PreserveSig) -eq 0 -or
+        $imports.Length -ne 1 -or $imports[0].Value -cne 'kernel32.dll' -or
+        $imports[0].EntryPoint -cne $contract.Name -or $imports[0].SetLastError -ne $contract.LastError -or
+        $imports[0].CharSet -ne $characterSet -or $imports[0].CallingConvention -ne [Runtime.InteropServices.CallingConvention]::Winapi -or
+        $imports[0].ExactSpelling -or -not $imports[0].PreserveSig -or $parameters.Length -ne $contract.Parameters.Length) {
+      throw 'Inspect native ABI metadata is invalid'
+    }
+    for ($position = 0; $position -lt $parameters.Length; $position++) {
+      if ($parameters[$position].ParameterType -ne $contract.Parameters[$position] -or
+          $parameters[$position].IsOut -ne ($contract.Out -contains ($position + 1))) { throw 'Inspect native parameter ABI is invalid' }
+    }
+    if ($contract.Return -eq [bool]) {
+      $marshal = @($method.ReturnParameter.GetCustomAttributes([Runtime.InteropServices.MarshalAsAttribute], $false))
+      if ($marshal.Length -ne 1 -or $marshal[0].Value -ne [Runtime.InteropServices.UnmanagedType]::Bool) { throw 'Inspect native BOOL ABI is invalid' }
+    }
+  }
+}
+# INSPECT_NATIVE_BINDINGS_END
+
 function Write-Message($Value) {
   [Console]::Out.WriteLine(($Value | ConvertTo-Json -Compress -Depth 8))
   [Console]::Out.Flush()
@@ -98,9 +177,15 @@ function Test-ProcessLive([IntPtr]$Handle) {
 }
 
 try {
-  Write-InspectPhase 'before-add-type'
-  Add-Type -TypeDefinition $nativeSource | Out-Null
-  Write-InspectPhase 'after-add-type'
+  if ($Operation -eq 'Inspect') {
+    Write-InspectPhase 'before-native-bind'
+    Initialize-InspectNativeBindings
+    Write-InspectPhase 'after-native-bind'
+  } else {
+    Write-InspectPhase 'before-add-type'
+    Add-Type -TypeDefinition $nativeSource | Out-Null
+    Write-InspectPhase 'after-add-type'
+  }
   if ($Operation -eq 'Inspect') {
     if ($ProcessId -le 0) { throw 'a positive process ID is required' }
     # Query and synchronization only: recording a fixture never grants termination.

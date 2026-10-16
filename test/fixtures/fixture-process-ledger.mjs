@@ -305,7 +305,7 @@ function captureFixtureProcess(pid, controller) {
     outputBytes += Buffer.byteLength(bytes);
     if (outputBytes > 1024 * 1024) return cancel("output");
     stderrTail = (stderrTail + bytes.toString("utf8")).slice(-1024);
-    for (const match of stderrTail.matchAll(/\[fixture-inspect\] phase=(script-entry|before-add-type|after-add-type|open-process|read-identity|write-identity|exit-success|exit-error)/g)) lastPhase = match[1];
+    for (const match of stderrTail.matchAll(/\[fixture-inspect\] phase=(script-entry|before-add-type|after-add-type|before-native-bind|after-native-bind|open-process|read-identity|write-identity|exit-success|exit-error)/g)) lastPhase = match[1];
   });
   child.once("exit", (code) => {
     exited = true;
