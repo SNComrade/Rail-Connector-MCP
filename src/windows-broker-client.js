@@ -7,10 +7,10 @@ import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 export const WINDOWS_BROKER_PROTOCOL = 1;
-// Exact stop identity adds broker-enforced fields. Keep the compatibility
-// version strict so a client cannot send them to an already-running older
-// broker that would ignore the fields.
-export const WINDOWS_BROKER_VERSION = "1.0.0-beta.4+broker.4";
+// Keep compatibility strict for broker-enforced stop identity and the native
+// terminal backend. An already-running older broker cannot supply these
+// guarantees and must not be reused.
+export const WINDOWS_BROKER_VERSION = "1.0.0-beta.4+broker.6";
 const BROKER_START_TIMEOUT_MS = 15000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;

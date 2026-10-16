@@ -8921,23 +8921,27 @@ server.registerTool(
       metadata,
       expectedGeneration
     );
+    await pairedBoundaryTestHook(
+      "capture_after_capture", sessionName, expectedGeneration
+    );
     const observation = await sessionRuntimeObservation(metadata);
     const signals = signalsWithWorkflowActivity(
       captureSignals(capture),
       observation.workflowActivity
     );
-    return text({
-      managedSession: sessionName,
-      capture,
-      signals,
-      transcript: await sessionTranscriptSnapshot(metadata),
-      posture: await managedPostureReport(
-        sessionName,
-        signals,
-        metadata,
-        observation
-      ),
-    });
+    const transcript = await sessionTranscriptSnapshot(metadata);
+    const posture = await managedPostureReport(
+      sessionName, signals, metadata, observation
+    );
+    await pairedBoundaryTestHook(
+      "capture_before_terminal_check", sessionName, expectedGeneration
+    );
+    if (expectedGeneration) {
+      await conditionalWindowsMetadata(sessionName, expectedGeneration);
+    }
+    // All evidence and posture reads precede the final generation check.
+    // Return synchronously so a paired capture cannot adopt a replacement.
+    return text({ managedSession: sessionName, capture, signals, transcript, posture });
   }
 );
 

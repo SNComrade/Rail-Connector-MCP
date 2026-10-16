@@ -1051,9 +1051,11 @@ async function productionBoundaryHookIsInert() {
       ...pair,
     }, { env: productionEnvironment, startIfMissing: false });
     assert.equal(released.status, "released");
-    const armPath = path.join(productionHookDir, "capture_after_metadata.arm.json");
-    const enteredPath = path.join(productionHookDir, "capture_after_metadata.entered.json");
-    fs.writeFileSync(armPath, `${JSON.stringify({ sessionName: productionSession, ...pair })}\n`, { flag: "wx" });
+    const captureStages = ["capture_after_metadata", "capture_after_capture", "capture_before_terminal_check"];
+    for (const stage of captureStages) {
+      fs.writeFileSync(path.join(productionHookDir, stage + ".arm.json"),
+        JSON.stringify({ sessionName: productionSession, ...pair }) + "\n", { flag: "wx" });
+    }
     const captured = await productionClient.callTool(
       { name: "capture_remote_control", arguments: { managedSession: productionSession, ...pair } },
       undefined,
@@ -1061,11 +1063,11 @@ async function productionBoundaryHookIsInert() {
     );
     assert.equal(captured.isError, undefined, contentText(captured));
     assert.match(contentText(captured), /Fake Claude TUI/);
-    assert.equal(
-      fs.existsSync(enteredPath),
-      false,
-      "the matching paired-boundary arm must be ignored when the server is not in test mode"
-    );
+    for (const stage of captureStages) {
+      assert.equal(fs.existsSync(path.join(productionHookDir, stage + ".entered.json")), false,
+        "the matching capture boundary must be ignored outside test mode");
+      assert.equal(fs.existsSync(path.join(productionHookDir, stage + ".arm.json")), true);
+    }
   } catch (error) {
     primaryError = error;
     throw error;
@@ -1788,6 +1790,183 @@ async function exactPairReplacementInjectionCoverage() {
   );
 }
 
+
+async function captureTerminalGenerationCoverage() {
+  await windowsBrokerRequest("ping", {}, { env: environment });
+  const cases = [
+    { name: "after-capture-same-conversation", stage: "capture_after_capture", replace: true },
+    { name: "after-posture-same-conversation", stage: "capture_before_terminal_check", replace: true },
+    { name: "paired-capture-control", stage: "capture_after_capture" },
+    { name: "paired-posture-control", stage: "capture_before_terminal_check" },
+    { name: "legacy-unbound-control", stage: "capture_after_capture", unbound: true },
+    { name: "partial-generation-control", partial: "generation" },
+    { name: "partial-start-time-control", partial: "started" },
+  ];
+  const failures = [];
+  for (const testCase of cases) {
+    try { await captureTerminalGenerationCase(testCase); }
+    catch (error) {
+      failures.push(error);
+      if (error.fixtureCleanupFailed) break;
+    }
+  }
+  if (failures.length) {
+    throw new AggregateError(failures,
+      "terminal capture generation failures: " + failures.map((error) => error.message).join("; "),
+      { cause: failures[0] });
+  }
+}
+
+async function captureTerminalGenerationCase(testCase) {
+  const sessionName = "capture_terminal_" + testCase.name + "_" + process.pid;
+  const startLease = testCase.name + "-start";
+  const replacementLease = testCase.name + "-replacement";
+  const sessionId = "67676767-6767-4676-8676-676767676767";
+  const expected = { resolvedSessionId: sessionId, canonicalCwd: canonicalWorkspace };
+  const tracked = { metadata: null, leaseId: startLease };
+  const logFile = path.join(configDir, "projects",
+    canonicalWorkspace.replace(/[^A-Za-z0-9]/g, "-"), sessionId + ".jsonl");
+  const originalBanner = "CAPTURE_ORIGINAL_READY_" + testCase.name;
+  const replacementBanner = "CAPTURE_REPLACEMENT_READY_" + testCase.name;
+  const assistantRecord = (marker) => ({
+    type: "assistant", uuid: randomUUID(), sessionId, timestamp: new Date().toISOString(),
+    message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: marker }] },
+  });
+  let boundary = null;
+  let boundaryReleased = false;
+  let capturePromise = null;
+  let captureSettled = false;
+  let primaryError = null;
+  try {
+    fs.rmSync(logFile, { force: true });
+    const started = await windowsBrokerRequest("start",
+      directFixtureLaunch(sessionName, startLease, { sessionId, banner: originalBanner }),
+      { env: environment, startIfMissing: false });
+    assert.equal(started.status, "started");
+    tracked.metadata = started.metadata;
+    const pair = brokerGenerationPair(started.metadata);
+    await waitForDirectFixtureReady(sessionName, started.metadata, originalBanner);
+    await releaseDirectFixtureLease(sessionName, startLease, started.metadata);
+    tracked.leaseId = null;
+    const originalMarker = "synthetic-capture-original-" + testCase.name + "-" + started.metadata.generationId;
+    const userRecord = {
+      type: "user", uuid: randomUUID(), sessionId, timestamp: new Date().toISOString(),
+      message: { role: "user", content: "synthetic capture generation prompt" },
+    };
+    fs.appendFileSync(logFile, [userRecord, assistantRecord(originalMarker)]
+      .map((record) => JSON.stringify(record)).join("\n") + "\n");
+    if (testCase.stage) armPairedBoundary(testCase.stage, sessionName, pair);
+    const suppliedPair = testCase.unbound ? {} : testCase.partial === "generation"
+      ? { expectedGenerationId: pair.expectedGenerationId }
+      : testCase.partial === "started" ? { expectedStartedAtMs: pair.expectedStartedAtMs } : pair;
+    capturePromise = callTool("capture_remote_control", { managedSession: sessionName, ...suppliedPair });
+    capturePromise.catch(() => {});
+    let replacementMarker = null;
+    if (testCase.stage && !testCase.unbound) {
+      boundary = await waitForPairedBoundary(testCase.stage);
+      if (testCase.replace) {
+        await acquireDirectFixtureLease(sessionName, replacementLease, started.metadata);
+        tracked.leaseId = replacementLease;
+        const replacement = await windowsBrokerRequest("replace", {
+          ...directFixtureLaunch(sessionName, replacementLease, { sessionId, banner: replacementBanner }),
+          ...pair, graceful: false, force: true,
+        }, { env: environment, startIfMissing: false });
+        assert.equal(replacement.status, "started");
+        tracked.metadata = replacement.metadata;
+        assert.equal(replacement.metadata.resolvedSessionId, sessionId);
+        assert.notEqual(replacement.metadata.generationId, started.metadata.generationId);
+        await waitForDirectFixtureReady(sessionName, replacement.metadata, replacementBanner);
+        replacementMarker = "synthetic-capture-replacement-" + testCase.name + "-" + replacement.metadata.generationId;
+        fs.appendFileSync(logFile, JSON.stringify(assistantRecord(replacementMarker)) + "\n");
+      }
+      releasePairedBoundary(testCase.stage, boundary.token);
+      boundaryReleased = true;
+    }
+    const captured = await capturePromise;
+    captureSettled = true;
+    let result;
+    try { result = JSON.parse(contentText(captured)); } catch { result = {}; }
+    const surviving = (await brokerStatus()).managedSessions.find((session) => session.name === sessionName);
+    assert.deepEqual(brokerGenerationPair(surviving), brokerGenerationPair(tracked.metadata),
+      "capture must preserve the exact generation pair");
+    assert.equal(surviving.pid, tracked.metadata.pid, "capture must preserve the exact fixture PID");
+    assert.equal(surviving.canonicalCwd, canonicalWorkspace);
+    assert.equal(surviving.resolvedSessionId, sessionId);
+    assert.equal(surviving.exited, false, "capture must preserve the exact running generation");
+    const returnedAssistant = result.transcript?.lastAssistant;
+    const matchesMarker = (marker) => Boolean(marker && returnedAssistant?.text === marker &&
+      returnedAssistant?.textSha256 === "sha256:" + createHash("sha256").update(marker).digest("hex"));
+    const oldTerminalReturned = typeof result.capture === "string" && result.capture.includes(originalBanner) &&
+      !result.capture.includes(replacementBanner);
+    const returnedOriginalMarker = matchesMarker(originalMarker);
+    const returnedReplacementMarker = matchesMarker(replacementMarker);
+    const evidence = {
+      case: testCase.name, isError: Boolean(captured.isError), stage: testCase.stage ?? null,
+      originalGenerationId: started.metadata.generationId, survivingGenerationId: surviving.generationId,
+      originalPair: pair, originalPid: started.metadata.pid,
+      replacementPair: testCase.replace ? brokerGenerationPair(tracked.metadata) : null,
+      replacementPid: testCase.replace ? tracked.metadata.pid : null,
+      survivingPair: brokerGenerationPair(surviving), survivingPid: surviving.pid,
+      sameConversation: surviving.resolvedSessionId === sessionId, replacementAlive: !surviving.exited,
+      originalMarker, replacementMarker, returnedAssistant, oldTerminalReturned,
+      returnedOriginalMarker, returnedReplacementMarker, rawResult: captured,
+    };
+    fs.writeFileSync(path.join(root, testCase.name + ".capture-evidence.json"), JSON.stringify(evidence) + "\n");
+    console.log("capture-terminal evidence " + JSON.stringify({
+      case: testCase.name, isError: evidence.isError, sameConversation: evidence.sameConversation,
+      exactGenerationPreserved: true, oldTerminalReturned, returnedOriginalMarker, returnedReplacementMarker,
+    }));
+    if (testCase.replace) {
+      // On the instrumented old runtime the assertion fails with raw proof:
+      // after-capture combines old A terminal with new B transcript, whereas
+      // after-posture wrongly accepts the already assembled A snapshot.
+      if (!captured.isError) {
+        assert.equal(oldTerminalReturned, true, "RED capture must retain the original generation's terminal");
+        assert.equal(testCase.stage === "capture_after_capture"
+          ? returnedReplacementMarker : returnedOriginalMarker, true,
+        "RED capture must return the exact stage-specific assistant marker and tagged digest");
+      }
+      assert.equal(captured.isError, true, testCase.name + " accepted a stale capture response");
+      assert.match(contentText(captured), /generation changed|stale|different managed session generation/i);
+    } else if (testCase.partial) {
+      assert.equal(captured.isError, true, "partial generation binding must remain rejected");
+      assert.match(contentText(captured), /must be supplied together/i);
+    } else {
+      assert.equal(captured.isError, undefined, contentText(captured));
+      assert.equal(oldTerminalReturned, true);
+      assert.equal(returnedOriginalMarker, true, "valid capture must return the exact original transcript");
+      if (testCase.unbound) {
+        assert.equal(fs.existsSync(boundaryPath(testCase.stage, "entered")), false,
+          "unbound capture must not enter a paired test hook");
+        assert.equal(fs.existsSync(boundaryPath(testCase.stage, "arm")), true);
+      }
+    }
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    const cleanupErrors = [];
+    for (const cleanup of [
+      async () => { if (boundary && !boundaryReleased) releasePairedBoundary(testCase.stage, boundary.token); },
+      async () => { if (capturePromise && !captureSettled) await capturePromise; },
+      async () => { if (tracked.metadata) await forceStopExactDirectFixture(sessionName, expected, tracked); },
+    ]) {
+      try { await cleanup(); } catch (error) { cleanupErrors.push(error); }
+    }
+    if (cleanupErrors.length) {
+      const cleanupError = new AggregateError(cleanupErrors, "terminal capture fixture cleanup failed",
+        { cause: cleanupErrors[0] });
+      if (primaryError) {
+        primaryError.fixtureCleanupFailed = true;
+        appendCleanupFailure(primaryError, cleanupError);
+      } else {
+        cleanupError.fixtureCleanupFailed = true;
+        throw cleanupError;
+      }
+    }
+  }
+}
+
 async function waitTerminalGenerationCoverage() {
   await windowsBrokerRequest("ping", {}, { env: environment });
   await pairedBoundaryPublicationCoverage();
@@ -2074,6 +2253,7 @@ async function defaultStopGenerationCoverage() {
   await startRetainsOriginalBindingWhileLeaseBlocksReplacement();
   await exactPairReplacementInjectionCoverage();
   await waitTerminalGenerationCoverage();
+  await captureTerminalGenerationCoverage();
 
   const unpaired = await callTool("stop_remote_control", {
     managedSession,
@@ -2451,9 +2631,14 @@ async function defaultStopGenerationCoverage() {
 }
 
 const focusedWaitTerminal = process.argv.includes("--wait-terminal-generation-only");
+const focusedCaptureTerminal = process.argv.includes("--capture-terminal-generation-only");
 let primaryError = null;
 try {
-  if (focusedWaitTerminal) {
+  if (focusedCaptureTerminal) {
+    await client.connect(transport, { timeout: 30000 });
+    await productionBoundaryHookIsInert();
+    await captureTerminalGenerationCoverage();
+  } else if (focusedWaitTerminal) {
     await client.connect(transport, { timeout: 30000 });
     await waitTerminalGenerationCoverage();
   } else {

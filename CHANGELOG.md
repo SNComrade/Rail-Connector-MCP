@@ -22,6 +22,10 @@ Semantic Versioning after the first stable release.
 - Current Claude CLI capability probing, safe keyword delivery, workflow
   completion observations, and operator/debugger/reviewer guidance
 - Reviewed dependency ranges aligned with the development source
+- Pin node-pty 1.2.0-beta.15 and select its bundled Windows ConPTY backend,
+  including the upstream native handle-registry synchronization fix
+- Apply a tracked, version/hash-verified JavaScript install fix exposing a bounded
+  startup budget for slow worker readiness while retaining native-connect safeguards
 
 ### Fixed
 
@@ -35,12 +39,17 @@ Semantic Versioning after the first stable release.
   sharing failures while retaining genuine permission failures and timeout causes
 - Validate deterministic replacement-launch metadata before stopping an existing
   managed generation, preserving its process, state and mutation lease on rejection
+- Avoid the legacy Windows console-list helper and deferred numeric-PID forced
+  termination path; await the original PTY's process identity during async startup
 
 ### Known Limitations
 
 - Completing or stopping a Claude turn does not close its host MCP client's
   connection. Idle stdio servers exit when that client closes input; client
   connection retention still requires separate host investigation.
+- The pinned node-pty release and bundled DLL option remain prerelease and
+  experimental. Upstream natural-exit native handle leakage is unresolved;
+  successful terminal stop does not prove all native resources are released.
 
 ### Security
 

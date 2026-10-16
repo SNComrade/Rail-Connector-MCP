@@ -5,6 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import * as pty from "node-pty";
 import { createTerminalRenderer, workflowKeywordPrefixLength } from "./terminal.js";
+import { verifyNodePtyFix } from "../tools/install-node-pty-fix.mjs";
 import {
   WINDOWS_BROKER_PROTOCOL,
   WINDOWS_BROKER_VERSION,
@@ -20,6 +21,10 @@ const KEYWORD_MODE_OBSERVATION_MS = DEFAULT_SUBMIT_SETTLE_MS;
 const REQUEST_READ_TIMEOUT_MS = 2000;
 const MAX_BROKER_CONNECTIONS = 64;
 const MAX_SLEEP_MS = 30_000;
+// Explicit child-start budget within the client's existing 30s request window.
+// The carried public option gives node-pty the same readiness contract; its
+// unconfigured upstream 5s watchdog must not terminate a valid slower start.
+const PTY_STARTUP_TIMEOUT_MS = 15000;
 const COMPATIBILITY_INSPECTION_OPERATIONS = new Set([
   "ping",
   "status",
@@ -72,6 +77,10 @@ if (brokerToken.length < 32) {
   process.stderr.write("windows-broker token is invalid\n");
   process.exit(2);
 }
+// A broker must not remain alive with cached unpatched modules and later accept
+// an on-disk repair as proof of its loaded code. Refuse before serving any IPC;
+// an operator's reviewed npm ci is followed by a fresh broker process.
+verifyNodePtyFix();
 
 function sleep(ms) {
   let delay = Number.isInteger(ms) ? ms : 0;
@@ -701,6 +710,11 @@ async function startSession(
   try {
     ptyProcess = pty.spawn(launch.command, launch.ptyArgs, {
       name: "xterm-256color",
+      // The bundled backend avoids node-pty's deferred console-list fork and
+      // numeric-PID termination. The exact dependency includes the native
+      // handle-registry synchronization fix; never fall back to system ConPTY.
+      useConptyDll: true,
+      conptyConnectionTimeout: PTY_STARTUP_TIMEOUT_MS,
       cols: clampInteger(payload.cols, 140, 40, 400),
       rows: clampInteger(payload.rows, 40, 10, 200),
       cwd: canonicalCwd,
@@ -722,7 +736,7 @@ async function startSession(
     cwd: requestedCwd,
     canonicalCwd,
     command: launch.metadataCommand,
-    pid: ptyProcess.pid,
+    pid: Number.isSafeInteger(ptyProcess.pid) && ptyProcess.pid > 0 ? ptyProcess.pid : null,
     args: launch.metadataArgs,
     requestedPosture: payload.requestedPosture ?? null,
     resolvedPosture: payload.resolvedPosture ?? null,
@@ -743,15 +757,46 @@ async function startSession(
   renderer.onBinary((data) => {
     if (!session.exited) session.ptyProcess.write(data);
   });
+  const observePid = () => {
+    const pid = ptyProcess.pid;
+    if (session.pid === null && Number.isSafeInteger(pid) && pid > 0) session.pid = pid;
+  };
   ptyProcess.onData((data) => {
+    observePid();
     session.rawBuffer = trimRawBuffer(session.rawBuffer + data);
     void renderer.write(data);
   });
   ptyProcess.onExit(({ exitCode }) => {
+    observePid();
     session.exitCode = exitCode;
     session.exited = true;
   });
   sessions.set(sessionName, session);
+  // node-pty connects asynchronously after its output worker becomes ready.
+  // Keep the original generation owned while renderer replies unblock the
+  // terminal handshake; do not publish a successful start with a PID of zero.
+  const startupDeadline = performance.now() + PTY_STARTUP_TIMEOUT_MS;
+  while (session.pid === null && !session.exited && performance.now() < startupDeadline) {
+    observePid();
+    if (session.pid !== null) break;
+    await sleep(10);
+  }
+  observePid();
+  if (session.pid === null && !session.exited) {
+    session.recoveryOnly = true;
+    session.lease = null;
+    // Public kill can be deferred until first data. It is a cancellation
+    // request, not exit proof: retain the PTY, renderer and exact binding so
+    // any late child remains tracked and replacement/shutdown stays blocked.
+    let stopError;
+    try { ptyProcess.kill(); } catch (error) { stopError = error; }
+    const error = new Error(
+      `Native Windows terminal startup did not confirm a process. The original generation remains recovery-only; inspect status and stop with expectedGenerationId=${session.generationId}, expectedStartedAtMs=${session.startedAtMs}.`,
+      stopError ? { cause: stopError } : undefined
+    );
+    error.code = "EPTYSTARTUP";
+    throw error;
+  }
   return { status: "started", metadata: sessionMetadata(sessionName, session) };
 }
 
@@ -983,6 +1028,7 @@ async function handleOperation(operation, payload) {
     if (operation === "start") {
       const launch = validatedPtyLaunch(payload);
       const launchCwd = validatedLaunchCwd(payload);
+      verifyNodePtyFix();
       const existing = sessions.get(sessionName);
       if (existing && !existing.exited) {
         return {
@@ -1014,6 +1060,9 @@ async function handleOperation(operation, payload) {
       }
       const launchCwd = validatedLaunchCwd(payload);
       const launchMetadata = validatedStartMetadata(payload, launch);
+      // Fail deterministic dependency preflight before stopping an existing
+      // generation, just as for invalid replacement launch metadata.
+      verifyNodePtyFix();
       if (existing) {
         const stopResult = await stopSession(sessionName, {
           graceful: Boolean(payload.graceful),

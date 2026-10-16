@@ -14,6 +14,33 @@ Codex, this MCP, and Claude all run inside that same WSL environment.
 
 ## Prerequisites
 
+The native broker uses the bundled ConPTY backend from exactly pinned
+`node-pty 1.2.0-beta.15`. This includes upstream's native handle-registry race
+fix and avoids the legacy asynchronous console-list helper and numeric-PID
+termination path. Missing bundled binaries fail launch; there is no fallback
+to that legacy backend. The dependency and its DLL option remain prerelease
+and experimental, so the native test matrix is required before promotion.
+
+The checkout carries a version/hash-verified JavaScript compatibility fix for
+upstream [slow worker startup](https://github.com/microsoft/node-pty/issues/955).
+`npm ci` applies it through the tracked install lifecycle. It exposes an explicit
+15-second child-start readiness budget within the existing 30-second broker
+request window, while preserving the upstream rule that native connection waits
+for worker readiness. Worker failures, cancellation and late events retain their
+cleanup safeguards. The upstream default remains unchanged for callers that do
+not configure the option. A Windows launch refuses missing or altered fix bytes;
+`--ignore-scripts` is not a supported installation. No native binary is patched.
+
+The client requires the matching broker build rather than reusing an older
+terminal backend. This does not change an installed broker automatically.
+An incomplete asynchronous start remains tracked as recovery-only until its
+original generation exits or is stopped with its exact generation/start pair.
+
+Upstream [natural-exit resource leakage](https://github.com/microsoft/node-pty/issues/965)
+remains a separate limitation. An exited child or absent console helper does
+not prove all native handles or descendants were released, nor that host MCP
+connection retention or RAM pressure is resolved.
+
 Install and verify in PowerShell:
 
 ```powershell

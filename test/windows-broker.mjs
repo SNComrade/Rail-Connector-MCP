@@ -1062,6 +1062,9 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.match(keywordPartialModeLossCapture, /Fake Claude TUI/);
+  // Bundled ConPTY can exchange device attributes during startup. Bind this
+  // assertion to the send operation, retaining every subsequent PTY write.
+  const keywordPartialWritesBefore = (await brokerPtyWrites(keywordPartialModeLossSession)).length;
   const keywordPartialBody = `ultracode:${"x".repeat(255)}🧪${"y".repeat(600)}`;
   await assert.rejects(
     windowsBrokerRequest("sendText", {
@@ -1101,7 +1104,7 @@ try {
     // Recorded, not asserted: whether the paste markers reached this terminal.
     console.log(`windows-broker: Node ${process.versions.node} fake terminal received paste markers: ${keywordPartialModeLossWire.includes("\x1b[200~")}`);
     assert.deepEqual(
-      await brokerPtyWrites(keywordPartialModeLossSession),
+      (await brokerPtyWrites(keywordPartialModeLossSession)).slice(keywordPartialWritesBefore),
       ["ultracode:", "\x1b[200~", "x".repeat(255)],
       "after a body mode loss the broker must write no later chunk, closing marker, or Enter"
     );

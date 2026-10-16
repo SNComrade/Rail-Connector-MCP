@@ -48,6 +48,7 @@ const expectedFiles = new Set([
   "LICENSE",
   "NOTICE",
   "package.json",
+  "patches/node-pty-1.2.0-beta.15-readiness.json",
   "README.md",
   "SECURITY.md",
   "src/claude-command-resolution.js",
@@ -57,6 +58,7 @@ const expectedFiles = new Set([
   "src/windows-broker.js",
   "SUPPORT.md",
   "THIRD-PARTY-NOTICES.md",
+  "tools/install-node-pty-fix.mjs",
 ]);
 
 assert.deepEqual(
