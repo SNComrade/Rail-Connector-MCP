@@ -83,6 +83,25 @@ function Invoke-NativeChecked {
   }
 }
 
+function Resolve-InstallerExecutable {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Name
+  )
+
+  # Select one native command in PATH order, even when several copies exist.
+  $command = Get-Command $Name -CommandType Application, ExternalScript `
+    -TotalCount 1 -ErrorAction SilentlyContinue
+  if (-not $command -or [string]::IsNullOrWhiteSpace($command.Source)) {
+    throw "Missing executable command: $Name"
+  }
+  $path = [System.IO.Path]::GetFullPath($command.Source)
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+    throw "Resolved $Name command is not an executable file: $path"
+  }
+  return $path
+}
+
 function Test-CodexExecutable {
   param(
     [Parameter(Mandatory = $true)]
@@ -239,17 +258,8 @@ function Invoke-Installer {
   }
 
   $rootDir = $script:InstallerRoot
-  $nodePath = (Get-Command node -CommandType Application, ExternalScript -ErrorAction Stop).Source
-  $claudePath = (Get-Command claude -CommandType Application, ExternalScript -ErrorAction Stop).Source
-  foreach ($resolvedCommand in @(
-    @{ Name = "node"; Path = $nodePath },
-    @{ Name = "claude"; Path = $claudePath }
-  )) {
-    if ([string]::IsNullOrWhiteSpace($resolvedCommand.Path) -or
-        -not (Test-Path -LiteralPath $resolvedCommand.Path -PathType Leaf)) {
-      throw "Resolved $($resolvedCommand.Name) command is not an executable file: $($resolvedCommand.Path)"
-    }
-  }
+  $nodePath = Resolve-InstallerExecutable -Name "node"
+  $claudePath = Resolve-InstallerExecutable -Name "claude"
   $nodeMajor = [int]((& $nodePath -p "Number(process.versions.node.split('.')[0])").Trim())
   if ($nodeMajor -notin @(22, 24, 26)) {
     throw "Node.js major 22, 24, or 26 is required. Current version: $(& $nodePath --version)"

@@ -22,6 +22,59 @@ if (-not $failedAsExpected) {
   throw "Invoke-NativeChecked did not reject a nonzero native exit code."
 }
 
+$pathProbeDir = Join-Path ([System.IO.Path]::GetTempPath()) ("rail executable probe " + [guid]::NewGuid().ToString("N"))
+$firstBin = Join-Path $pathProbeDir "first bin"
+$secondBin = Join-Path $pathProbeDir "second bin"
+$originalPath = $env:PATH
+try {
+  New-Item -ItemType Directory -Path $firstBin, $secondBin | Out-Null
+  foreach ($extension in @(".cmd", ".ps1")) {
+    $name = "rail-installer-path-probe$extension"
+    $firstCommand = Join-Path $firstBin $name
+    $secondCommand = Join-Path $secondBin $name
+    # These files are discovered, never executed.
+    Set-Content -LiteralPath $firstCommand -Value "exit 43"
+    Set-Content -LiteralPath $secondCommand -Value "exit 44"
+    $env:PATH = "$firstBin;$secondBin;$originalPath"
+    $matches = @(Get-Command $name -All -CommandType Application, ExternalScript -ErrorAction Stop)
+    if ($matches.Count -ne 2) {
+      throw "The duplicate executable fixture did not expose both PATH entries."
+    }
+    $resolved = Resolve-InstallerExecutable -Name $name
+    if ($resolved -isnot [string] -or $resolved -ne [System.IO.Path]::GetFullPath($firstCommand)) {
+      throw "Executable resolution did not return exactly the first scalar PATH entry."
+    }
+    $env:PATH = "$secondBin;$firstBin;$originalPath"
+    $resolved = Resolve-InstallerExecutable -Name $name
+    if ($resolved -isnot [string] -or $resolved -ne [System.IO.Path]::GetFullPath($secondCommand)) {
+      throw "Executable resolution did not follow changed PATH precedence."
+    }
+  }
+  $missingName = "rail-installer-missing-" + [guid]::NewGuid().ToString("N")
+  $missingRejected = $false
+  try {
+    Resolve-InstallerExecutable -Name $missingName | Out-Null
+  } catch {
+    if ($_.Exception.Message -ne "Missing executable command: $missingName") {
+      throw
+    }
+    $missingRejected = $true
+  }
+  if (-not $missingRejected) {
+    throw "Executable resolution accepted a missing command."
+  }
+} finally {
+  $env:PATH = $originalPath
+  $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+  $cleanupPath = [System.IO.Path]::GetFullPath($pathProbeDir)
+  if (-not $cleanupPath.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Executable probe cleanup escaped the temporary root."
+  }
+  if (Test-Path -LiteralPath $cleanupPath) {
+    Remove-Item -LiteralPath $cleanupPath -Recurse -Force
+  }
+}
+
 $probeDir = Join-Path ([System.IO.Path]::GetTempPath()) "rail connector probe $PID"
 $allowedRoot = Join-Path $probeDir "allowed project"
 New-Item -ItemType Directory -Path $allowedRoot -Force | Out-Null
