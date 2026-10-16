@@ -10,6 +10,8 @@ Before launch, determine:
 - whether this is review-only or implementation work
 - whether to start, resume by UUID/title, continue latest, or fork
 - requested permission, model, effort, and Ultracode posture
+- whether a prompt will carry a workflow keyword (`ultracode:`), which under
+  `dontAsk` needs the Workflow tool allowed at launch (see Review Workflow)
 - a unique `managedSession` when other agents may be active
 
 Call `get_claude_capabilities` before relying on version-sensitive controls.
@@ -19,6 +21,11 @@ calibrated against an invalid control; timeout and termination are
 inconclusive. For an existing session, use the persisted sanitized
 `launchEnvironment` rather than substituting the environment of a refreshed
 MCP process.
+
+Start responses report the inspected Claude Code version as
+`claudeCliVersion`. Claude Code can update itself between two starts, so it
+can differ from an earlier start (a live check saw 2.1.289 and then 2.1.294).
+Report it and carry on unless a tool reports a problem.
 
 ## Review Workflow
 
@@ -31,6 +38,19 @@ available. This denies new permission requests while letting Claude return a
 direct report instead of ending at plan approval.
 Use `plan` only as a compatibility fallback, and never approve implementation
 from a report-only review.
+
+`dontAsk` also denies the Workflow tool unless it is allowed, so a workflow
+keyword (`ultracode:` with `pasteMode: "keyword"`) without that allowance
+starts no workflow and Claude reports the denied call (seen live). The
+allowance verified live is `tools: ["Workflow"]` plus `allowedTools:
+["Workflow"]` at launch. Note that `tools: ["Workflow"]` leaves Workflow as the
+session's only built-in tool, so a review that must read code also has to list
+read tools such as `Read`, `Grep` and `Glob` in `tools` (and keep them out of
+`disallowedTools`); that wider list, `allowedTools` alone, and what workflow
+workers can do under it are not verified. In `default` mode, Claude's
+documentation says Claude asks before a workflow runs (not verified through
+this MCP), and the MCP may not recognize that prompt as `approval_required`
+(not verified); see `docs/USAGE.md` Permission Modes.
 
 `disallowedTools` and `tools` constrain built-in Claude tools only. Connected
 MCP and connector tools can remain available, and the current MCP does not
@@ -178,8 +198,10 @@ completed transcript and surface or resolve the attached limit or paste warning.
 
 ## Changing Launch Posture
 
-Permission, model, ordinary effort, and Ultracode are process launch controls.
-To change them:
+Permission, model, ordinary effort, Ultracode, and the tool lists (`tools`,
+`allowedTools`, `disallowedTools`) are process launch controls. This MCP sets
+them only at launch and offers no supported way to add a tool allowance, such
+as Workflow under `dontAsk`, to a running session. To change them:
 
 1. Wait for the current turn to finish.
 2. Record the exact `resolvedSessionId`.

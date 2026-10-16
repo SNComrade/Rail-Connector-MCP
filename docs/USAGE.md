@@ -46,6 +46,26 @@ resolves that request to the installed CLI's advertised `default` or `manual`
 alias. Explicit elevated modes must be advertised by the installed CLI; they
 are never silently downgraded.
 
+The product MCP resolves the executable selected by the ordinary launcher and
+refreshes cached capabilities when that executable's stat identity changes.
+The Issue 66 compatibility harness adds per-operation validation: it resolves
+the ordinary `claude` launcher again and freezes the exact launcher and payload
+identities. It does not pin a long-lived Claude version, run the updater, or
+select a cached/versioned payload directly. A newly installed Claude release is
+accepted only after the same capability, provenance, and minimum-contract
+checks pass; an incompatible capability shape is handled as a compatibility
+repair rather than by downgrading Claude.
+
+That rolling behavior depends on ordinary `claude` launcher resolution.
+`RAIL_CONNECTOR_CLAUDE_PATH` is an explicit operator-selected executable or
+wrapper override whose update behavior belongs to that selected command. Leave
+it unset when the MCP should follow the ordinary currently installed launcher.
+The Issue 66 harness resolver fails closed when an inherited override selects a
+different command from the ordinary launcher. Its dedicated MCP children also
+remove every case variant of that key from their launch environment. These
+are harness checks; the product MCP continues to honor an explicit executable
+override. An override is not credited as rolling-latest validation evidence.
+
 For current Claude builds that support it, `ultracode: true` resolves to
 `--effort=ultracode`. The older generic settings request remains only as a
 capability-reported compatibility fallback. Capability inspection reports the
@@ -118,6 +138,43 @@ conversation. They are intentionally independent. With `trustWorkspace: false`,
 a new project remains at Claude's trust prompt until the operator inspects the
 project configuration and explicitly chooses whether to trust it.
 
+Prompt suggestions start off. Claude can show a generated next prompt as
+dimmed text in an empty composer, even right after a fresh start. The MCP
+cannot tell that text from a real unsent draft, so it would refuse prompts
+(`active_input_not_empty`) and graceful stop (`awaiting_input`). Every managed
+Claude session the MCP launches, including resume, continue, fork and a
+`killExisting` replacement, therefore gets
+`CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` in its environment on both
+backends. This replaces any value the MCP process itself inherited, for example
+from a Claude Code session that started it. Short Claude checks the MCP runs
+itself, such as version and help probes and session listing, keep the MCP
+process environment unchanged. Pass
+`promptSuggestions: true` to keep suggestions on for that launch; the launched
+Claude then gets `true`, which also overrides Claude's own
+`promptSuggestionEnabled` setting and keeps suggestions on until the account
+reaches its usage limit instead of pausing near it. This is the only way the
+MCP offers.
+
+Limits of this setting:
+
+- Claude Code honors the variable from version 2.1.238. An older Claude
+  ignores it and can still show suggestions; the MCP does not check the
+  version.
+- It sets the launched process environment only. An `env` entry for
+  `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION` in Claude user, project, local or
+  managed settings usually takes precedence, in either direction, and so can a
+  configured Claude wrapper.
+- It is not recorded in launch evidence, posture or audit receipts, and an
+  `already_running` result does not compare it: a session keeps the environment
+  it was launched with, and "matches the requested launch arguments" covers
+  arguments and posture only. Sessions launched before this setting existed, or
+  by an MCP process not yet restarted on this version, can still show
+  suggestions.
+- To be sure of the setting for an existing session, replace it. If the
+  session already shows composer text, `killExisting` alone is refused; inspect
+  the capture first, because `forceKillExisting` also discards a real unsent
+  draft.
+
 Resume selectors are mutually exclusive:
 
 - `sessionId` resumes an exact UUID.
@@ -149,6 +206,40 @@ inspection means report-only is not an operating-system sandbox. This denies
 new permission requests while allowing a direct final report. Use `plan` only
 as a compatibility fallback, and never approve implementation from a
 report-only session.
+
+`dontAsk` also denies the Workflow tool unless it is allowed. A workflow
+keyword (`pasteMode: "keyword"`) sent to a `dontAsk` session without that
+allowance starts no workflow: Claude reports the Workflow call as denied, and
+the MCP shows no workflow launch (seen live). The allowance verified live is
+`tools: ["Workflow"]` plus `allowedTools: ["Workflow"]` at launch, with a
+`disallowedTools` list that denied file, shell, network and connector tools;
+the keyword workflow ran and the MCP released it without force (see
+`docs/WINDOWS_VALIDATION.md`, 2026-10-08). `tools` limits the session's
+built-in tools to the ones it names, so a session that also needs other
+built-in tools must list them in `tools` and leave them out of
+`disallowedTools`. Not verified: such a wider list, `allowedTools` alone
+without `tools`, and tools that workflow workers themselves use.
+
+This MCP sets the permission mode and tool lists only when it launches
+Claude, and it offers no supported way to add an allowance to a running
+session: `start_remote_control` without `killExisting` reports the existing
+session as `already_running` and changes nothing. Once the session is idle,
+replace it with the allowance and `killExisting: true`, or stop it and resume
+its `resolvedSessionId` with the allowance. A resumed conversation's workflow
+is released by Claude's task notification, not the fresh-conversation
+snapshot. Claude's own `/permissions` command or a settings allow rule could
+add an allowance inside a running session, but that changes Claude's
+configuration outside this MCP (not verified through this MCP).
+
+In `default` (or `manual`) mode, Claude's documentation says Claude asks
+before running a workflow (not verified through this MCP). The MCP reports an
+approval prompt as `approval_required` (and `wait_for_claude_turn` returns
+`needs_attention`) only when the screen shows an approval question together
+with a `Yes, and don't ask again` or `No, and tell Claude what to do
+differently` choice. A workflow's own prompt may use other choices, so the MCP
+may not recognize it, and the wait can end in `timeout` instead (not
+verified). Capture the session either way, answer the prompt only with the
+user's authorization, then wait again with the original `waitAfterCursor`.
 
 These tool-list flags constrain Claude's built-in tools. They do not prove that
 connected MCP or connector tools were removed from the session; those tools can
@@ -237,7 +328,13 @@ Start and capture responses contain a `posture` object:
 - `observed` records session-log or terminal evidence.
 - `observed.claudeVersion` records the CLI version from a bound session-log
   record when available. Start responses also report the version inspected for
-  that launch as `claudeCliVersion`.
+  that launch as `claudeCliVersion`. Claude Code can update itself between two
+  starts (a native install downloads updates in the background and uses them
+  at the next start), so a later start can report a newer version than an
+  earlier one; a live check saw 2.1.289 and then 2.1.294 ten minutes apart.
+  Report the version and carry on unless a tool reports a problem. In an
+  `already_running` result, `claudeCliVersion` is the version installed now,
+  which can differ from the version the running session started with.
 - `evidence` identifies the source for each observed field.
 - `ultracodeAssessment` separates launch acceptance, runtime effort, sanitized
   workflow activity, environment blockers, conflicts, and unknowns.
@@ -353,6 +450,70 @@ approval, trust, limit, or non-empty composer states unless `force: true` is
 explicitly supplied. The result reports whether bracketed paste was requested
 and actually used.
 
+Keyword mode requires an empty composer even with `force: true`. A draft or
+unresolved paste placeholder returns `preflight_blocked` with reason
+`active_input_not_empty` or `paste_pending`, `forceUsed: false`, and
+`forceRefused: true` when force was requested. It sends no text or Enter, even
+when pending workflow evidence would otherwise mask the composer state.
+Generated suggestions remain protected when indistinguishable from real
+drafts; keyword mode does not clear or dismiss them. Managed launches start
+with suggestions off (see Start), so this applies when suggestions are on: a
+`promptSuggestions: true` launch, a Claude settings override or wrapper, a
+Claude older than 2.1.238, or a session launched before that default. Ordinary
+modes retain their existing explicit-force behavior.
+
+For a user-authorized workflow keyword request on native Windows, select
+`pasteMode: "keyword"` and begin the unchanged prompt with lowercase `ultracode:`:
+
+```json
+{
+  "managedSession": "claude-feature-review",
+  "text": "ultracode: Review this synthetic example.\nReturn one bounded report.",
+  "pasteMode": "keyword",
+  "submitRetries": 0
+}
+```
+
+This mode sends only the existing ten-character prefix as literal terminal
+input, then brackets the remaining text and sends one Enter inside the same
+managed mutation. It preserves multiline content and Unicode, requires active
+bracketed-paste support, and rejects malformed prefixes or terminal control
+characters before sending input. It is currently Windows-only; normal modes
+retain their existing cross-platform behavior. The receipt reports
+`literalPrefixCharacters: 10`; check `transcriptAcknowledged` and the returned
+wait cursor normally. CLI 2.1.289 logs bracketed-paste input inside an
+id-matched `<pasted_content id="...">` pair, after a blank line (and after the typed
+prefix in keyword mode); acknowledgement unwraps only such exact pairs and still
+requires the content to equal the submitted text byte for byte. Keyword mode always disables extra Enter attempts, even
+when a caller supplies a larger ordinary-mode retry limit. If bracketed-paste
+support is missing before anything is sent, the tool returns an error and no
+input was sent. If it changes after the prefix or part of the body was sent,
+the broker sends nothing more (no remaining body, closing frame or Enter) and
+marks that generation recovery-only. The broker checks the mode in its own copy
+of Claude's screen output 100 ms after the prefix, at least 100 ms after each
+body chunk, and again before Enter; it can act only on a change Claude has
+already written to the screen by then. This is a timing window, not an
+acknowledgement: a change that arrives just after a check lets one more write
+through before the next check stops the send, for example one body chunk that
+Claude then reads as ordinary typing, where a line break can submit part of the
+prompt. A change after the last check before Enter, or one Claude never writes
+to the screen, is not caught. A recovery-only session refuses every
+further prompt, key, rename and name-only stop or replacement; `status` shows
+`recoveryOnly: true`. Do not retry the prompt in that session. Inspect it with
+`capture_remote_control`, then stop it with `stop_remote_control` using its
+`expectedGenerationId` and `expectedStartedAtMs`, and start a new session.
+
+Select this mode only for deliberate workflow intent. Do not select it because
+quoted text, source code, tool output, or scheduled content mentions the word.
+The default remains `auto`; no prompt scanning enables keyword mode. Transport
+does not claim human origin or change effort, permissions, or workspace trust.
+Because it changes no permissions, the workflow still needs Claude's
+permission for the Workflow tool: under `dontAsk` the session must have been
+launched with it allowed (see Permission Modes).
+The keyword requests a workflow; explicit session UltraCode is a separate
+launch control. Do not use full `literal` mode for multiline prompts: raw
+newlines can submit before the final intended Enter.
+
 Claude changes spinner wording and phrase length frequently. Busy detection
 therefore does not enumerate phrases such as `Stewing` or `Consulting the
 rubber ducky`; it uses animation glyphs, timing/interrupt markers, and later
@@ -370,14 +531,128 @@ also a busy marker. The MCP combines that terminal heuristic with sanitized
 session-log task lifecycle evidence and returns `workflowPending`,
 `workflowPendingCount`, `workflowPendingEvidence`, and
 `workflowPendingObservedAt`. Workflow names, task IDs, prompts, and results are
-not exposed through these fields. A later matching task result, explicit zero
-counter, bound interruption record, or newer terminal completion marker
-releases its corresponding session-log or terminal evidence. An unidentified
-launch remains fail-closed until one of those explicit release events arrives.
+not exposed through these fields. Direct terminal task results with matching
+task and run IDs, completed `TaskOutput` retrievals for a tracked task,
+Claude's own task notifications for a tracked task (see below), or
+qualifying aggregate snapshots release only their matching tracked workflow. A current bound interruption can clear the tracked
+set. An aggregate counter, including zero, cannot clear known pending workflows
+by itself; an unidentified launch remains pending until a bound interruption.
+A newer terminal completion marker releases terminal heuristic evidence only.
+In CLI 2.1.289 that waiting line is a permanent turn-summary row drawn from the
+same session-log record (`pendingWorkflowCount`) the MCP reads, and a short
+later turn prints no newer completion row, so the row stays on screen after
+the workflow completes. When the session log is fully and certainly observed
+and has tracked workflow launches, the log decides: the stale row then is not
+counted as pending work or as busy evidence (`likelyBusy`) in any composer state. Without a
+complete log, or before the log has seen any launch, the row still holds
+pending work. In particular, when an MCP process first reads a session log that
+is already larger than 2.25 MiB (after an MCP restart, or when resuming a long
+conversation), it reads only the log's head and tail; the stale row then keeps
+holding pending work for that session. Confirm in Claude that the workflow has
+finished, then repeat the call with `force: true`.
 `workflowPendingEvidence` and `workflowPendingObservedAt` are empty whenever no
 workflow is currently pending. `terminalState` preserves a simultaneous
 approval, trust, draft, or other terminal state so workflow-only force controls
 cannot bypass it.
+
+Some CLI 2.1.274 workflow logs contain a launch and positive count, then worker
+results and a final assistant answer without any aggregate terminal record.
+Those observations cannot safely release pending state. A matching completed
+`TaskOutput` retrieval is supported; the historical 2.1.275 compatibility
+control exercised that path successfully. The real retrieval records on file (CLI
+2.1.275) carry the task ID but no run ID, while every `async_launched`
+record carries both and each task ID maps to a single run. A retrieval without a
+run ID therefore releases the tracked launch with that task ID, provided the
+launch bound a run ID and the retrieval is not older than the latest workflow
+observation; a retrieval that does carry a different run ID stays a conflict.
+CLI 2.1.289 no longer offers a `TaskOutput` tool (a call fails with "No such
+tool available"). It reports a finished background task with a
+`<task-notification>` that Claude itself records, either as a user record or,
+in a resumed session, as a `queued_command` attachment, each marked by the
+record-level origin `{kind: "task-notification"}`, which typed prompt text
+cannot set. The MCP reads only the notification's leading header (task ID,
+then status); a terminal status for a tracked launch that bound a run ID
+releases that workflow, in fresh and resumed sessions and on every backend.
+Terminal statuses are `completed`, `failed` and `killed` (Claude's word for a
+stopped task), plus the older `succeeded`, `error`, `cancelled`, `canceled` and
+`interrupted`. Any other status, such as `blocked`, keeps the workflow pending;
+if Claude shows that it has ended, repeat the call with `force: true`.
+Worker output later in the notification, a notification for another task, a
+non-terminal status, and identical text in an ordinary user message do not
+release anything. Live evidence (native Windows, CLI 2.1.289): every
+`local_workflow` launch in the Issue 66 runs was followed by a notification
+with status `completed` for that task, as a user record in fresh sessions and
+as a `queued_command` attachment in resumed ones. Linux, macOS and tmux, and
+the `failed` and `killed` statuses, are covered by offline tests only.
+The MCP does not read arbitrary worker sidecars or clear pending solely from
+worker completion, terminal prose, an idle composer, or an assistant end turn.
+
+A completed 2.1.275 review also reproduced a dimmed prompt suggestion being
+classified as a nonempty draft, blocking graceful stop. Internal cursor-style
+diagnostics can record that appearance, but styling alone is not a trusted
+distinction from a real draft. Automatic draft clearing is not implemented.
+Managed launches now prevent suggestions by default instead (see Start); when
+suggestions are on anyway, the classification limitation remains: untyped
+suggestion text still blocks prompts (`active_input_not_empty`) and graceful
+stop (`awaiting_input`). Inspected force cleanup
+of an authorized task-owned session must be reported as a failure of graceful
+shutdown, never a passing lifecycle result.
+
+The MCP also checks the CLI's per-conversation aggregate workflow snapshot when
+the session log is complete and a current managed launch identifies both the
+task and run. A bounded, unchanged regular file must report completed status
+with matching identities and ordered timestamps within that managed generation.
+The snapshot must start no earlier than the managed session and within a
+window around the matching JSONL `async_launched` record: at most 30 seconds
+before it or 5 seconds after it. Claude registers the run before it writes that
+record, so the snapshot normally starts a few milliseconds earlier (3-55 ms
+across 115 local snapshots from CLI 2.1.247-2.1.288). Completion must not
+precede the snapshot start or the launch record. An aggregate pending count
+written after the completion holds the release back only when that count is
+higher than the other tracked and unidentified workflows known at that moment;
+a zero count, or a count those other workflows explain, does not.
+Only that workflow is released; peers, unidentified work, newer pending evidence,
+partial history, malformed files and conflicting evidence remain fail-closed.
+An aggregate pending count alone cannot clear an identified workflow. Direct
+terminal results require the matching run ID; every terminal result requires a
+tracked launch with a bound run ID and a valid, ordered launch timestamp.
+
+Snapshot evidence is checked again on each observation, so a cached release does
+not hide a later missing or conflicting snapshot. The posture report's
+`ultracodeAssessment.workflowActivity` identifies this source with
+`completionEvidence: "claude_workflow_snapshot"` and `completedSnapshotCount`,
+without exposing task identities or results. A `TaskOutput` call is not required
+for this aggregate-snapshot path.
+
+Aggregate snapshot completion currently requires a native-Windows broker binding
+between one fresh managed generation and a new Claude conversation. The MCP
+requests a new conversation ID, verifies that its session log was absent before
+launch and contains an explicit matching session record, then binds the stable
+log-file identity to that broker generation. A resumed, forked, reused, missing,
+or ambiguous conversation log cannot earn this snapshot completion evidence.
+The snapshot itself has no generation ID, so a snapshot created before the
+bound generation or a replaced or identity-changed log file also leaves the
+workflow pending. Linux, macOS, and tmux remain fail-closed for this evidence
+source until an equivalent generation binding is implemented.
+
+The earlier configuration diagnostic run isolated its task-owned broker and
+state directory but deliberately shared active Claude configuration and
+authentication. Because unrelated Claude processes were present, that run
+established correlation only, not single-process attribution.
+
+This snapshot format was corroborated in task-owned CLI 2.1.275 evidence and its
+writer inspected in 2.1.276. It is a version-specific compatibility source, not
+a promised CLI API. A passing live test using the older matching `TaskOutput`
+shape still validates only that observed path; it cannot establish recovery of
+the historical 2.1.274 missing-event case. Missing aggregate evidence continues
+to block ordinary lifecycle operations. The start-before-launch ordering comes
+from local snapshot history; release through it in a live managed session is
+recorded in `docs/WINDOWS_VALIDATION.md` only after such a run.
+
+No reliable interactive suggestion-origin marker was established. The
+print/stream-json suggestion event belongs to a different interface and is not
+used to classify Remote Control composer text. Suggestion classification remains
+incomplete; the MCP prevents suggestions by default instead (see Start).
 
 The first session-log observation is bounded. Small logs are read fully; large
 logs use a 256 KiB head plus a 2 MiB tail and then continue incrementally from
@@ -388,12 +663,12 @@ discarded rather than presented as current. Any workflow launch or pending
 state from the head remains historical evidence, but current workflow state is
 reported as `unknown_due_to_gap` with `workflowObservationUncertain: true`, a
 null `workflowPendingCount`, and `claude_session_log_incomplete` evidence until
-the tail supplies an explicit global counter or bound interruption as a
-candidate release. Before reporting certainty, the MCP replays the complete log
-once and validates releases against the newest observed workflow timestamp; a
-newer launch hidden in the skipped middle therefore keeps the session pending.
-Successful replay changes coverage to `full` and clears the skipped-byte count.
-This uncertainty fails
+the tail supplies a current explicit global counter or bound interruption.
+Such a checkpoint can restore current-state certainty; a counter still cannot
+clear known pending workflows by itself. The MCP does not replay the skipped
+middle. Coverage remains `head_tail` and the skipped-byte count remains, so
+aggregate snapshot completion cannot use that observation as full history.
+While current-state uncertainty remains, it fails
 closed as `workflowPending: true`, so ordinary submit, text, Enter, rename,
 replacement, and stop operations remain blocked. Inspect before using an
 explicit force recovery. `lastKnownPendingCount` preserves the most recent
@@ -575,6 +850,42 @@ rejected before any connection and replaced under exclusive-create semantics;
 it can never select the old predictable pipe. The old predictable pipe is never
 sent the current token. Broker mutations require a renewable exclusive lease,
 and PTY launch descriptors must resolve to the configured Claude executable.
+
+On native Windows every managed session has a generation pair:
+`generationId` and `startedAtMs`. `start_remote_control` returns it as
+`sessionBinding`, and `status` lists it for each managed session. Callers can
+pass it as `expectedGenerationId` and `expectedStartedAtMs` to
+`capture_remote_control`, `wait_for_claude_turn`, `submit_prompt`,
+`rename_claude_session` and `stop_remote_control`. The pair is checked before
+any capture, input or stop. If the managed name now belongs to a different
+generation or no longer exists, the call fails with `ESTALE` and sends, types
+and stops nothing in any other generation; a pair refused at the start of the
+call does nothing at all. Only if Claude exits during a call and another start
+takes the name can input sent earlier in that call have reached the old
+generation. Callers see only the error text, which says the generation
+changed, refuses a stale operation, or rejects the `afterCursor`. A paired
+`wait_for_claude_turn` also needs the `waitAfterCursor` returned for that
+generation; without it, or with any other cursor, it fails with `ESTALE`. tmux
+rejects the
+pair. Supplying only one of the two fields is rejected. `stop_remote_control`
+also accepts `expectedResolvedSessionId` and `expectedCanonicalCwd` to bind the
+stop to the exact conversation and workspace as well.
+
+Calls without the pair keep name-based behavior, with one exception. A session
+becomes recovery-only after `stop_timeout` (Claude did not confirm exit after a
+forced ConPTY stop) or after an interrupted keyword send. It then refuses every
+prompt, text, key and rename, even with the pair, and every name-only stop and
+`killExisting` replacement; `status`, `capture_remote_control` and
+`wait_for_claude_turn` still work. `status` shows `recoveryOnly: true` for such
+a session, and the `stop_timeout` reply, a normal result rather than an error,
+includes the `expectedGenerationId` and `expectedStartedAtMs` to retry with.
+After `stop_timeout`, retry with that pair and `force: true`. A paired forced
+stop repeats the ConPTY termination; a paired stop without `force` does not.
+The broker does not add a separate `taskkill` by PID. A forced stop discards
+any unsent draft, in-flight turn, pending approval and running workflow. If
+the retry returns `stop_timeout` again, the process must end outside the MCP.
+If the session's workspace folder has been removed or retargeted, the paired
+stop also fails closed and the session must be ended outside the MCP.
 
 `status` returns managed sessions by default. Pass
 `includeAgentDetails: true` only when machine-wide `claude agents --json --all`

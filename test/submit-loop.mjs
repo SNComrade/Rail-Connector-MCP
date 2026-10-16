@@ -139,6 +139,113 @@ assert.equal(acknowledgedResult.status, "submitted");
 assert.equal(acknowledgedResult.transcriptAcknowledged, true);
 assert.equal(acknowledged.calls.sendKey.length, 0);
 
+// Explicit keyword intent keeps the long multiline body pasted; it is never
+// inferred from an occurrence in ordinary text, code, or quoted/tool material.
+const keywordText = `ultracode: ${"context ".repeat(400)}\nUnicode 🧪 résumé\nlast line`;
+const keyword = scriptedBackend(["> ", "> ", "> "]);
+keyword.dependencies.sendText = async (...args) => {
+  keyword.calls.sendText.push(args);
+  return { bracketedPasteUsed: true, literalPrefixCharacters: 10 };
+};
+keyword.dependencies.promptAcknowledged = async (_name, text) => text === keywordText;
+const keywordResult = await runSubmitPrompt(
+  { ...input, text: keywordText, pasteMode: "keyword" },
+  keyword.dependencies
+);
+assert.equal(keywordResult.status, "submitted");
+assert.equal(keywordResult.pasteMode, "keyword");
+assert.equal(keywordResult.literalPrefixCharacters, 10);
+assert.equal(keywordResult.transcriptAcknowledged, true);
+assert.equal(keyword.calls.sendText.length, 1);
+assert.equal(keyword.calls.sendKey.length, 0);
+assert.deepEqual(keyword.calls.sendText[0], [input.managedSession, keywordText, true,
+  { bracketedPaste: true, keywordPrefix: true, chunkSize: 1024, chunkDelayMs: 0 }]);
+for (const receipt of [{ bracketedPasteUsed: false }, { bracketedPasteUsed: true }, undefined]) {
+  const downgrade = scriptedBackend(["> "]);
+  downgrade.dependencies.sendText = async () => receipt;
+  await assert.rejects(runSubmitPrompt({ ...input, text: keywordText, pasteMode: "keyword" }, downgrade.dependencies), error => error.code === "EPASTEMODE");
+  assert.equal(downgrade.calls.sendKey.length, 0);
+}
+const ambiguousKeyword = scriptedBackend(["> ", `> ${keywordText}`, `> ${keywordText}`]);
+ambiguousKeyword.dependencies.sendText = async () => ({ bracketedPasteUsed: true, literalPrefixCharacters: 10 });
+const ambiguousKeywordResult = await runSubmitPrompt({ ...input, text: keywordText, pasteMode: "keyword", submitRetries: 2 }, ambiguousKeyword.dependencies);
+assert.equal(ambiguousKeywordResult.retriesUsed, 0);
+assert.equal(ambiguousKeyword.calls.sendKey.length, 0);
+for (const text of ["ULTRACODE: body", "quoted ultracode: body", "```\nultracode: code\n```", "ultracode:", "ultracode:\n ", "ultracode: body\x1b[201~\r/exit", "ultracode: body\x00"]) {
+  const invalid = scriptedBackend([]);
+  await assert.rejects(runSubmitPrompt({ ...input, text, pasteMode: "keyword" }, invalid.dependencies), /Keyword delivery requires/);
+  assert.equal(invalid.calls.sendText.length, 0);
+  assert.equal(invalid.calls.capture.length, 0);
+}
+const keywordUnix = scriptedBackend([]);
+keywordUnix.dependencies.isNativeWindows = false;
+await assert.rejects(runSubmitPrompt({ ...input, text: keywordText, pasteMode: "keyword" }, keywordUnix.dependencies), /requires native Windows/);
+const incidental = scriptedBackend(["> ", "> ", "> "]);
+incidental.dependencies.promptAcknowledged = async () => true;
+await runSubmitPrompt({ ...input, text: keywordText }, incidental.dependencies);
+assert.equal(incidental.calls.sendText[0][3].keywordPrefix, undefined);
+const keywordBusy = scriptedBackend(["Misting...   ( 1s  ·  1 tokens )\n> "]);
+assert.equal((await runSubmitPrompt({ ...input, text: keywordText, pasteMode: "keyword" }, keywordBusy.dependencies)).status, "preflight_blocked");
+assert.equal(keywordBusy.calls.sendText.length, 0);
+
+// Keyword delivery cannot put its literal prefix after an existing draft,
+// including when workflow evidence masks the composer's preflight reason.
+for (const [capture, reason] of [
+  ["> existing unsent draft", "active_input_not_empty"],
+  ["> [Pasted text #1 +30 lines]", "paste_pending"],
+  ["[Pasted text #1 +30 lines]\n> ", "paste_pending"],
+  ["> A generated suggestion indistinguishable from a real draft", "active_input_not_empty"],
+]) {
+  for (const pending of [false, true]) {
+    for (const force of [false, true]) {
+      const occupied = scriptedBackend([capture]);
+      occupied.dependencies.runtimeObservation = async () => ({
+        workflowActivity: { pendingCount: pending ? 1 : 0, evidence: "claude_session_log" },
+      });
+      const result = await runSubmitPrompt(
+        { ...input, text: keywordText, pasteMode: "keyword", force },
+        occupied.dependencies
+      );
+      assert.equal(result.status, "preflight_blocked");
+      assert.equal(result.reason, reason);
+      assert.equal(result.forceUsed, false);
+      assert.equal(result.forceRefused, force ? true : undefined);
+      assert.equal(result.signals.workflowPending, pending);
+      assert.equal(occupied.calls.sendText.length, 0);
+      assert.equal(occupied.calls.sendKey.length, 0);
+    }
+  }
+}
+const unavailableKeywordCapture = scriptedBackend([]);
+unavailableKeywordCapture.dependencies.capture = async () => { throw new Error("capture unavailable"); };
+await assert.rejects(runSubmitPrompt(
+  { ...input, text: keywordText, pasteMode: "keyword", force: true }, unavailableKeywordCapture.dependencies
+), /capture unavailable/);
+assert.equal(unavailableKeywordCapture.calls.sendText.length, 0);
+assert.equal(unavailableKeywordCapture.calls.sendKey.length, 0);
+
+// Ordinary force behavior is unchanged; this new restriction is keyword-only.
+const ordinaryForcedDraft = scriptedBackend(["> existing unsent draft", "> ", "> "]);
+ordinaryForcedDraft.dependencies.promptAcknowledged = async () => true;
+const ordinaryForcedResult = await runSubmitPrompt({ ...input, force: true }, ordinaryForcedDraft.dependencies);
+assert.equal(ordinaryForcedResult.status, "submitted");
+assert.equal(ordinaryForcedResult.forcedPastReason, "active_input_not_empty");
+assert.equal(ordinaryForcedDraft.calls.sendText.length, 1);
+
+const emptyForcedKeyword = scriptedBackend(["> ", "> ", "> "]);
+emptyForcedKeyword.dependencies.promptAcknowledged = async () => true;
+emptyForcedKeyword.dependencies.sendText = async (...args) => {
+  emptyForcedKeyword.calls.sendText.push(args);
+  return { bracketedPasteUsed: true, literalPrefixCharacters: 10 };
+};
+const emptyForcedResult = await runSubmitPrompt(
+  { ...input, text: keywordText, pasteMode: "keyword", force: true }, emptyForcedKeyword.dependencies
+);
+assert.equal(emptyForcedResult.status, "submitted");
+assert.equal(emptyForcedResult.forceUsed, false);
+assert.equal(emptyForcedKeyword.calls.sendText.length, 1);
+assert.equal(emptyForcedKeyword.calls.sendKey.length, 0);
+
 const degradedPaste = scriptedBackend(["> ", "> ", "> "]);
 degradedPaste.dependencies.sendText = async (...args) => {
   degradedPaste.calls.sendText.push(args);

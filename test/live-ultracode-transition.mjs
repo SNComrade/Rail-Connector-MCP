@@ -32,7 +32,7 @@ const claudeSettingsFile = path.join(claudeConfigDir, "settings.json");
 const claudeSettingsSnapshot = fs.existsSync(claudeSettingsFile)
   ? fs.readFileSync(claudeSettingsFile, "utf8")
   : null;
-const testedModel = "claude-fable-5";
+const testedModel = "claude-fable-5-1";
 const claudeProjectDir = path.join(
   claudeConfigDir,
   "projects",
@@ -251,7 +251,7 @@ try {
       sessionTitle: `Rail UltraCode Transition ${process.pid}`,
       permissionMode: "bypassPermissions",
       confirmBypassPermissions: true,
-      model: "claude-fable-5",
+      model: "claude-fable-5-1",
       ultracode: true,
       confirmUltracode: true,
       debug: true,

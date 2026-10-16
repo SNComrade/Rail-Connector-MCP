@@ -2,7 +2,7 @@
 
 ## Release Status
 
-`1.0.0-beta.3` is prerelease software. Tool names, input schemas, response
+`1.0.0-beta.4` is prerelease software. Tool names, input schemas, response
 fields, installation behavior, and platform support may change before `1.0.0`.
 
 ## Node.js
@@ -23,6 +23,20 @@ or major release, with advance notice in the changelog when practical.
 
 Each platform also requires a compatible `node-pty` prebuild or native compiler
 toolchain.
+
+The beta pins `node-pty 1.2.0-beta.15` exactly. Native Windows selects its bundled
+ConPTY DLL backend and fails launch if the required binaries are unavailable;
+it does not fall back to the legacy console-list/PID-termination backend.
+The dependency and DLL option remain prerelease/experimental. Broker build
+`1.0.0-beta.4+broker.6` requires a compatible broker rather than reusing an older
+backend. See [Windows guidance](docs/WINDOWS.md) for startup recovery and limits.
+Upstream natural-exit native resource leakage remains under investigation;
+this change is not a claim that all host memory or connection retention is fixed.
+The tracked install lifecycle applies a version/hash-guarded JavaScript fix for
+the upstream beta.15 readiness watchdog. Windows uses an explicit 15-second child
+startup contract and refuses unpatched or unexpected dependency bytes. Install
+with normal `npm ci`; disabling install scripts is unsupported. Native binaries
+and the upstream readiness-before-connect/error-cleanup safeguards are preserved.
 
 ## Claude Code
 

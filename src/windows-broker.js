@@ -2,10 +2,10 @@
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { spawn as spawnChild } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as pty from "node-pty";
-import { createTerminalRenderer } from "./terminal.js";
+import { createTerminalRenderer, workflowKeywordPrefixLength } from "./terminal.js";
+import { verifyNodePtyFix } from "../tools/install-node-pty-fix.mjs";
 import {
   WINDOWS_BROKER_PROTOCOL,
   WINDOWS_BROKER_VERSION,
@@ -17,9 +17,14 @@ const CAPTURE_BUFFER_LIMIT = 4 * 1024 * 1024;
 const DEFAULT_TEXT_CHUNK_SIZE = 2048;
 const DEFAULT_TEXT_CHUNK_DELAY_MS = 10;
 const DEFAULT_SUBMIT_SETTLE_MS = 100;
+const KEYWORD_MODE_OBSERVATION_MS = DEFAULT_SUBMIT_SETTLE_MS;
 const REQUEST_READ_TIMEOUT_MS = 2000;
 const MAX_BROKER_CONNECTIONS = 64;
 const MAX_SLEEP_MS = 30_000;
+// Explicit child-start budget within the client's existing 30s request window.
+// The carried public option gives node-pty the same readiness contract; its
+// unconfigured upstream 5s watchdog must not terminate a valid slower start.
+const PTY_STARTUP_TIMEOUT_MS = 15000;
 const COMPATIBILITY_INSPECTION_OPERATIONS = new Set([
   "ping",
   "status",
@@ -28,6 +33,28 @@ const COMPATIBILITY_INSPECTION_OPERATIONS = new Set([
   "acquireCleanupLease",
   "releaseCleanupLease",
   "cleanupStop",
+]);
+// A generation pair is optional for the established public API, whose
+// name-selected operations retain backwards compatibility. Callers that
+// already possess a generation/start pair can opt into this stricter broker
+// contract. Keeping the distinction explicit lets an isolated controller fail
+// closed without making an ordinary legacy operation discover a pair before it
+// can acquire its initial lease.
+const EXACT_PAIR_OPERATIONS = new Set([
+  "acquireLease",
+  "conditionalMetadata",
+  "conditionalStopMetadata",
+  "capture",
+  "updateMetadata",
+  "updateObservation",
+  "releaseLease",
+  "renewLease",
+  "stop",
+  "acquireCleanupLease",
+  "releaseCleanupLease",
+  "cleanupStop",
+  "sendText",
+  "sendKey",
 ]);
 const sessions = new Map();
 const operationLocks = new Map();
@@ -50,6 +77,10 @@ if (brokerToken.length < 32) {
   process.stderr.write("windows-broker token is invalid\n");
   process.exit(2);
 }
+// A broker must not remain alive with cached unpatched modules and later accept
+// an on-disk repair as proof of its loaded code. Refuse before serving any IPC;
+// an operator's reviewed npm ci is followed by a fresh broker process.
+verifyNodePtyFix();
 
 function sleep(ms) {
   let delay = Number.isInteger(ms) ? ms : 0;
@@ -334,6 +365,66 @@ async function captureSession(session, lines = 120) {
   return session.exited ? `[managed session exited, code ${session.exitCode}]\n${capture}` : capture;
 }
 
+function isUuid(value) {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function validatedFreshLaunchSessionId(payload, launch) {
+  const freshSessionId = payload.freshSessionId;
+  if (freshSessionId === undefined || freshSessionId === null) return null;
+  const resolvedSessionId = payload.resolvedSessionId;
+  if (
+    !isUuid(freshSessionId) ||
+    freshSessionId !== resolvedSessionId ||
+    !isUuid(resolvedSessionId)
+  ) {
+    const error = new Error(
+      "A fresh Claude session id must be the exact UUID supplied as the resolved session id."
+    );
+    error.code = "ESESSIONIDENTITY";
+    throw error;
+  }
+  const sessionIdPositions = launch.metadataArgs
+    .map((argument, index) => argument === "--session-id" ? index : -1)
+    .filter((index) => index >= 0);
+  if (
+    sessionIdPositions.length !== 1 ||
+    launch.metadataArgs[sessionIdPositions[0] + 1] !== freshSessionId
+  ) {
+    const error = new Error(
+      "A fresh Claude session id requires exactly one matching --session-id launch argument."
+    );
+    error.code = "ESESSIONIDENTITY";
+    throw error;
+  }
+  const hasContinuationArgument = launch.metadataArgs.some((argument) =>
+    /^(?:--resume|--continue|--fork(?:-session)?)(?:=|$)/i.test(argument)
+  );
+  if (hasContinuationArgument) {
+    const error = new Error(
+      "A fresh Claude session identity cannot be combined with resume, continue, or fork arguments."
+    );
+    error.code = "ESESSIONIDENTITY";
+    throw error;
+  }
+  return freshSessionId;
+}
+
+function validatedStartMetadata(payload, launch) {
+  const leaseId = typeof payload.leaseId === "string" ? payload.leaseId : "";
+  if (!leaseId) {
+    const error = new Error("Starting a managed session requires a broker lease id.");
+    error.code = "ELEASE";
+    throw error;
+  }
+  return {
+    leaseId,
+    launchEnvironment: validatedLaunchEnvironment(payload.launchEnvironment),
+    freshSessionId: validatedFreshLaunchSessionId(payload, launch),
+  };
+}
+
 function sessionMetadata(sessionName, session) {
   return {
     name: sessionName,
@@ -349,7 +440,9 @@ function sessionMetadata(sessionName, session) {
     resolvedPosture: session.resolvedPosture ?? null,
     launchEnvironment: session.launchEnvironment ?? null,
     resolvedSessionId: session.resolvedSessionId ?? null,
+    snapshotIdentityBinding: session.snapshotIdentityBinding ?? null,
     observedPosture: session.observedPosture ?? null,
+    recoveryOnly: Boolean(session.recoveryOnly),
     exited: session.exited,
     exitCode: session.exitCode,
   };
@@ -362,10 +455,10 @@ function assertExpectedGeneration(
   expectedGenerationId
 ) {
   if (
-    (expectedGenerationId &&
+    (expectedGenerationId !== null &&
+      expectedGenerationId !== undefined &&
       String(expectedGenerationId) !== session.generationId) ||
-    (!expectedGenerationId &&
-      expectedStartedAtMs !== null &&
+    (expectedStartedAtMs !== null &&
       expectedStartedAtMs !== undefined &&
       Number(expectedStartedAtMs) !== session.startedAtMs)
   ) {
@@ -377,33 +470,160 @@ function assertExpectedGeneration(
   }
 }
 
+function assertCompleteExpectedGeneration(sessionName, session, payload, operation) {
+  if (
+    typeof payload.expectedGenerationId !== "string" ||
+    payload.expectedGenerationId.length === 0 ||
+    !Number.isSafeInteger(payload.expectedStartedAtMs)
+  ) {
+    const error = new Error(`${operation} requires a complete generation binding.`);
+    error.code = "EINVAL";
+    throw error;
+  }
+  if (!session) {
+    const error = new Error(
+      `Managed session generation changed for ${sessionName}; refusing a stale ${operation}.`
+    );
+    error.code = "ESTALE";
+    throw error;
+  }
+  assertExpectedGeneration(
+    sessionName,
+    session,
+    payload.expectedStartedAtMs,
+    payload.expectedGenerationId
+  );
+}
+
+function assertRequiredExactGeneration(sessionName, session, payload, operation) {
+  if (payload.requireExactPair !== true) return;
+  assertCompleteExpectedGeneration(sessionName, session, payload, operation);
+}
+
+function canonicalCwdForExactStop(session) {
+  let currentCanonicalCwd;
+  try {
+    currentCanonicalCwd =
+      fs.realpathSync.native?.(session.cwd) ?? fs.realpathSync(session.cwd);
+  } catch {
+    const error = new Error("Managed session cwd is unavailable for an exact stop.");
+    error.code = "ECWDUNAVAILABLE";
+    throw error;
+  }
+  if (
+    path.resolve(currentCanonicalCwd).toLowerCase() !==
+    path.resolve(session.canonicalCwd).toLowerCase()
+  ) {
+    const error = new Error("Managed session cwd no longer matches its start-time canonical provenance.");
+    error.code = "ECWDPROVENANCE";
+    throw error;
+  }
+  return currentCanonicalCwd;
+}
+
+function assertExpectedStopIdentity(sessionName, session, payload) {
+  const hasSessionId =
+    payload.expectedResolvedSessionId !== undefined &&
+    payload.expectedResolvedSessionId !== null;
+  const hasCwd =
+    payload.expectedCanonicalCwd !== undefined &&
+    payload.expectedCanonicalCwd !== null;
+  if (!hasSessionId && !hasCwd) return null;
+  if (!hasSessionId || !hasCwd) {
+    const error = new Error("Exact stop identity requires both resolved session id and canonical cwd.");
+    error.code = "EINVAL";
+    throw error;
+  }
+  assertCompleteExpectedGeneration(sessionName, session, payload, "Exact stop identity");
+  if (
+    !isUuid(payload.expectedResolvedSessionId) ||
+    session.resolvedSessionId !== payload.expectedResolvedSessionId
+  ) {
+    const error = new Error("Managed session identity changed; refusing a stale stop.");
+    error.code = "ESTALE";
+    throw error;
+  }
+  if (
+    typeof payload.expectedCanonicalCwd !== "string" ||
+    !path.isAbsolute(payload.expectedCanonicalCwd)
+  ) {
+    const error = new Error("Exact stop identity requires an absolute canonical cwd.");
+    error.code = "EINVAL";
+    throw error;
+  }
+  const canonicalCwd = canonicalCwdForExactStop(session);
+  if (
+    path.resolve(canonicalCwd).toLowerCase() !==
+    path.resolve(payload.expectedCanonicalCwd).toLowerCase()
+  ) {
+    const error = new Error("Managed session identity changed; refusing a stale stop.");
+    error.code = "ESTALE";
+    throw error;
+  }
+  return {
+    generationId: session.generationId,
+    startedAtMs: session.startedAtMs,
+    resolvedSessionId: session.resolvedSessionId,
+    canonicalCwd,
+  };
+}
+
+function assertRecoveryGeneration(sessionName, session, payload) {
+  if (!session.recoveryOnly) return;
+  if (
+    typeof payload.expectedGenerationId !== "string" ||
+    payload.expectedGenerationId.length === 0 ||
+    !Number.isSafeInteger(payload.expectedStartedAtMs)
+  ) {
+    const error = new Error(
+      `Session ${sessionName} is recovery-only (after a stop timeout or an interrupted keyword send); stop it with its exact expectedGenerationId and expectedStartedAtMs.`
+    );
+    error.code = "EINVAL";
+    throw error;
+  }
+  assertExpectedGeneration(
+    sessionName,
+    session,
+    payload.expectedStartedAtMs,
+    payload.expectedGenerationId
+  );
+}
+
+function assertOptionalExactGeneration(sessionName, session, payload) {
+  const hasGeneration = payload.expectedGenerationId !== undefined &&
+    payload.expectedGenerationId !== null;
+  const hasStart = payload.expectedStartedAtMs !== undefined &&
+    payload.expectedStartedAtMs !== null;
+  if (!hasGeneration && !hasStart) return;
+  if (
+    !hasGeneration || !hasStart ||
+    typeof payload.expectedGenerationId !== "string" ||
+    payload.expectedGenerationId.length === 0 ||
+    !Number.isSafeInteger(payload.expectedStartedAtMs)
+  ) {
+    const error = new Error("A lease release requires a complete generation binding.");
+    error.code = "EINVAL";
+    throw error;
+  }
+  if (!session) {
+    const error = new Error(
+      `Managed session generation changed for ${sessionName}; refusing a stale lease release.`
+    );
+    error.code = "ESTALE";
+    throw error;
+  }
+  assertExpectedGeneration(
+    sessionName,
+    session,
+    payload.expectedStartedAtMs,
+    payload.expectedGenerationId
+  );
+}
+
 async function waitForExit(session, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (!session.exited && Date.now() < deadline) await sleep(50);
   return session.exited;
-}
-
-async function forceKillProcessTree(pid) {
-  await new Promise((resolve) => {
-    const child = spawnChild(
-      "taskkill.exe",
-      ["/PID", String(pid), "/T", "/F"],
-      { windowsHide: true, stdio: "ignore" }
-    );
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve();
-    };
-    const timer = setTimeout(() => {
-      child.kill();
-      finish();
-    }, 5000);
-    child.once("error", finish);
-    child.once("exit", finish);
-  });
 }
 
 async function stopSession(
@@ -417,6 +637,14 @@ async function stopSession(
     await session.renderer.dispose();
     sessions.delete(sessionName);
     return { status: "not_running", managedSession: sessionName, exitCode };
+  }
+
+  if (!graceful && !force) {
+    return {
+      status: "stop_blocked",
+      reason: "stop_mode_required",
+      managedSession: sessionName,
+    };
   }
 
   const capture = omitCapture ? "" : await captureSession(session, 120);
@@ -442,16 +670,20 @@ async function stopSession(
   } catch {
     // The process exited between checks.
   }
-  if (!(await waitForExit(session, 1500))) {
-    await forceKillProcessTree(session.pid);
-  }
+  // Do not add a separate PID-only taskkill fallback if node-pty cannot
+  // confirm exit. The caller must bind its own exact process for recovery.
+  await waitForExit(session, 1500);
   if (!(await waitForExit(session, 4000))) {
     session.lease = null;
+    session.recoveryOnly = true;
     return {
       status: "stop_timeout",
       managedSession: sessionName,
+      recoveryOnly: true,
+      expectedGenerationId: session.generationId,
+      expectedStartedAtMs: session.startedAtMs,
       ...(omitCapture ? {} : { capture }),
-      note: "Claude did not confirm exit after ConPTY termination and taskkill /T /F. The session remains tracked and can be retried.",
+      note: "Claude did not confirm exit after ConPTY termination. The session remains tracked for exact-owned recovery: name-only calls are refused, so retry stop_remote_control with these expectedGenerationId and expectedStartedAtMs values.",
     };
   }
   const exitCode = session.exitCode;
@@ -464,16 +696,11 @@ async function startSession(
   sessionName,
   payload,
   launch = validatedPtyLaunch(payload),
-  launchCwd = validatedLaunchCwd(payload)
+  launchCwd = validatedLaunchCwd(payload),
+  launchMetadata = validatedStartMetadata(payload, launch)
 ) {
-  const leaseId = typeof payload.leaseId === "string" ? payload.leaseId : "";
-  if (!leaseId) {
-    const error = new Error("Starting a managed session requires a broker lease id.");
-    error.code = "ELEASE";
-    throw error;
-  }
   const { requestedCwd, canonicalCwd } = launchCwd;
-  const launchEnvironment = validatedLaunchEnvironment(payload.launchEnvironment);
+  const { leaseId, launchEnvironment, freshSessionId } = launchMetadata;
   const renderer = createTerminalRenderer({
     cols: clampInteger(payload.cols, 140, 40, 400),
     rows: clampInteger(payload.rows, 40, 10, 200),
@@ -483,6 +710,11 @@ async function startSession(
   try {
     ptyProcess = pty.spawn(launch.command, launch.ptyArgs, {
       name: "xterm-256color",
+      // The bundled backend avoids node-pty's deferred console-list fork and
+      // numeric-PID termination. The exact dependency includes the native
+      // handle-registry synchronization fix; never fall back to system ConPTY.
+      useConptyDll: true,
+      conptyConnectionTimeout: PTY_STARTUP_TIMEOUT_MS,
       cols: clampInteger(payload.cols, 140, 40, 400),
       rows: clampInteger(payload.rows, 40, 10, 200),
       cwd: canonicalCwd,
@@ -504,12 +736,14 @@ async function startSession(
     cwd: requestedCwd,
     canonicalCwd,
     command: launch.metadataCommand,
-    pid: ptyProcess.pid,
+    pid: Number.isSafeInteger(ptyProcess.pid) && ptyProcess.pid > 0 ? ptyProcess.pid : null,
     args: launch.metadataArgs,
     requestedPosture: payload.requestedPosture ?? null,
     resolvedPosture: payload.resolvedPosture ?? null,
     launchEnvironment,
     resolvedSessionId: payload.resolvedSessionId ?? null,
+    freshSessionId,
+    snapshotIdentityBinding: null,
     observedPosture: payload.observedPosture ?? null,
     lease: {
       id: leaseId,
@@ -523,15 +757,46 @@ async function startSession(
   renderer.onBinary((data) => {
     if (!session.exited) session.ptyProcess.write(data);
   });
+  const observePid = () => {
+    const pid = ptyProcess.pid;
+    if (session.pid === null && Number.isSafeInteger(pid) && pid > 0) session.pid = pid;
+  };
   ptyProcess.onData((data) => {
+    observePid();
     session.rawBuffer = trimRawBuffer(session.rawBuffer + data);
     void renderer.write(data);
   });
   ptyProcess.onExit(({ exitCode }) => {
+    observePid();
     session.exitCode = exitCode;
     session.exited = true;
   });
   sessions.set(sessionName, session);
+  // node-pty connects asynchronously after its output worker becomes ready.
+  // Keep the original generation owned while renderer replies unblock the
+  // terminal handshake; do not publish a successful start with a PID of zero.
+  const startupDeadline = performance.now() + PTY_STARTUP_TIMEOUT_MS;
+  while (session.pid === null && !session.exited && performance.now() < startupDeadline) {
+    observePid();
+    if (session.pid !== null) break;
+    await sleep(10);
+  }
+  observePid();
+  if (session.pid === null && !session.exited) {
+    session.recoveryOnly = true;
+    session.lease = null;
+    // Public kill can be deferred until first data. It is a cancellation
+    // request, not exit proof: retain the PTY, renderer and exact binding so
+    // any late child remains tracked and replacement/shutdown stays blocked.
+    let stopError;
+    try { ptyProcess.kill(); } catch (error) { stopError = error; }
+    const error = new Error(
+      `Native Windows terminal startup did not confirm a process. The original generation remains recovery-only; inspect status and stop with expectedGenerationId=${session.generationId}, expectedStartedAtMs=${session.startedAtMs}.`,
+      stopError ? { cause: stopError } : undefined
+    );
+    error.code = "EPTYSTARTUP";
+    throw error;
+  }
   return { status: "started", metadata: sessionMetadata(sessionName, session) };
 }
 
@@ -615,9 +880,23 @@ async function handleOperation(operation, payload) {
   if (!/^[A-Za-z0-9_-]{1,80}$/.test(sessionName)) throw new Error(`Invalid managed session name: ${sessionName}`);
 
   return withOperationLock(sessionName, async () => {
+    if (payload.requireExactPair !== undefined && typeof payload.requireExactPair !== "boolean") {
+      const error = new Error("requireExactPair must be a boolean.");
+      error.code = "EINVAL";
+      throw error;
+    }
+    // Do this under the same per-session lock as the operation, and before an
+    // absent/exited session can be turned into a legacy name-only result. A
+    // strict caller therefore never downgrades an exact-pair request into a
+    // `not_running` or compatibility-cleanup response.
+    if (payload.requireExactPair === true && EXACT_PAIR_OPERATIONS.has(operation)) {
+      const session = sessions.get(sessionName);
+      assertRequiredExactGeneration(sessionName, session, payload, operation);
+    }
     if (operation === "acquireCleanupLease") {
       const session = sessions.get(sessionName);
       if (!session) return { status: "not_running" };
+      assertRecoveryGeneration(sessionName, session, payload);
       const leaseId = String(payload.leaseId || "");
       if (!leaseId) {
         const error = new Error(
@@ -656,6 +935,7 @@ async function handleOperation(operation, payload) {
     }
     if (operation === "releaseCleanupLease") {
       const session = sessions.get(sessionName);
+      assertOptionalExactGeneration(sessionName, session, payload);
       if (session?.lease?.id === payload.leaseId) session.lease = null;
       return { status: "released" };
     }
@@ -664,6 +944,7 @@ async function handleOperation(operation, payload) {
       if (!session) {
         return { status: "not_running", managedSession: sessionName };
       }
+      assertRecoveryGeneration(sessionName, session, payload);
       assertMutationLease(session, payload.leaseId);
       assertExpectedGeneration(
         sessionName,
@@ -679,7 +960,7 @@ async function handleOperation(operation, payload) {
     }
     if (operation === "acquireLease") {
       const session = sessions.get(sessionName);
-      if (!session || session.exited) {
+      if (!session || (session.exited && !payload.expectedGenerationId)) {
         if (payload.expectedGenerationId) {
           const error = new Error(
             `Managed session generation changed for ${sessionName}; refusing a stale lease acquisition.`
@@ -689,6 +970,14 @@ async function handleOperation(operation, payload) {
         }
         return { status: "not_running" };
       }
+      // A caller holding the exact original pair may remove an exited
+      // generation. This must not turn into a name-only lease on a replacement.
+      if (session.exited && !Number.isSafeInteger(payload.expectedStartedAtMs)) {
+        const error = new Error("An exited generation requires its exact start timestamp.");
+        error.code = "EINVAL";
+        throw error;
+      }
+      assertRecoveryGeneration(sessionName, session, payload);
       assertExpectedGeneration(
         sessionName,
         session,
@@ -717,12 +1006,19 @@ async function handleOperation(operation, payload) {
     }
     if (operation === "releaseLease") {
       const session = sessions.get(sessionName);
+      assertOptionalExactGeneration(sessionName, session, payload);
       if (session?.lease?.id === payload.leaseId) session.lease = null;
       return { status: "released" };
     }
     if (operation === "renewLease") {
       const session = sessions.get(sessionName);
       if (!session || session.exited) return { status: "not_running" };
+      assertExpectedGeneration(
+        sessionName,
+        session,
+        payload.expectedStartedAtMs,
+        payload.expectedGenerationId
+      );
       const lease = activeLease(session);
       if (!lease || lease.id !== payload.leaseId) return { status: "lost" };
       lease.expiresAt =
@@ -732,6 +1028,7 @@ async function handleOperation(operation, payload) {
     if (operation === "start") {
       const launch = validatedPtyLaunch(payload);
       const launchCwd = validatedLaunchCwd(payload);
+      verifyNodePtyFix();
       const existing = sessions.get(sessionName);
       if (existing && !existing.exited) {
         return {
@@ -749,6 +1046,9 @@ async function handleOperation(operation, payload) {
     if (operation === "replace") {
       const launch = validatedPtyLaunch(payload);
       const existing = sessions.get(sessionName);
+      if (existing && !existing.exited) {
+        assertRecoveryGeneration(sessionName, existing, payload);
+      }
       if (existing && !existing.exited) assertMutationLease(existing, payload.leaseId);
       if (existing) {
         assertExpectedGeneration(
@@ -759,6 +1059,10 @@ async function handleOperation(operation, payload) {
         );
       }
       const launchCwd = validatedLaunchCwd(payload);
+      const launchMetadata = validatedStartMetadata(payload, launch);
+      // Fail deterministic dependency preflight before stopping an existing
+      // generation, just as for invalid replacement launch metadata.
+      verifyNodePtyFix();
       if (existing) {
         const stopResult = await stopSession(sessionName, {
           graceful: Boolean(payload.graceful),
@@ -768,12 +1072,43 @@ async function handleOperation(operation, payload) {
           return { status: "replace_failed", stopResult };
         }
       }
-      return startSession(sessionName, payload, launch, launchCwd);
+      return startSession(sessionName, payload, launch, launchCwd, launchMetadata);
     }
 
     const session = sessions.get(sessionName);
     if (!session) throw new Error(`No managed native Windows Claude session found: ${sessionName}`);
 
+    if (operation === "conditionalMetadata") {
+      if (
+        !payload.expectedGenerationId ||
+        !Number.isSafeInteger(payload.expectedStartedAtMs)
+      ) {
+        const error = new Error("Conditional metadata requires a complete generation binding.");
+        error.code = "EINVAL";
+        throw error;
+      }
+      assertExpectedGeneration(
+        sessionName,
+        session,
+        payload.expectedStartedAtMs,
+        payload.expectedGenerationId
+      );
+      return { metadata: sessionMetadata(sessionName, session) };
+    }
+    if (operation === "conditionalStopMetadata") {
+      if (!session.exited) assertMutationLease(session, payload.leaseId);
+      assertExpectedGeneration(
+        sessionName,
+        session,
+        payload.expectedStartedAtMs,
+        payload.expectedGenerationId
+      );
+      const boundIdentity = assertExpectedStopIdentity(sessionName, session, payload);
+      return {
+        metadata: sessionMetadata(sessionName, session),
+        ...(boundIdentity ? { boundIdentity } : {}),
+      };
+    }
     if (operation === "capture") {
       assertExpectedGeneration(
         sessionName,
@@ -781,7 +1116,70 @@ async function handleOperation(operation, payload) {
         payload.expectedStartedAtMs,
         payload.expectedGenerationId
       );
-      return { capture: await captureSession(session, payload.lines) };
+      return {
+        capture: await captureSession(session, payload.lines),
+        ...(payload.includeCursorStyle === true
+          ? { cursorLineStyle: await session.renderer.cursorLineStyle() }
+          : {}),
+      };
+    }
+    if (operation === "bindWorkflowSnapshotIdentity") {
+      if (session.exited || session.recoveryOnly) {
+        const error = new Error(
+          "Workflow snapshot identity binding requires a healthy running managed session."
+        );
+        error.code = "ERECOVERY";
+        throw error;
+      }
+      assertMutationLease(session, payload.leaseId);
+      assertCompleteExpectedGeneration(
+        sessionName,
+        session,
+        payload,
+        "Workflow snapshot identity binding"
+      );
+      if (session.snapshotIdentityBinding) {
+        const error = new Error(
+          "Workflow snapshot identity is already bound for this managed session generation."
+        );
+        error.code = "EBOUND";
+        throw error;
+      }
+      const requestedSessionId = payload.requestedSessionId;
+      const resolvedSessionId = payload.resolvedSessionId;
+      if (
+        !session.freshSessionId ||
+        requestedSessionId !== session.freshSessionId ||
+        resolvedSessionId !== session.freshSessionId ||
+        session.resolvedSessionId !== session.freshSessionId
+      ) {
+        const error = new Error(
+          "Workflow snapshot identity binding requires the exact fresh launched Claude session id."
+        );
+        error.code = "ESESSIONIDENTITY";
+        throw error;
+      }
+      if (
+        typeof payload.logFileIdentity !== "string" ||
+        payload.logFileIdentity.trim().length === 0
+      ) {
+        const error = new Error(
+          "Workflow snapshot identity binding requires a stable nonempty log file identity."
+        );
+        error.code = "EINVAL";
+        throw error;
+      }
+      session.snapshotIdentityBinding = {
+        generationId: session.generationId,
+        startedAtMs: session.startedAtMs,
+        resolvedSessionId: session.resolvedSessionId,
+        logFileIdentity: payload.logFileIdentity,
+        mode: "fresh",
+      };
+      return {
+        status: "bound",
+        metadata: sessionMetadata(sessionName, session),
+      };
     }
     if (operation === "updateMetadata") {
       assertMutationLease(session, payload.leaseId);
@@ -791,7 +1189,20 @@ async function handleOperation(operation, payload) {
         payload.expectedStartedAtMs,
         payload.expectedGenerationId
       );
-      if (payload.resolvedSessionId) session.resolvedSessionId = String(payload.resolvedSessionId);
+      if (payload.resolvedSessionId) {
+        const nextResolvedSessionId = String(payload.resolvedSessionId);
+        if (
+          session.snapshotIdentityBinding &&
+          nextResolvedSessionId !== session.resolvedSessionId
+        ) {
+          const error = new Error(
+            "Resolved Claude session id is immutable after workflow snapshot identity binding."
+          );
+          error.code = "EBOUND";
+          throw error;
+        }
+        session.resolvedSessionId = nextResolvedSessionId;
+      }
       if (payload.requestedPosture) session.requestedPosture = payload.requestedPosture;
       if (payload.resolvedPosture) session.resolvedPosture = payload.resolvedPosture;
       if (payload.launchEnvironment) {
@@ -818,6 +1229,7 @@ async function handleOperation(operation, payload) {
       };
     }
     if (operation === "stop") {
+      assertRecoveryGeneration(sessionName, session, payload);
       if (!session.exited) assertMutationLease(session, payload.leaseId);
       assertExpectedGeneration(
         sessionName,
@@ -825,12 +1237,24 @@ async function handleOperation(operation, payload) {
         payload.expectedStartedAtMs,
         payload.expectedGenerationId
       );
-      return stopSession(sessionName, payload);
+      const boundIdentity = assertExpectedStopIdentity(sessionName, session, payload);
+      const result = await stopSession(sessionName, payload);
+      return {
+        ...result,
+        ...(boundIdentity && result.status === "stopped" && result.graceful === true
+          ? { boundIdentity }
+          : {}),
+      };
     }
     if (!liveSession(sessionName)) {
       throw new Error(`Managed native Windows Claude session has exited: ${sessionName}`);
     }
     if (operation === "sendText") {
+      if (session.recoveryOnly) {
+        const error = new Error("Recovery-only session (after a stop timeout or an interrupted keyword send) accepts only an exact-generation stop.");
+        error.code = "ERECOVERY";
+        throw error;
+      }
       assertMutationLease(session, payload.leaseId);
       assertExpectedGeneration(
         sessionName,
@@ -838,18 +1262,92 @@ async function handleOperation(operation, payload) {
         payload.expectedStartedAtMs,
         payload.expectedGenerationId
       );
-      const chunks = textChunks(payload.text, payload.chunkSize);
+      if (payload.keywordPrefix !== undefined && typeof payload.keywordPrefix !== "boolean") {
+        const error = new Error("keywordPrefix must be a boolean.");
+        error.code = "EINVAL";
+        throw error;
+      }
+      const prefixLength = payload.keywordPrefix ? workflowKeywordPrefixLength(payload.text) : 0;
+      const chunks = textChunks(prefixLength ? payload.text.slice(prefixLength) : payload.text, payload.chunkSize);
       const delayMs = clampInteger(payload.chunkDelayMs, DEFAULT_TEXT_CHUNK_DELAY_MS, 0, 250);
-      const bracketedPasteUsed =
+      // A keyword body must leave a real observation window between PTY
+      // chunks so a bracketed-paste mode change reaches the renderer before the
+      // next chunk. A 10 ms window was too short on loaded hosted Windows
+      // runners; use the same window as the prefix settle.
+      const keywordChunkDelayMs = prefixLength
+        ? Math.max(delayMs, KEYWORD_MODE_OBSERVATION_MS)
+        : delayMs;
+      if (prefixLength) await session.renderer.flush();
+      let bracketedPasteUsed =
         Boolean(payload.bracketedPaste) && session.renderer.bracketedPasteMode;
+      if (prefixLength && !bracketedPasteUsed) {
+        const error = new Error("Keyword delivery requires active bracketed-paste support; no input was sent.");
+        error.code = "EPASTEMODE";
+        throw error;
+      }
+      if (prefixLength) {
+        // Both segments and the final Enter stay inside one generation-bound
+        // operation/lease. Only caller-selected, unchanged prefix bytes are literal.
+        session.ptyProcess.write(payload.text.slice(0, prefixLength));
+        await sleep(DEFAULT_SUBMIT_SETTLE_MS);
+        await session.renderer.flush();
+        bracketedPasteUsed =
+          Boolean(payload.bracketedPaste) && session.renderer.bracketedPasteMode;
+        if (!bracketedPasteUsed) {
+          session.recoveryOnly = true;
+          const error = new Error(
+            "Keyword prefix was sent, but bracketed-paste support changed before the body; no body or Enter was sent. This generation is recovery-only; inspect the composer before retrying."
+          );
+          error.code = "EPASTEMODE";
+          throw error;
+        }
+      }
       if (bracketedPasteUsed) session.ptyProcess.write("\x1b[200~");
       for (let index = 0; index < chunks.length; index += 1) {
         session.ptyProcess.write(chunks[index]);
-        if (delayMs > 0 && index + 1 < chunks.length) await sleep(delayMs);
+        if (prefixLength) {
+          // Yield after every body chunk, including when the requested pacing
+          // delay is zero, so pending terminal mode output is observed before
+          // another chunk, a closing frame, or Enter can be sent.
+          await sleep(keywordChunkDelayMs);
+          await session.renderer.flush();
+          if (!session.renderer.bracketedPasteMode) {
+            session.recoveryOnly = true;
+            const error = new Error(
+              "Keyword body was partially sent, but bracketed-paste support changed; no later body, closing frame, or Enter was sent. This generation is recovery-only."
+            );
+            error.code = "EPASTEMODE";
+            throw error;
+          }
+        } else if (delayMs > 0 && index + 1 < chunks.length) {
+          await sleep(delayMs);
+        }
+      }
+      if (prefixLength) {
+        await session.renderer.flush();
+        if (!session.renderer.bracketedPasteMode) {
+          session.recoveryOnly = true;
+          const error = new Error(
+            "Keyword body was sent, but bracketed-paste support changed before the closing frame; no closing frame or Enter was sent. This generation is recovery-only."
+          );
+          error.code = "EPASTEMODE";
+          throw error;
+        }
       }
       if (bracketedPasteUsed) session.ptyProcess.write("\x1b[201~");
       if (payload.submit) {
         await sleep(clampInteger(payload.submitSettleMs, DEFAULT_SUBMIT_SETTLE_MS, 50, 500));
+        if (prefixLength) {
+          await session.renderer.flush();
+          if (!session.renderer.bracketedPasteMode) {
+            session.recoveryOnly = true;
+            const error = new Error(
+              "Keyword body and closing frame were sent, but bracketed-paste support changed before Enter; no Enter was sent. This generation is recovery-only."
+            );
+            error.code = "EPASTEMODE";
+            throw error;
+          }
+        }
         session.ptyProcess.write("\r");
       }
       await sleep(400);
@@ -857,9 +1355,15 @@ async function handleOperation(operation, payload) {
         status: "sent",
         bracketedPasteRequested: Boolean(payload.bracketedPaste),
         bracketedPasteUsed,
+        ...(prefixLength ? { literalPrefixCharacters: prefixLength } : {}),
       };
     }
     if (operation === "sendKey") {
+      if (session.recoveryOnly) {
+        const error = new Error("Recovery-only session (after a stop timeout or an interrupted keyword send) accepts only an exact-generation stop.");
+        error.code = "ERECOVERY";
+        throw error;
+      }
       assertMutationLease(session, payload.leaseId);
       assertExpectedGeneration(
         sessionName,

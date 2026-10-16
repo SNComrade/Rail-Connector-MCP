@@ -1,0 +1,47 @@
+{
+  "format": 1,
+  "package": "node-pty",
+  "version": "1.2.0-beta.15",
+  "fix": "conpty-readiness-budget-v1",
+  "upstreamIssue": "https://github.com/microsoft/node-pty/issues/955",
+  "preservedSafeguards": "https://github.com/microsoft/node-pty/pull/943",
+  "patches": [
+    {
+      "path": "lib/windowsTerminal.js",
+      "sha256Before": "b05d53d49cf9f422c2836029676ac2829f59cc14f5bbbbfaafa08382ff044267",
+      "sha256After": "75fd46726fb2bf55b9461e365413867fdad223764de974532024d206817a2494",
+      "replacements": [
+        {
+          "from": "        opt = opt || {};\n",
+          "to": "        opt = opt || {};\n        if (opt.conptyConnectionTimeout !== undefined && (!Number.isSafeInteger(opt.conptyConnectionTimeout) || opt.conptyConnectionTimeout < 1 || opt.conptyConnectionTimeout > 30000)) {\n            throw new RangeError(\"conptyConnectionTimeout must be an integer between 1 and 30000 milliseconds\");\n        }\n"
+        },
+        {
+          "from": "false, opt.useConptyDll, opt.conptyInheritCursor);",
+          "to": "false, opt.useConptyDll, opt.conptyInheritCursor, opt.conptyConnectionTimeout === undefined ? undefined : { connectionTimeout: opt.conptyConnectionTimeout });"
+        }
+      ]
+    },
+    {
+      "path": "lib/windowsPtyAgent.js",
+      "sha256Before": "4f503c377b11cbd113e1f32b3932fdc35e8132b0e647f4c6b70dc84224127c53",
+      "sha256After": "b0596fd3813b9bf1428531c504b6e0bdce311a484e743e3623a3966cc40804aa",
+      "replacements": [
+        {
+          "from": "        if (options === void 0) { options = defaultWindowsPtyAgentOptions; }",
+          "to": "        options = Object.assign({}, defaultWindowsPtyAgentOptions, options);"
+        }
+      ]
+    },
+    {
+      "path": "typings/node-pty.d.ts",
+      "sha256Before": "5e2960f29b6d3ca6b8a438cca419e0485d046cb7d9acf67471d5627803ad8db0",
+      "sha256After": "915230c6276abe2eeb0c74319c18967187970f4d960bd8d29a9d806b7d7beb2c",
+      "replacements": [
+        {
+          "from": "    conptyInheritCursor?: boolean;\n",
+          "to": "    conptyInheritCursor?: boolean;\n\n    /**\n     * Downstream compatibility option: bounded worker-readiness budget in milliseconds.\n     * Integer 1..30000; the unconfigured upstream default remains 5000.\n     * Native connection still requires observed worker readiness.\n     */\n    conptyConnectionTimeout?: number;\n"
+        }
+      ]
+    }
+  ]
+}

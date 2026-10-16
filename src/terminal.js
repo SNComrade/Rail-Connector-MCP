@@ -6,6 +6,23 @@ const DEFAULT_COLS = 140;
 const DEFAULT_ROWS = 40;
 const DEFAULT_SCROLLBACK = 4000;
 
+// Explicit transport intent, never inferred from quoted/pasted prompt contents.
+export function workflowKeywordPrefixLength(text) {
+  if (
+    typeof text !== "string" ||
+    !text.startsWith("ultracode:") ||
+    !text.slice(10).trim() ||
+    /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/u.test(text)
+  ) {
+    const error = new Error(
+      "Keyword delivery requires an intentional leading ultracode: prefix, a nonempty body, and no terminal control characters."
+    );
+    error.code = "EINVAL";
+    throw error;
+  }
+  return 10;
+}
+
 function terminalText(terminal, lines) {
   const buffer = terminal.buffer.active;
   const requestedLines = Number.isInteger(lines) && lines > 0 ? lines : buffer.length;
@@ -52,9 +69,29 @@ export function createTerminalRenderer({
     get bracketedPasteMode() {
       return terminal.modes.bracketedPasteMode;
     },
+    async flush() {
+      await pendingWrite;
+    },
     async capture(lines) {
       await pendingWrite;
       return terminalText(terminal, lines);
+    },
+    async cursorLineStyle() {
+      await pendingWrite;
+      const buffer = terminal.buffer.active;
+      const line = buffer.getLine(buffer.baseY + buffer.cursorY);
+      if (!line) return null;
+      const spans = [];
+      for (let column = 0; column < terminal.cols; column += 1) {
+        const cell = line.getCell(column);
+        if (!cell?.getChars()?.trim()) continue;
+        const style = { dim: Boolean(cell.isDim()), italic: Boolean(cell.isItalic()), inverse: Boolean(cell.isInverse()), fgMode: cell.getFgColorMode(), fg: cell.getFgColor(), bgMode: cell.getBgColorMode(), bg: cell.getBgColor() };
+        const previous = spans.at(-1);
+        if (previous && previous.end === column && JSON.stringify(previous.style) === JSON.stringify(style)) previous.end += cell.getWidth();
+        else spans.push({ start: column, end: column + cell.getWidth(), style });
+      }
+      // Read-only diagnostics: no input text or terminal escapes leave the renderer.
+      return { cursorX: buffer.cursorX, spans };
     },
     async dispose() {
       await pendingWrite;

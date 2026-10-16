@@ -9,7 +9,9 @@ The repo-scoped Codex skills live under:
 ## Active Skills
 
 - `rail-operator` operates start, resume, prompt, wait, capture,
-  rename, archive, reconnect, and stop workflows.
+  rename, archive, reconnect, and stop workflows. Its Quick Check is a
+  one-session smoke check to run after a Claude Code update or when something
+  looks off.
 - `rail-debugger` diagnoses registration, capability resolution,
   broker/tmux lifecycle, input transport, transcript binding, and posture.
 - `rail-reviewer` runs independent report-only Claude reviews.
@@ -53,7 +55,7 @@ The skills teach agents to:
   an isolated policy assertion as verified runtime isolation
 - distinguish UltraCode parser acceptance, xhigh correlation, workflow
   activity, conflicts, and unknown trigger attribution
-- use explicit Fable 5 and Opus 5 bypass-plus-UltraCode launch recipes only
+- use explicit Fable 5.1 and Opus 5 bypass-plus-UltraCode launch recipes only
   when the user requests that posture
 - distinguish built-in Claude tool filters from connected MCP and connector
   tools, whose availability must be assessed separately

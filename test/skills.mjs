@@ -132,7 +132,8 @@ const operatorGuidance = [
   .map(read)
   .join("\n");
 assert.match(operatorGuidance, /xhigh_correlated_unconfirmed/);
-assert.match(operatorGuidance, /claude-fable-5/);
+assert.match(operatorGuidance, /claude-fable-5-1/);
+assert.doesNotMatch(operatorGuidance, /claude-fable-5(?!-1)/);
 assert.match(operatorGuidance, /claude-opus-5/);
 assert.match(operatorGuidance, /conflicting_effort_evidence/);
 assert.match(operatorGuidance, /effort other than `xhigh` or `ultracode`/i);

@@ -169,7 +169,7 @@ try {
       ...upgradedMetadata,
       observedPosture: {
         permissionMode: "plan",
-        model: "claude-fable-5",
+        model: "claude-fable-5-1",
         effort: "high",
         ultracode: null,
         evidence: { effort: "legacy-test-fixture" },

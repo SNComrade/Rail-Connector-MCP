@@ -67,6 +67,8 @@ try {
   assert.ok(startTool.inputSchema.properties.debug);
   assert.ok(startTool.inputSchema.properties.debugFilter);
   assert.ok(startTool.inputSchema.properties.permissionMode.enum.includes("manual"));
+  assert.equal(startTool.inputSchema.properties.promptSuggestions?.type, "boolean");
+  assert.equal(startTool.inputSchema.properties.promptSuggestions.default, false);
   const listTool = tools.tools.find((tool) => tool.name === "list_claude_sessions");
   assert.ok(listTool.inputSchema.properties.includeRemoteUrls);
   assert.ok(listTool.inputSchema.properties.archiveState);

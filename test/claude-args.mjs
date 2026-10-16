@@ -3,12 +3,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  isNormalLaunchWrapper,
+  resolveNormalLaunchDescriptor,
+  resolveProductClaudeLaunchDescriptor,
+} from "../src/claude-command-resolution.js";
+import {
   assertBypassPolicy,
   bypassPolicyStatus,
   assertSafeManagedSessionName,
   assertSafeSessionId,
   bindPreparedClaudeDebugCapture,
   brokerStartFailureDefinitelyPrecommit,
+  claudeChildEnvironment,
   claudeChildLaunchEnvironmentStatus,
   claudeArgs,
   claudeDebugCaptureStatus,
@@ -19,6 +25,7 @@ import {
   prepareClaudeDebugCapture,
   requestedLaunchPosture,
   requestedLaunchPostureFromArgs,
+  resolveClaudeLaunchDescriptor,
   resolveCommandFromPath,
   resolveAllowedCwd,
   textChunks,
@@ -365,9 +372,99 @@ assert.deepEqual(
     "-e",
     "CLAUDE_CODE_DISABLE_WORKFLOWS=0",
     "-e",
+    "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false",
+    "-e",
     "FORCE_COLOR=1",
   ]
 );
+
+// Prompt suggestions: off by default whatever the MCP process inherited, on
+// only by the caller's explicit choice, and nothing else changes. Every case
+// uses a synthetic base so a failure never prints the runner's environment.
+const neutralBase = Object.freeze({ PATH: "/synthetic/bin", OTHER_SETTING: "kept" });
+assert.deepEqual(
+  claudeChildEnvironment(neutralBase, { configDir: "/tmp/claude config" }),
+  {
+    PATH: "/synthetic/bin",
+    OTHER_SETTING: "kept",
+    CLAUDE_CONFIG_DIR: "/tmp/claude config",
+    FORCE_COLOR: "1",
+    CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "false",
+  },
+  "the default launch adds only the suggestion setting to the existing overrides"
+);
+assert.deepEqual(neutralBase, { PATH: "/synthetic/bin", OTHER_SETTING: "kept" });
+for (const inherited of ["true", "1", "on", "false", ""]) {
+  const child = claudeChildEnvironment(
+    { ...neutralBase, CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: inherited },
+    { configDir: "/tmp/c" }
+  );
+  assert.equal(child.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION, "false", `inherited ${JSON.stringify(inherited)} must not decide`);
+}
+const casedChild = claudeChildEnvironment(
+  { ...neutralBase, claude_code_enable_prompt_suggestion: "true", Claude_Code_Enable_Prompt_Suggestion: "1" },
+  { configDir: "/tmp/c" }
+);
+assert.deepEqual(
+  Object.keys(casedChild).filter((name) => name.toUpperCase() === "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"),
+  ["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"],
+  "a differently cased inherited copy must not survive beside the override"
+);
+assert.equal(casedChild.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION, "false");
+for (const inherited of [undefined, "false", "0"]) {
+  const base = inherited === undefined ? neutralBase : { ...neutralBase, CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: inherited };
+  assert.deepEqual(
+    claudeChildEnvironment(base, { configDir: "/tmp/c", promptSuggestions: true }),
+    {
+      PATH: "/synthetic/bin",
+      OTHER_SETTING: "kept",
+      CLAUDE_CONFIG_DIR: "/tmp/c",
+      FORCE_COLOR: "1",
+      CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "true",
+    },
+    `the opt-in keeps suggestions on over inherited ${JSON.stringify(inherited)}`
+  );
+}
+for (const notBoolean of ["true", 1, null]) {
+  assert.equal(
+    claudeChildEnvironment(neutralBase, { configDir: "/tmp/c", promptSuggestions: notBoolean })
+      .CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION,
+    "false",
+    "only the boolean true opts in"
+  );
+}
+assert.deepEqual(
+  tmuxChildEnvironmentArgs(
+    claudeChildEnvironment(
+      { ...neutralBase, CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "true", CLAUDE_CODE_EFFORT_LEVEL: "xhigh" },
+      { configDir: "/tmp/c" }
+    )
+  ),
+  [
+    "-e", "CLAUDE_CONFIG_DIR=/tmp/c",
+    "-e", "CLAUDE_CODE_EFFORT_LEVEL=xhigh",
+    "-e", "CLAUDE_CODE_DISABLE_WORKFLOWS=",
+    "-e", "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false",
+    "-e", "FORCE_COLOR=1",
+  ],
+  "tmux forwards only the listed keys and an explicit off"
+);
+assert.deepEqual(
+  tmuxChildEnvironmentArgs(
+    claudeChildEnvironment(
+      { ...neutralBase, CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "false" },
+      { configDir: "/tmp/c", promptSuggestions: true }
+    )
+  ).slice(6, 8),
+  ["-e", "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=true"]
+);
+for (const value of [undefined, "", "1", "TRUE", "yes"]) {
+  assert.ok(
+    tmuxChildEnvironmentArgs({ CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: value })
+      .includes("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false"),
+    "tmux never sends an empty or unexpected suggestion value"
+  );
+}
 assert.deepEqual(tmuxVersionStatus("tmux 3.2a\n"), {
   raw: "tmux 3.2a",
   detectedVersion: "3.2",
@@ -620,7 +717,7 @@ assert.deepEqual(
     forkSession: true,
     remoteName: "Codex Review",
     permissionMode: "plan",
-    model: "sonnet",
+    model: "claude-fable-5-1",
     effort: "high",
     allowedTools: ["Read", "Grep", "Bash(git *)"],
     disallowedTools: "Edit,Write",
@@ -633,7 +730,7 @@ assert.deepEqual(
     "--resume",
     resumeId,
     "--fork-session",
-    "--model=sonnet",
+    "--model=claude-fable-5-1",
     "--effort=high",
     "--allowedTools=Read,Grep,Bash(git *)",
     "--disallowedTools=Edit,Write",
@@ -806,13 +903,27 @@ assert.throws(
 const commandRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rail-connector-command-"));
 const commandFile = path.join(commandRoot, "claude.exe");
 fs.writeFileSync(commandFile, "");
+// A real-folder search with Windows PATH rules needs a Windows file system:
+// on other hosts the win32 path join turns the temporary folder into a
+// backslash path that does not exist. The synthetic Windows PATH-order checks
+// below still run on every host.
+if (process.platform === "win32") {
+  assert.equal(
+    resolveCommandFromPath("claude", {
+      platform: "win32",
+      pathValue: commandRoot,
+      pathExtValue: ".EXE;.CMD",
+    }).toLowerCase(),
+    (fs.realpathSync.native?.(commandFile) ?? fs.realpathSync(commandFile)).toLowerCase()
+  );
+}
 assert.equal(
-  resolveCommandFromPath("claude", {
+  resolveClaudeLaunchDescriptor({
     platform: "win32",
-    pathValue: commandRoot,
-    pathExtValue: ".EXE;.CMD",
-  }).toLowerCase(),
-  (fs.realpathSync.native?.(commandFile) ?? fs.realpathSync(commandFile)).toLowerCase()
+    env: { RAIL_CONNECTOR_CLAUDE_PATH: commandFile, PATH: "" },
+  }).path.toLowerCase(),
+  (fs.realpathSync.native?.(commandFile) ?? fs.realpathSync(commandFile)).toLowerCase(),
+  "the product override must return the same canonical launch descriptor used by qualification"
 );
 assert.equal(
   resolveCommandFromPath("claude", {
@@ -831,6 +942,68 @@ assert.equal(
   ""
 );
 fs.rmSync(commandRoot, { recursive: true, force: true });
+
+// The product, RuntimeEpoch, and private acceptance sampler all rely on this
+// descriptor. These synthetic inventories prove its Windows PATH order without
+// consulting the installed Claude CLI.
+const virtualExecutableSet = (files) => {
+  const normalized = new Set(files.map((file) => path.win32.resolve(file).toLowerCase()));
+  return (file) => normalized.has(path.win32.resolve(file).toLowerCase());
+};
+const wrapperFirst = resolveNormalLaunchDescriptor("claude", {
+  platform: "win32",
+  pathValue: "C:\\shim;C:\\current",
+  pathExtValue: ".EXE;.CMD;.BAT",
+  isExecutable: virtualExecutableSet(["C:\\shim\\claude.cmd", "C:\\current\\claude.exe"]),
+  normalizePath: (file) => path.win32.resolve(file),
+});
+assert.equal(wrapperFirst.path, "C:\\shim\\claude.cmd", "an earlier batch wrapper must win PATH order");
+assert.equal(isNormalLaunchWrapper(wrapperFirst), true, "a batch wrapper must carry unproven target provenance");
+assert.equal(wrapperFirst.target, null, "static resolution must not guess a wrapper target");
+const directExe = resolveNormalLaunchDescriptor("claude", {
+  platform: "win32",
+  pathValue: "C:\\current;C:\\later",
+  pathExtValue: ".CMD;.EXE",
+  isExecutable: virtualExecutableSet(["C:\\current\\claude.exe", "C:\\later\\claude.cmd"]),
+  normalizePath: (file) => path.win32.resolve(file),
+});
+assert.equal(directExe.path, "C:\\current\\claude.exe", "a direct executable must retain the selected PATH target");
+assert.equal(directExe.configuredOverride, false, "bare PATH selection must explicitly be unconfigured for RuntimeEpoch qualification");
+assert.deepEqual(directExe.target, { path: "C:\\current\\claude.exe", provenance: "selected_native_path" });
+const sameDirectory = resolveNormalLaunchDescriptor("claude", {
+  platform: "win32",
+  pathValue: "C:\\same",
+  pathExtValue: ".BAT;.CMD;.EXE;.CUSTOM",
+  isExecutable: virtualExecutableSet(["C:\\same\\claude.exe", "C:\\same\\claude.cmd", "C:\\same\\claude.bat", "C:\\same\\claude.custom"]),
+  normalizePath: (file) => path.win32.resolve(file),
+});
+assert.equal(sameDirectory.path, "C:\\same\\claude.exe", "the product's fixed same-directory extension order must beat PATHEXT order");
+const configuredOverride = resolveProductClaudeLaunchDescriptor({
+  platform: "win32",
+  env: { RAIL_CONNECTOR_CLAUDE_PATH: "C:\\override\\claude.exe", PATH: "C:\\current" },
+  isExecutable: virtualExecutableSet(["C:\\override\\claude.exe", "C:\\current\\claude.exe"]),
+  normalizePath: (file) => path.win32.resolve(file),
+});
+assert.equal(configuredOverride.path, "C:\\override\\claude.exe", "an explicit product override must take precedence over PATH");
+assert.equal(configuredOverride.configuredOverride, true);
+const reparseCanonicalized = resolveProductClaudeLaunchDescriptor({
+  platform: "win32",
+  env: { RAIL_CONNECTOR_CLAUDE_PATH: "C:\\alias\\claude.exe" },
+  isExecutable: virtualExecutableSet(["C:\\alias\\claude.exe"]),
+  normalizePath: () => "C:\\target\\claude.exe",
+});
+assert.equal(reparseCanonicalized.path, "C:\\target\\claude.exe", "an accepted alias or reparse path must freeze its canonical executable target");
+assert.equal(reparseCanonicalized.target.path, "C:\\target\\claude.exe");
+assert.equal(resolveNormalLaunchDescriptor("claude", {
+  platform: "win32", pathValue: "C:\\missing", isExecutable: virtualExecutableSet([]),
+}), null, "a missing normal launcher must fail closed");
+const changedTarget = resolveNormalLaunchDescriptor("claude", {
+  platform: "win32",
+  pathValue: "C:\\updated",
+  isExecutable: virtualExecutableSet(["C:\\updated\\claude.exe"]),
+  normalizePath: (file) => path.win32.resolve(file),
+});
+assert.equal(changedTarget.path, "C:\\updated\\claude.exe", "each resolution must use the current PATH target rather than a remembered path");
 
 const allowedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rail-connector-allowed-"));
 const allowedChild = path.join(allowedRoot, "child");

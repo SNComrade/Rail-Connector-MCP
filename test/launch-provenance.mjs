@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -63,8 +64,24 @@ const baseEnv = {
   CLAUDE_CONFIG_DIR: configDir,
   CLAUDE_CODE_EFFORT_LEVEL: "xhigh",
   CLAUDE_CODE_DISABLE_WORKFLOWS: "0",
+  // As if the MCP were started from a Claude Code session with suggestions on:
+  // the launched Claude must still get them off.
+  CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "true",
   RAIL_DELAYED_EXPANSION: "must-not-rewrite-debug-filter",
 };
+// On tmux hosts the test owns its tmux server (a short socket directory, so
+// the macOS socket path limit holds). The server starts with the MCP's own
+// environment, so the launch must override a stale server value, and no shared
+// tmux server is touched.
+const tmuxDir =
+  process.platform === "win32"
+    ? null
+    : fs.mkdtempSync(path.join(fs.existsSync("/tmp") ? "/tmp" : os.tmpdir(), "pmtx-"));
+if (tmuxDir) {
+  baseEnv.TMUX_TMPDIR = tmuxDir;
+  delete baseEnv.TMUX;
+  delete baseEnv.TMUX_PANE;
+}
 
 function createMcpClient(env, name) {
   const transport = new StdioClientTransport({
@@ -104,6 +121,22 @@ async function invocationRecords(expectedCount) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(`Expected ${expectedCount} fake Claude invocation records.`);
+}
+
+async function invocationRecordForSession(sessionId) {
+  for (let index = 0; index < 100; index += 1) {
+    const files = fs.existsSync(argvDir)
+      ? fs.readdirSync(argvDir).filter((name) => name.endsWith(".json"))
+      : [];
+    for (const name of files) {
+      const record = JSON.parse(fs.readFileSync(path.join(argvDir, name), "utf8"));
+      if (record.argv[0] === "--session-id" && record.argv[1] === sessionId) {
+        return record;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Expected a fake Claude invocation record for ${sessionId}.`);
 }
 
 let first = null;
@@ -189,6 +222,12 @@ try {
       `Missing final child argv ${JSON.stringify(expected)}: ${JSON.stringify(vectors)}`
     );
   }
+  // Capability probes keep the MCP's own environment unchanged.
+  for (const record of records.filter(
+    (entry) => entry.argv.includes("--version") || entry.argv.includes("--help")
+  )) {
+    assert.equal(record.environment.promptSuggestion, "enabled", JSON.stringify(record.argv));
+  }
   const interactive = records.find(
     (record) =>
       !record.argv.includes("--version") && !record.argv.includes("--help")
@@ -216,6 +255,7 @@ try {
     effortOverrideStatus: "compatible_xhigh",
     workflowsDisabled: false,
     forceColor: "enabled",
+    promptSuggestion: "disabled",
   });
 
   const boundedWait = await callTool(first.client, "wait_for_claude_turn", {
@@ -233,6 +273,7 @@ try {
     ...baseEnv,
     CLAUDE_CODE_EFFORT_LEVEL: "high",
     CLAUDE_CODE_DISABLE_WORKFLOWS: "1",
+    CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "false",
   };
   second = createMcpClient(refreshedEnv, "launch-provenance-refreshed");
   await second.client.connect(second.transport, { timeout: 30000 });
@@ -273,6 +314,29 @@ try {
     force: false,
   });
   assert.equal(noSession.status, "not_running");
+
+  // The caller's opt-in keeps suggestions on, even over an inherited "false".
+  const optIn = await callTool(second.client, "start_remote_control", {
+    cwd: workspace,
+    managedSession,
+    remoteName: "Prompt Suggestion Opt In",
+    permissionMode: "default",
+    promptSuggestions: true,
+  });
+  assert.equal(optIn.status, "started", JSON.stringify(optIn));
+  const optInRecord = await invocationRecordForSession(optIn.sessionId);
+  assert.deepEqual(optInRecord.environment, {
+    effortOverrideStatus: "other",
+    workflowsDisabled: true,
+    forceColor: "enabled",
+    promptSuggestion: "enabled",
+  });
+  const optInStopped = await callTool(second.client, "stop_remote_control", {
+    managedSession,
+    graceful: true,
+    force: true,
+  });
+  assert.equal(optInStopped.status, "stopped", JSON.stringify(optInStopped));
 
   console.log(
     `launch-provenance ok (${process.platform === "win32" ? "windows" : "tmux"})`
@@ -318,6 +382,21 @@ try {
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
     }
+  }
+  if (tmuxDir) {
+    const tmuxEnv = { ...process.env, TMUX_TMPDIR: tmuxDir };
+    delete tmuxEnv.TMUX;
+    delete tmuxEnv.TMUX_PANE;
+    let tmuxServerGone = false;
+    try {
+      execFileSync("tmux", ["kill-server"], { env: tmuxEnv, stdio: "pipe", timeout: 10000 });
+      tmuxServerGone = true;
+    } catch (error) {
+      // Normally the test-owned server already exited with its last session.
+      tmuxServerGone = /no server running|error connecting/i.test(String(error.stderr ?? ""));
+    }
+    if (tmuxServerGone) fs.rmSync(tmuxDir, { recursive: true, force: true });
+    else console.warn(`launch-provenance: kept ${tmuxDir}; its tmux server could not be confirmed stopped`);
   }
   fs.rmSync(root, {
     recursive: true,
