@@ -86,14 +86,19 @@ function Invoke-NativeChecked {
 function Resolve-InstallerExecutable {
   param(
     [Parameter(Mandatory = $true)]
-    [string]$Name
+    [string]$Name,
+    [switch]$NativeOnly
   )
 
-  # Select one native command in PATH order, even when several copies exist.
-  $command = Get-Command $Name -CommandType Application, ExternalScript `
-    -TotalCount 1 -ErrorAction SilentlyContinue
+  # The persisted Node command must be native. Claude also supports batch shims.
+  $supportedExtensions = @(".exe", ".com")
+  if (-not $NativeOnly) { $supportedExtensions += @(".cmd", ".bat") }
+  # Filter before selecting: a PowerShell shim can shadow a usable batch shim.
+  $command = Get-Command $Name -CommandType Application -All -ErrorAction SilentlyContinue |
+    Where-Object { [System.IO.Path]::GetExtension($_.Source) -in $supportedExtensions } |
+    Select-Object -First 1
   if (-not $command -or [string]::IsNullOrWhiteSpace($command.Source)) {
-    throw "Missing executable command: $Name"
+    throw "Missing supported executable command: $Name"
   }
   $path = [System.IO.Path]::GetFullPath($command.Source)
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -258,7 +263,7 @@ function Invoke-Installer {
   }
 
   $rootDir = $script:InstallerRoot
-  $nodePath = Resolve-InstallerExecutable -Name "node"
+  $nodePath = Resolve-InstallerExecutable -Name "node" -NativeOnly
   $claudePath = Resolve-InstallerExecutable -Name "claude"
   $nodeMajor = [int]((& $nodePath -p "Number(process.versions.node.split('.')[0])").Trim())
   if ($nodeMajor -notin @(22, 24, 26)) {

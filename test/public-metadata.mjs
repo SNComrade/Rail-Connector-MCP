@@ -91,10 +91,11 @@ assert.ok(
 assert.ok(unixInstaller.includes('main ${@+"$@"}'), "Unix installer must support zero arguments under Bash 3.2 nounset");
 const executableResolver = windowsInstaller.match(/function Resolve-InstallerExecutable \{[\s\S]*?\n\}/)?.[0];
 assert.ok(executableResolver, "Windows installer must define its native executable resolver");
-assert.match(executableResolver, /Get-Command \$Name -CommandType Application, ExternalScript\s*`\s*-TotalCount 1/);
+assert.match(executableResolver, /Get-Command \$Name -CommandType Application -All/);
+assert.doesNotMatch(executableResolver, /ExternalScript|-TotalCount/);
 assert.match(executableResolver, /Test-Path -LiteralPath \$path -PathType Leaf/);
 assert.match(executableResolver, /return \$path/);
-assert.match(windowsInstaller, /\$nodePath = Resolve-InstallerExecutable -Name "node"/);
+assert.match(windowsInstaller, /\$nodePath = Resolve-InstallerExecutable -Name "node" -NativeOnly/);
 assert.match(windowsInstaller, /\$claudePath = Resolve-InstallerExecutable -Name "claude"/);
 assert.ok(windowsDocs.includes("RAIL_CONNECTOR_CLAUDE_PATH = 'C:\\path\\to\\claude.exe'"));
 assert.ok(windowsDocs.includes("RAIL_CONNECTOR_ALLOWED_ROOTS = 'C:\\Users\\<you>\\Projects;D:\\Work'"));

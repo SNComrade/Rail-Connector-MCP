@@ -26,9 +26,10 @@ $pathProbeDir = Join-Path ([System.IO.Path]::GetTempPath()) ("rail executable pr
 $firstBin = Join-Path $pathProbeDir "first bin"
 $secondBin = Join-Path $pathProbeDir "second bin"
 $originalPath = $env:PATH
+$originalPathExt = $env:PATHEXT
 try {
   New-Item -ItemType Directory -Path $firstBin, $secondBin | Out-Null
-  foreach ($extension in @(".cmd", ".ps1")) {
+  foreach ($extension in @(".cmd", ".bat", ".exe", ".com")) {
     $name = "rail-installer-path-probe$extension"
     $firstCommand = Join-Path $firstBin $name
     $secondCommand = Join-Path $secondBin $name
@@ -50,12 +51,79 @@ try {
       throw "Executable resolution did not follow changed PATH precedence."
     }
   }
+  $mixedName = "rail-installer-mixed-probe"
+  $powerShellShim = Join-Path $firstBin "$mixedName.ps1"
+  $batchShim = Join-Path $firstBin "$mixedName.cmd"
+  $nativeExecutable = Join-Path $secondBin "$mixedName.exe"
+  Set-Content -LiteralPath $powerShellShim -Value "throw 'Unsupported shim must never execute'"
+  Set-Content -LiteralPath $batchShim -Value "exit 45"
+  Set-Content -LiteralPath $nativeExecutable -Value "Not executed"
+  $env:PATH = "$firstBin;$secondBin;$originalPath"
+  $resolved = Resolve-InstallerExecutable -Name $mixedName
+  if ($resolved -isnot [string] -or $resolved -ne [System.IO.Path]::GetFullPath($batchShim)) {
+    throw "Mixed PowerShell/batch discovery did not select the first supported launcher."
+  }
+  $env:PATH = "$secondBin;$firstBin;$originalPath"
+  if ((Resolve-InstallerExecutable -Name $mixedName) -ne [System.IO.Path]::GetFullPath($nativeExecutable)) {
+    throw "Supported mixed extensions did not preserve changed PATH order."
+  }
+  $env:PATH = "$firstBin;$secondBin;$originalPath"
+  if ((Resolve-InstallerExecutable -Name $mixedName -NativeOnly) -ne [System.IO.Path]::GetFullPath($nativeExecutable)) {
+    throw "The persisted Node command did not skip script/batch launchers for a native executable."
+  }
+  $unsupportedName = "rail-installer-unsupported-probe"
+  Set-Content -LiteralPath (Join-Path $firstBin "$unsupportedName.ps1") -Value "throw 'Never execute'"
+  $unsupportedRejected = $false
+  try {
+    Resolve-InstallerExecutable -Name $unsupportedName | Out-Null
+  } catch {
+    if ($_.Exception.Message -ne "Missing supported executable command: $unsupportedName") { throw }
+    $unsupportedRejected = $true
+  }
+  if (-not $unsupportedRejected) { throw "An unsupported-only PowerShell command was accepted." }
+  Set-Content -LiteralPath (Join-Path $secondBin "$unsupportedName.cmd") -Value "exit 46"
+  $nativeOnlyRejected = $false
+  try {
+    Resolve-InstallerExecutable -Name $unsupportedName -NativeOnly | Out-Null
+  } catch {
+    if ($_.Exception.Message -ne "Missing supported executable command: $unsupportedName") { throw }
+    $nativeOnlyRejected = $true
+  }
+  if (-not $nativeOnlyRejected) { throw "The persisted Node command accepted a batch-only installation." }
+  $customExtensionName = "rail-installer-custom-extension-probe"
+  Set-Content -LiteralPath (Join-Path $firstBin "$customExtensionName.py") -Value "Never executed"
+  $supportedBatch = Join-Path $secondBin "$customExtensionName.cmd"
+  Set-Content -LiteralPath $supportedBatch -Value "exit 47"
+  $env:PATHEXT = ".PY;$originalPathExt"
+  if ((Resolve-InstallerExecutable -Name $customExtensionName) -ne [System.IO.Path]::GetFullPath($supportedBatch)) {
+    throw "Custom PATHEXT exposed an unsupported launch type before a supported command."
+  }
+  $env:PATHEXT = $originalPathExt
+  if ((Test-Path -LiteralPath "Alias:\$mixedName") -or (Test-Path -LiteralPath "Function:\$mixedName")) {
+    throw "A fixture command name is already owned by this process."
+  }
+  try {
+    Set-Alias -Name $mixedName -Value Write-Output
+    if ((Resolve-InstallerExecutable -Name $mixedName) -ne [System.IO.Path]::GetFullPath($batchShim)) {
+      throw "An alias shadowed the supported executable selection."
+    }
+  } finally {
+    Remove-Item -LiteralPath "Alias:\$mixedName" -ErrorAction SilentlyContinue
+  }
+  try {
+    Set-Item -LiteralPath "Function:\$mixedName" -Value { throw "Fixture function must not execute" }
+    if ((Resolve-InstallerExecutable -Name $mixedName) -ne [System.IO.Path]::GetFullPath($batchShim)) {
+      throw "A function shadowed the supported executable selection."
+    }
+  } finally {
+    Remove-Item -LiteralPath "Function:\$mixedName" -ErrorAction SilentlyContinue
+  }
   $missingName = "rail-installer-missing-" + [guid]::NewGuid().ToString("N")
   $missingRejected = $false
   try {
     Resolve-InstallerExecutable -Name $missingName | Out-Null
   } catch {
-    if ($_.Exception.Message -ne "Missing executable command: $missingName") {
+    if ($_.Exception.Message -ne "Missing supported executable command: $missingName") {
       throw
     }
     $missingRejected = $true
@@ -65,6 +133,7 @@ try {
   }
 } finally {
   $env:PATH = $originalPath
+  $env:PATHEXT = $originalPathExt
   $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\') + '\'
   $cleanupPath = [System.IO.Path]::GetFullPath($pathProbeDir)
   if (-not $cleanupPath.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) {
