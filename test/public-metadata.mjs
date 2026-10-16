@@ -89,8 +89,14 @@ assert.ok(
   "Unix installer must use the Bash 3.2-safe empty-array expansion"
 );
 assert.ok(unixInstaller.includes('main ${@+"$@"}'), "Unix installer must support zero arguments under Bash 3.2 nounset");
-assert.match(windowsInstaller, /Get-Command node -CommandType Application, ExternalScript/);
-assert.match(windowsInstaller, /Test-Path -LiteralPath \$resolvedCommand\.Path -PathType Leaf/);
+const executableResolver = windowsInstaller.match(/function Resolve-InstallerExecutable \{[\s\S]*?\n\}/)?.[0];
+assert.ok(executableResolver, "Windows installer must define its native executable resolver");
+assert.match(executableResolver, /Get-Command \$Name -CommandType Application -All/);
+assert.doesNotMatch(executableResolver, /ExternalScript|-TotalCount/);
+assert.match(executableResolver, /Test-Path -LiteralPath \$path -PathType Leaf/);
+assert.match(executableResolver, /return \$path/);
+assert.match(windowsInstaller, /\$nodePath = Resolve-InstallerExecutable -Name "node" -NativeOnly/);
+assert.match(windowsInstaller, /\$claudePath = Resolve-InstallerExecutable -Name "claude"/);
 assert.ok(windowsDocs.includes("RAIL_CONNECTOR_CLAUDE_PATH = 'C:\\path\\to\\claude.exe'"));
 assert.ok(windowsDocs.includes("RAIL_CONNECTOR_ALLOWED_ROOTS = 'C:\\Users\\<you>\\Projects;D:\\Work'"));
 assert.doesNotMatch(windowsDocs, /RAIL_CONNECTOR_(?:CLAUDE_PATH|ALLOWED_ROOTS) = "[A-Za-z]:\\/);

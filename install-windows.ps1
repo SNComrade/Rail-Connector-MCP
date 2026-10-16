@@ -83,6 +83,30 @@ function Invoke-NativeChecked {
   }
 }
 
+function Resolve-InstallerExecutable {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Name,
+    [switch]$NativeOnly
+  )
+
+  # The persisted Node command must be native. Claude also supports batch shims.
+  $supportedExtensions = @(".exe", ".com")
+  if (-not $NativeOnly) { $supportedExtensions += @(".cmd", ".bat") }
+  # Filter before selecting: a PowerShell shim can shadow a usable batch shim.
+  $command = Get-Command $Name -CommandType Application -All -ErrorAction SilentlyContinue |
+    Where-Object { [System.IO.Path]::GetExtension($_.Source) -in $supportedExtensions } |
+    Select-Object -First 1
+  if (-not $command -or [string]::IsNullOrWhiteSpace($command.Source)) {
+    throw "Missing supported executable command: $Name"
+  }
+  $path = [System.IO.Path]::GetFullPath($command.Source)
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+    throw "Resolved $Name command is not an executable file: $path"
+  }
+  return $path
+}
+
 function Test-CodexExecutable {
   param(
     [Parameter(Mandatory = $true)]
@@ -239,17 +263,8 @@ function Invoke-Installer {
   }
 
   $rootDir = $script:InstallerRoot
-  $nodePath = (Get-Command node -CommandType Application, ExternalScript -ErrorAction Stop).Source
-  $claudePath = (Get-Command claude -CommandType Application, ExternalScript -ErrorAction Stop).Source
-  foreach ($resolvedCommand in @(
-    @{ Name = "node"; Path = $nodePath },
-    @{ Name = "claude"; Path = $claudePath }
-  )) {
-    if ([string]::IsNullOrWhiteSpace($resolvedCommand.Path) -or
-        -not (Test-Path -LiteralPath $resolvedCommand.Path -PathType Leaf)) {
-      throw "Resolved $($resolvedCommand.Name) command is not an executable file: $($resolvedCommand.Path)"
-    }
-  }
+  $nodePath = Resolve-InstallerExecutable -Name "node" -NativeOnly
+  $claudePath = Resolve-InstallerExecutable -Name "claude"
   $nodeMajor = [int]((& $nodePath -p "Number(process.versions.node.split('.')[0])").Trim())
   if ($nodeMajor -notin @(22, 24, 26)) {
     throw "Node.js major 22, 24, or 26 is required. Current version: $(& $nodePath --version)"
