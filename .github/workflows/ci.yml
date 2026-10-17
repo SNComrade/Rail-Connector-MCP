@@ -17,10 +17,11 @@ concurrency:
 jobs:
   test:
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         os:
           - ubuntu-latest
@@ -30,6 +31,15 @@ jobs:
           - 22
           - 24
           - 26
+        # These labels select dedicated, isolated public-CI runners.
+        # Keep os values stable because they form the required check names.
+        include:
+          - os: ubuntu-latest
+            runner: [self-hosted, Linux, rail-ci]
+          - os: windows-latest
+            runner: [self-hosted, Windows, rail-ci]
+          - os: macos-latest
+            runner: [self-hosted, macOS, rail-ci]
 
     steps:
       - name: Check out repository
@@ -43,13 +53,31 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
 
-      - name: Install tmux on Linux
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y tmux
-
-      - name: Install tmux on macOS
+      - name: Configure macOS tool paths
         if: runner.os == 'macOS'
-        run: brew install tmux
+        run: |
+          for tool_dir in /opt/homebrew/bin /usr/local/bin "$RUNNER_TOOL_CACHE/tmux/3.7c/x64/bin"; do
+            if [ -d "$tool_dir" ]; then
+              printf '%s\n' "$tool_dir" >> "$GITHUB_PATH"
+            fi
+          done
+
+      - name: Verify Unix runner prerequisites
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tool in git tmux python3 make; do
+            command -v "$tool"
+          done
+          tmux -V
+
+      - name: Verify macOS compiler prerequisites
+        if: runner.os == 'macOS'
+        run: |
+          command -v clang
+          xcode-select -p
+          xcrun --find clang
 
       - name: Install locked dependencies
         run: npm ci

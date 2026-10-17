@@ -17,7 +17,7 @@ permissions:
 jobs:
   audit:
     name: Audit production dependencies
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, rail-ci]
     timeout-minutes: 10
     steps:
       - name: Check out repository
