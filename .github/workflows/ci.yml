@@ -17,7 +17,7 @@ concurrency:
 jobs:
   test:
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ github.event_name == 'pull_request' && 'rail-ci-pr' || 'rail-ci-maintenance' }}"]
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -31,15 +31,16 @@ jobs:
           - 22
           - 24
           - 26
-        # These labels select dedicated, isolated public-CI runners.
+        # Labels select scheduling pools; both require fresh one-job guests.
+        # They do not establish isolation or restrict fork-controlled YAML.
         # Keep os values stable because they form the required check names.
         include:
           - os: ubuntu-latest
-            runner: [self-hosted, Linux, rail-ci]
+            runner_os: Linux
           - os: windows-latest
-            runner: [self-hosted, Windows, rail-ci]
+            runner_os: Windows
           - os: macos-latest
-            runner: [self-hosted, macOS, rail-ci]
+            runner_os: macOS
 
     steps:
       - name: Check out repository

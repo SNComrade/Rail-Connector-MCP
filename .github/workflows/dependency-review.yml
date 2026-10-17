@@ -9,7 +9,7 @@ permissions:
 jobs:
   review:
     name: Review dependency changes
-    runs-on: [self-hosted, Linux, rail-ci]
+    runs-on: [self-hosted, Linux, rail-ci-pr]
     timeout-minutes: 10
     steps:
       - name: Check out repository

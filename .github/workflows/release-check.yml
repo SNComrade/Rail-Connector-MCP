@@ -11,7 +11,7 @@ permissions:
 jobs:
   package:
     name: Verify tagged package
-    runs-on: [self-hosted, Linux, rail-ci]
+    runs-on: [self-hosted, Linux, rail-ci-maintenance]
     timeout-minutes: 20
     steps:
       - name: Check out repository
