@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -14,6 +14,8 @@ const comparablePath = (value) => path.win32.normalize(value).toLowerCase();
 const validPid = (value) => Number.isSafeInteger(value) && value > 0 && value <= 0x7fffffff;
 const runArgument = (runId) => `--rail-fixture-run=${runId}`;
 const HANDLE_LIMIT = 256;
+const INSPECT_TIMEOUT_MS = 15000;
+const INSPECT_CAPTURE_LIMIT = 1024 * 1024;
 const KEY_ENV = "RAIL_FAKE_CLAUDE_HANDLE_KEY";
 let controllerAdmission = null;
 
@@ -225,13 +227,60 @@ function nativeEnvironment() {
   return environment;
 }
 
+export function fixtureInspectFailureRecord(error, pid, elapsedMs) {
+  const captureLimited = ["ENOBUFS", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"].includes(error?.code);
+  const fingerprint = (value) => {
+    if (!Buffer.isBuffer(value) && typeof value !== "string") return null;
+    const bytes = Buffer.isBuffer(value) ? value.length : Buffer.byteLength(value, "utf8");
+    const sample = Buffer.isBuffer(value) ? value.subarray(0, INSPECT_CAPTURE_LIMIT)
+      : Buffer.from(value.slice(0, INSPECT_CAPTURE_LIMIT), "utf8").subarray(0, INSPECT_CAPTURE_LIMIT);
+    // These are returned captures, not proof of the child's complete streams.
+    return { bytes, hashedBytes: sample.length, hashComplete: sample.length === bytes && !captureLimited,
+      sha256: createHash("sha256").update(sample).digest("hex"),
+      encoding: Buffer.isBuffer(value) ? "raw" : "utf8-reencoded" };
+  };
+  const stderr = error?.stderr;
+  const truncated = (Buffer.isBuffer(stderr) || typeof stderr === "string") && stderr.length > 2048;
+  let stderrTail = Buffer.isBuffer(stderr) ? stderr.subarray(-2048).toString("utf8")
+    : typeof stderr === "string" ? stderr.slice(-2048) : "";
+  // A truncated first line cannot establish that a phase marker was complete.
+  if (truncated) stderrTail = stderrTail.includes("\n") ? stderrTail.slice(stderrTail.indexOf("\n") + 1) : "";
+  let nativePhase = "unobserved";
+  for (const match of stderrTail.matchAll(/^\[fixture-inspect\] phase=(script-entry|before-add-type|after-add-type|before-native-bind|after-native-bind|open-process|read-identity|write-identity|exit-success|exit-error)\r?\n/gm)) {
+    nativePhase = match[1];
+  }
+  return { version: 1, operation: "Inspect", requestedPid: validPid(pid) ? pid : null,
+    helperPid: validPid(error?.pid) ? error.pid : null, timeoutMs: INSPECT_TIMEOUT_MS,
+    elapsedMs: Number.isFinite(elapsedMs) && elapsedMs >= 0 && elapsedMs <= Number.MAX_SAFE_INTEGER / 1000
+      ? Math.round(elapsedMs * 1000) / 1000 : null,
+    code: typeof error?.code === "string" && /^[A-Z0-9_]{1,64}$/.test(error.code) ? error.code : null,
+    status: Number.isSafeInteger(error?.status) ? error.status : null,
+    signal: typeof error?.signal === "string" && /^SIG[A-Z0-9]{1,29}$/.test(error.signal) ? error.signal : null,
+    nativePhase, stdout: fingerprint(error?.stdout), stderr: fingerprint(stderr) };
+}
+
 export function inspectFixtureProcess(pid) {
   if (!validPid(pid)) throw new Error("Fixture process PID is invalid");
   // Only this reviewed test-helper process: no persistent execution-policy
   // change, and Windows Group Policy still takes precedence (including CI).
-  const output = execFileSync(nativePowerShell(), [
-    "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", nativeScript, "-Operation", "Inspect", "-ProcessId", String(pid),
-  ], { env: nativeEnvironment(), windowsHide: true, encoding: "utf8", timeout: 15000, maxBuffer: 1024 * 1024 });
+  const started = performance.now();
+  let output;
+  try {
+    // Inspect consumes no stdin. Match the existing retained-handle capture
+    // invocation instead of creating an unused input pipe. This is a bounded
+    // dependency mitigation, not an attribution of earlier startup timeouts.
+    output = execFileSync(nativePowerShell(), [
+      "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", nativeScript, "-Operation", "Inspect", "-ProcessId", String(pid),
+    ], { env: nativeEnvironment(), windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf8", timeout: INSPECT_TIMEOUT_MS, maxBuffer: INSPECT_CAPTURE_LIMIT });
+  } catch (error) {
+    try {
+      const record = fixtureInspectFailureRecord(error, pid, performance.now() - started);
+      console.error(`fixture-inspect failure ${JSON.stringify(record)}`);
+      error.fixtureInspectFailure = record;
+    } catch { /* Optional diagnostics must never replace the original failure. */ }
+    throw error;
+  }
   const identity = JSON.parse(output.trim());
   if (!validFileTime(identity.creationFileTime) || typeof identity.executablePath !== "string" || !identity.executablePath) {
     throw new Error("Fixture process creation identity is unreadable");

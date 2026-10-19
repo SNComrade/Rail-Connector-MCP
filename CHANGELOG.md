@@ -53,10 +53,14 @@ Semantic Versioning after the first stable release.
 
 ### Security
 
-- Use MCP SDK 1.32.1 and Zod 4.6.5 with reviewed transitive fixes for fast-uri
+- Use MCP SDK 1.32.1 and Zod 4.6.7 with reviewed transitive fixes for fast-uri
   3.1.8, qs 6.16.0, Hono 4.13.11, and ip-address 10.7.4
 - Update SHA-pinned setup-node 7.1.0, CodeQL 4.38.3, and upload-artifact 7.0.2
   in the public CI and package workflows
+- Improve detection of escaped Windows user-profile paths in repository and
+  npm-package privacy scans
+- Improve detection of POSIX user-profile paths, including repeated separators,
+  in repository and npm-package privacy scans
 
 ## [1.0.0-beta.3] - 2026-08-31
 
