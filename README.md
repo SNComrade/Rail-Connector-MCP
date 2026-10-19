@@ -144,6 +144,37 @@ Start with the MCP `get_claude_capabilities` and `status` tools. On Windows,
 project as `cwd`, not this repository unless this repository is the review
 target.
 
+### Privacy checks for examples
+
+Use synthetic profile placeholders in contributed examples and run
+`npm run check:privacy`. POSIX paths under `/home/` and `/Users/` use lowercase
+`you` or `<you>` as exact username components; `you-private` is not a
+placeholder. Repeated POSIX separators use the same rule. The no-username
+root directories `/home/` and `/Users/` are allowed.
+Windows double quotes end the username token without matched-frame or
+source-unit checks. Windows apostrophe/backtick framing must match; quoted
+POSIX bare placeholders and roots need matching single quotes, double quotes
+or backticks. Backtick runs must close with equal lengths.
+
+For contiguous source suffixes after Windows apostrophe/backtick frames or POSIX
+frames, use a complete supported source example: a simple one-line declaration,
+argument call, array/object initializer, conditional or property expression
+within a declaration. Windows double quotes remain delimiters. The shared
+grammar is limited to 4096 characters, ASCII identifiers and explicit semicolons.
+Unsupported syntax and raw suffix expressions are conservatively flagged. Put
+whitespace before comments or division operators:
+
+```js
+const root = 'C:\\Users\\you'; // synthetic placeholder
+const unixRoot = '/home/you';
+const halfLength = root.length / 2;
+```
+
+The scanner uses text boundaries, not a complete source-language or filename
+parser. Whitespace and quotes can occur in POSIX filenames, and data can imitate
+source syntax. Matched framing and supported source syntax are text heuristics,
+not proof of privacy. Review its content as well.
+
 ## Documentation
 
 - [Install Guide](docs/INSTALL.md)
