@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
@@ -13,10 +13,15 @@ import { Worker } from "node:worker_threads";
 import {
   classifyFixtureProcess, createFixtureProcessLedger, inspectFixtureProcess, publishFixtureProcessRecord, readFixtureProcessRecords,
 } from "./fixtures/fixture-process-ledger.mjs";
+import * as fixtureHelper from "./fixtures/fixture-process-ledger.mjs";
 
-if (process.argv[2] === "--admission-isolation") {
+if (process.argv[2] === "--inspect-failure-regression") {
+  inspectFailureRegression();
+} else if (process.argv[2] === "--admission-isolation") {
   await isolatedAdmissionRegression(process.argv[3]);
 } else {
+
+inspectFailureRegression();
 
 const runId = randomUUID();
 const expected = { runId, executablePath: "C:\\Node\\node.exe", fixturePath: "C:\\tests\\fixture.mjs" };
@@ -825,6 +830,87 @@ ${serveEntry}`);
 }
 console.log("fixture-process-ledger ok");
 
+}
+
+function inspectFailureRegression() {
+  if (process.platform === "win32") {
+    const builtins = createRequire(import.meta.url)("node:child_process");
+    const originalInspect = builtins.execFileSync;
+    const originalConsoleError = console.error;
+    const diagnosticMessages = [];
+    const timeout = Object.assign(new Error("injected Inspect timeout"), {
+      code: "ETIMEDOUT", pid: 456, status: null, signal: "SIGTERM", stdout: "",
+      stderr: "[fixture-inspect] phase=script-entry\r\n[fixture-inspect] phase=before-native-bind\r\n",
+    });
+    let calls = 0;
+    builtins.execFileSync = (command, args, options) => {
+      calls++;
+      assert.match(command, /WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/i);
+      assert.deepEqual(args, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+        fileURLToPath(new URL("./fixtures/fixture-process-native.ps1", import.meta.url)),
+        "-Operation", "Inspect", "-ProcessId", "123"]);
+      assert.deepEqual(options.stdio, ["ignore", "pipe", "pipe"], "read-only Inspect must not create an unused stdin pipe");
+      assert.equal(options.windowsHide, true);
+      assert.equal(options.timeout, 15000, "the first Inspect deadline must remain unchanged");
+      assert.equal(options.maxBuffer, 1024 * 1024);
+      assert.equal(options.encoding, "utf8");
+      throw timeout; // No synthetic PID may reach a native helper.
+    };
+    console.error = (message) => diagnosticMessages.push(String(message));
+    syncBuiltinESMExports();
+    try {
+      let caught;
+      try { inspectFixtureProcess(123); } catch (error) { caught = error; }
+      assert.equal(caught, timeout, "diagnostics must rethrow the original failure");
+      assert.equal(calls, 1, "a failed initial Inspect must never retry");
+      assert.equal(caught.fixtureInspectFailure?.nativePhase, "before-native-bind");
+      assert.equal(caught.fixtureInspectFailure?.stdout.bytes, 0);
+      assert.equal(caught.fixtureInspectFailure?.helperPid, 456);
+      assert.equal(caught.fixtureInspectFailure?.timeoutMs, 15000);
+      assert.equal(diagnosticMessages.length, 1);
+      assert.ok(diagnosticMessages[0].startsWith("fixture-inspect failure "));
+      assert.deepEqual(JSON.parse(diagnosticMessages[0].slice("fixture-inspect failure ".length)), caught.fixtureInspectFailure);
+      // Failure to attach optional metadata must also retain the primary error.
+      Object.freeze(timeout);
+      assert.throws(() => inspectFixtureProcess(123), (error) => error === timeout);
+      assert.equal(calls, 2, "each independent call still makes only one attempt");
+      assert.equal(diagnosticMessages.length, 2, "injected failures stay inside this test's captured diagnostics");
+    } finally {
+      console.error = originalConsoleError;
+      builtins.execFileSync = originalInspect;
+      syncBuiltinESMExports();
+    }
+  }
+  const phase = "[fixture-inspect] phase=read-identity\r\n";
+  const stderr = "never-emit-test-data".repeat(300) + "\n" + phase + "[fixture-inspect] phase=exit-error";
+  const failure = { code: "ETIMEDOUT", pid: 456, status: null, signal: "SIGTERM", stdout: "", stderr };
+  Object.defineProperty(failure, "env", { get() { assert.fail("diagnostics must not inspect environment values"); } });
+  const record = fixtureHelper.fixtureInspectFailureRecord(failure, 123, 15002.125);
+  assert.equal(record.nativePhase, "read-identity", "only the last complete allowed phase is evidence");
+  assert.equal(record.elapsedMs, 15002.125, "observed elapsed time must not be clamped to the deadline");
+  assert.equal(record.timeoutMs, 15000);
+  assert.equal(record.stdout.bytes, 0);
+  assert.equal(record.stdout.sha256, createHash("sha256").update("").digest("hex"));
+  assert.equal(record.stderr.bytes, Buffer.byteLength(stderr));
+  assert.equal(record.stderr.sha256, createHash("sha256").update(stderr).digest("hex"));
+  assert.equal(record.stderr.hashComplete, true);
+  assert.equal(JSON.stringify(record).includes("never-emit-test-data"), false, "raw diagnostic output must not escape");
+  const absent = fixtureHelper.fixtureInspectFailureRecord({ code: "ENOENT" }, 123, 0);
+  assert.equal(absent.stdout, null, "unavailable output is not empty-output proof");
+  assert.equal(absent.stderr, null);
+  assert.equal(absent.nativePhase, "unobserved");
+  const oversized = Buffer.alloc(1024 * 1024 + 1, 97);
+  const limited = fixtureHelper.fixtureInspectFailureRecord({ stdout: oversized, stderr: "[fixture-inspect] phase=unknown\n" }, 123, 1);
+  assert.equal(limited.stdout.bytes, oversized.length);
+  assert.equal(limited.stdout.hashedBytes, 1024 * 1024);
+  assert.equal(limited.stdout.hashComplete, false, "a bounded prefix hash must never claim full-stream coverage");
+  assert.equal(limited.nativePhase, "unobserved");
+  for (const code of ["ENOBUFS", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"]) {
+    const capped = fixtureHelper.fixtureInspectFailureRecord({ code, stdout: oversized.subarray(0, 1024 * 1024), stderr: "" }, 123, 1);
+    assert.equal(capped.stdout.hashComplete, false, "a maxBuffer error cannot prove the child stream was complete");
+    assert.equal(capped.stderr.hashComplete, false, "the overflowing stream is not known from the generic error alone");
+  }
+  console.log("fixture-inspect diagnostic regression ok");
 }
 
 async function isolatedAdmissionRegression(root) {

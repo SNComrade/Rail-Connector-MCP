@@ -111,12 +111,130 @@ function packageFiles() {
   return result[0].files.map((entry) => entry.path.replaceAll("\\", "/"));
 }
 
-function inspect(file, text, findings) {
+// Stop at the username component so an allowed child path cannot swallow a
+// later Windows profile prefix in the same whitespace-delimited token.
+const windowsUserPath = /[A-Za-z]:\\+(?!\\)Users\\+[^\\\s`"']+/gi;
+
+const sourceIdentifier = "[A-Za-z_$][\\w$]*";
+const sourcePlaceholder = "\0";
+const sourceDeclaration = `(?:const|let|var)\\s+${sourceIdentifier}\\s*=\\s*`;
+const sourceMember = `${sourcePlaceholder}(?:\\.${sourceIdentifier})*(?:\\s+/\\s+\\d+(?:\\.\\d+)?)?`;
+const sourceValue = `(?:${sourceMember}|\\[\\s*${sourcePlaceholder}\\s*\\]|\\{\\s*${sourceIdentifier}\\s*:\\s*${sourcePlaceholder}\\s*\\}|${sourceIdentifier}\\s*\\?\\s*${sourcePlaceholder}\\s*:\\s*${sourceIdentifier})`;
+const sourceLiteral = `(?:"(?:[^"\\\\\\r\\n]|\\\\[^\\r\\n])*"|'(?:[^'\\\\\\r\\n]|\\\\[^\\r\\n])*')`;
+const sourceLaterDeclaration = `(?:\\s*${sourceDeclaration}${sourceLiteral};)?`;
+const sourceComment = String.raw`(?:\s+(?://[^\r\n]*|/\*(?:[^*\r\n]|\*(?!/))*\*/))?`;
+const windowsPlaceholderSourceUnit = new RegExp(
+  `^(?:${sourceDeclaration}${sourceValue}|${sourceIdentifier}\\(\\s*${sourcePlaceholder}\\s*(?:,\\s*${sourceIdentifier}\\s*)?\\));${sourceLaterDeclaration}${sourceComment}\\s*$`
+);
+
+function hasCompleteWindowsPlaceholderSourceUnit(text, frameStart, frameEnd) {
+  const lineStart = text.lastIndexOf("\n", frameStart - 1) + 1;
+  const nextLine = text.indexOf("\n", frameEnd);
+  const lineEnd = nextLine < 0 ? text.length : nextLine;
+  if (lineEnd - lineStart > 4096) return false;
+  // Bind the grammar's value slot to this exact span, never source-controlled
+  // lookalike syntax elsewhere in a comment or an independent literal.
+  if (text.slice(lineStart, lineEnd).includes(sourcePlaceholder)) return false;
+  const unit = `${text.slice(lineStart, frameStart)}${sourcePlaceholder}${text.slice(frameEnd, lineEnd)}`.trim();
+  return windowsPlaceholderSourceUnit.test(unit);
+}
+
+function isExactWindowsPlaceholder(text, index, match) {
+  const profile = match.replace(/^[A-Za-z]:\\+Users\\+/i, "");
+  const placeholder = /^(?:you|<you>)/i.exec(profile);
+  if (!placeholder) return false;
+  const remainder = profile.slice(placeholder[0].length);
+  if (remainder) return false;
+
+  const next = text[index + match.length];
+  if (next === undefined || /\s/.test(next) || next === '"' || next === "\\") return true;
+  if ((next === "'" || next === "`") && text[index - 1] === next) {
+    let frameLength = 1;
+    if (next === "`") {
+      while (text[index - frameLength - 1] === next) frameLength += 1;
+      let closingLength = 1;
+      while (text[index + match.length + closingLength] === next) closingLength += 1;
+      if (closingLength !== frameLength) return false;
+    }
+    const frameEnd = index + match.length + frameLength;
+    const afterClosingFrame = text[frameEnd];
+    if (afterClosingFrame !== undefined && !/[\s;,:\)\]}."]/.test(afterClosingFrame)) return false;
+    // A suffix can disclose a username even without a child separator. Admit
+    // nonempty contiguous source syntax only as one complete supported unit.
+    if (afterClosingFrame !== undefined && !/[\s"]/.test(afterClosingFrame) &&
+        !hasCompleteWindowsPlaceholderSourceUnit(text, index - frameLength, frameEnd)) return false;
+    for (let cursor = frameEnd; cursor < text.length; cursor += 1) {
+      const character = text[cursor];
+      if (/[\s'"`]/.test(character)) break;
+      if (character === "\\" || character === "/") return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function hasNonPlaceholderWindowsUserPath(text) {
+  windowsUserPath.lastIndex = 0;
+  for (const match of text.matchAll(windowsUserPath)) {
+    if (!isExactWindowsPlaceholder(text, match.index, match[0])) return true;
+  }
+  return false;
+}
+
+const unixUserRoot = "/home/";
+const macUserRoot = "/Users/";
+
+// POSIX classification reuses the unchanged bounded source-unit grammar above.
+function hasExactPosixClosingFrame(text, index, end) {
+  const next = text[end];
+  if (![String.fromCharCode(39), String.fromCharCode(34), String.fromCharCode(96)].includes(next) ||
+      text[index - 1] !== next) return false;
+  let frameLength = 1;
+  if (next.charCodeAt(0) === 96) {
+    while (text[index - frameLength - 1] === next) frameLength += 1;
+    let closingLength = 1;
+    while (text[end + closingLength] === next) closingLength += 1;
+    if (closingLength !== frameLength) return false;
+  }
+  const frameEnd = end + frameLength;
+  const after = text[frameEnd];
+  if (after === undefined || /\s/.test(after)) return true;
+  if (!hasCompleteWindowsPlaceholderSourceUnit(text, index - frameLength, frameEnd)) return false;
+  for (let cursor = frameEnd; cursor < text.length; cursor += 1) {
+    const character = text[cursor];
+    if (/[\s'"\x60]/.test(character)) break;
+    if (character === '/' || character === '\\') return false;
+  }
+  return true;
+}
+function isAllowedPosixUserComponent(text, index, usernameStart) {
+  const placeholder = /^(?:you|<you>)/.exec(text.slice(usernameStart));
+  // An empty component is exempt only when this exact root directory has a
+  // matching adjacent closing frame; arbitrary quote-start usernames refuse.
+  if (!placeholder) return hasExactPosixClosingFrame(text, index, usernameStart);
+  const end = usernameStart + placeholder[0].length;
+  const next = text[end];
+  if (next === undefined || next === '/' || /\s/.test(next)) return true;
+  return hasExactPosixClosingFrame(text, index, end);
+}
+function hasNonPlaceholderPosixUserPath(text, prefix) {
+  // Include quote characters in the component inventory. They are valid POSIX
+  // filename bytes and cannot unconditionally end the placeholder exemption.
+  const pattern = prefix === '/home/' ? /\/home\/+[^\s/]+/g : /\/Users\/+[^\s/]+/g;
+  for (const match of text.matchAll(pattern)) {
+    let usernameStart = match.index + prefix.length;
+    while (text[usernameStart] === '/') usernameStart += 1;
+    // Preserve username offsets; framing begins at the complete leading slash run.
+    let profileStart = match.index;
+    while (profileStart > 0 && text[profileStart - 1] === '/') profileStart -= 1;
+    if (!isAllowedPosixUserComponent(text, profileStart, usernameStart)) return true;
+  }
+  return false;
+}
+
+export function inspectPrivacyText(file, text, findings) {
   const uuidPattern = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
   const remotePattern = /https:\/\/claude\.ai\/code\/([A-Za-z0-9_:-]+)/g;
-  const windowsUserPath = /\b[A-Za-z]:\\Users\\(?!<you>(?:\\|\b)|you(?:\\|\b))[^\s`"']+/gi;
-  const unixUserPath = /\/home\/(?!<you>(?:\/|\b)|you(?:\/|\b))[^\s`"']+/g;
-  const macUserPath = /\/Users\/(?!<you>(?:\/|\b)|you(?:\/|\b))[^\s`"']+/g;
   const emailPattern = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
   const privateKeyPattern = new RegExp("-----" + "BEGIN [A-Z ]*PRIVATE KEY-----", "g");
   const secretPatterns = [
@@ -140,10 +258,10 @@ function inspect(file, text, findings) {
     pattern.lastIndex = 0;
     if (pattern.test(text)) findings.push(`${file}: secret-like content`);
   }
+  if (hasNonPlaceholderWindowsUserPath(text)) findings.push(`${file}: local Windows user path`);
+  if (hasNonPlaceholderPosixUserPath(text, unixUserRoot)) findings.push(file + ": local Unix user path");
+  if (hasNonPlaceholderPosixUserPath(text, macUserRoot)) findings.push(file + ": local macOS user path");
   for (const [pattern, label] of [
-    [windowsUserPath, "local Windows user path"],
-    [unixUserPath, "local Unix user path"],
-    [macUserPath, "local macOS user path"],
     [emailPattern, "email address"],
   ]) {
     pattern.lastIndex = 0;
@@ -162,7 +280,7 @@ if (isDirectExecution()) {
     }
     const source = path.join(root, ...file.split("/"));
     if (fs.existsSync(source) && fs.statSync(source).isFile()) {
-      inspect(file, fs.readFileSync(source, "utf8"), findings);
+      inspectPrivacyText(file, fs.readFileSync(source, "utf8"), findings);
     }
   }
 
@@ -177,7 +295,7 @@ if (isDirectExecution()) {
     }
     const source = path.join(root, ...file.split("/"));
     if (fs.existsSync(source) && fs.statSync(source).isFile()) {
-      inspect(`npm:${file}`, fs.readFileSync(source, "utf8"), findings);
+      inspectPrivacyText(`npm:${file}`, fs.readFileSync(source, "utf8"), findings);
     }
   }
 
