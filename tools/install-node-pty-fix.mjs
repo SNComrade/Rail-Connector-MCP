@@ -9,11 +9,11 @@ export const nodePtyFixSpecPath = fileURLToPath(new URL("../patches/node-pty-1.2
 // including ordinary npm hoisting. Resolution reads metadata; it loads no PTY.
 const brokerRequire = createRequire(new URL("../src/windows-broker.js", import.meta.url));
 const defaultPackageRoot = () => path.dirname(brokerRequire.resolve("node-pty/package.json"));
-const permittedFiles = new Set(["lib/windowsTerminal.js", "lib/windowsPtyAgent.js", "typings/node-pty.d.ts"]);
+const permittedFiles = new Set(["lib/windowsTerminal.js", "lib/windowsPtyAgent.js", "typings/node-pty.d.ts", "lib/windowsConoutConnection.js"]);
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
 function refuse(message) {
-  const error = new Error(`node-pty compatibility fix: ${message}. Run the reviewed checkout's npm ci; do not hand-edit the dependency.`);
+  const error = new Error(`node-pty compatibility fix: ${message}. Stop all affected sessions and the broker before changing dependencies. In the reviewed checkout, run npm run postinstall for a known readiness-only installation, or npm ci for a fresh locked installation. Restart the broker from that reviewed checkout and verify the fix before use; do not patch a live installed runtime or hand-edit the dependency.`);
   error.code = "EPTYCOMPAT";
   throw error;
 }
@@ -36,7 +36,7 @@ function inspect(packageRoot) {
   const spec = JSON.parse(fs.readFileSync(nodePtyFixSpecPath, "utf8"));
   const metadata = JSON.parse(readPlainFile(path.join(root, "package.json")).bytes);
   if (spec.format !== 1 || spec.package !== "node-pty" || spec.version !== "1.2.0-beta.15" ||
-      metadata.name !== spec.package || metadata.version !== spec.version || spec.patches.length !== 3) {
+      metadata.name !== spec.package || metadata.version !== spec.version || spec.patches.length !== 4) {
     refuse("unsupported package or fix specification");
   }
   const seen = new Set();
@@ -66,14 +66,16 @@ function inspect(packageRoot) {
 
 export function verifyNodePtyFix({ packageRoot = defaultPackageRoot() } = {}) {
   const { spec, files } = inspect(packageRoot);
-  if (files.some((file) => file.state !== "patched")) refuse("required readiness-budget fix is not installed");
+  if (files.some((file) => file.state !== "patched")) refuse("required readiness-budget and output-worker cleanup fix is not installed");
   return { fix: spec.fix, version: spec.version, verifiedFiles: files.map((file) => file.path) };
 }
 
 export function applyNodePtyFix({ packageRoot = defaultPackageRoot() } = {}) {
   // Validate every source before the first write. A partial interrupted install
   // can be completed only when each target matches an exact known before/after
-  // hash; arbitrary dependency edits are never adopted.
+  // hash; arbitrary dependency edits are never adopted. The original three
+  // readiness postimages remain valid: upgrading that install writes only the
+  // fourth output-close target. Pristine/combined installs write four/zero.
   const { spec, files } = inspect(packageRoot);
   let appliedFiles = 0;
   for (const file of files) {

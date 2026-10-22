@@ -66,26 +66,39 @@ claude
 
 ## Install
 
+These commands use the guarded source installer. For an existing installation,
+first complete the [upgrade order](#upgrade), including authorized session stops
+and old-broker shutdown through the old client. Then close affected MCP clients
+and use a separate PowerShell window. `-ClientsClosed` acknowledges that
+preparation; it performs none of those steps.
+
 ```powershell
-git clone --branch v1.0.0-beta.4 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
-.\install-windows.ps1
+.\install-windows.ps1 -ClientsClosed
 ```
 
 The default `BypassPolicy` is `Disabled`. For an explicitly authorized
 single-user development host where bypass mode should be available:
 
 ```powershell
-.\install-windows.ps1 -BypassPolicy LocalHost -AllowedRoot "$HOME\Projects"
+.\install-windows.ps1 -BypassPolicy LocalHost -AllowedRoot "$HOME\Projects" -ClientsClosed
 ```
 
 For a disposable isolated instance:
 
 ```powershell
-.\install-windows.ps1 -BypassPolicy Isolated
+.\install-windows.ps1 -BypassPolicy Isolated -ClientsClosed
 ```
 
-The installer runs `npm ci`, syntax checking, and the smoke test by default;
+Keep affected MCP/client applications closed; the acknowledgement never
+overrides a failed guard. A fresh install
+requires both absent dependencies and absent/empty broker state. Existing
+dependencies with missing/invalid token state are refused, not repaired.
+
+The installer qualifies the target, selected state, broker endpoint and exact
+existing native dependency files before `npm ci`, then rechecks before
+registration. It runs `npm ci`, syntax checking and the smoke test by default;
 `-RunTests` adds `npm test`. It resolves absolute Node and Claude executables,
 probes Codex CLI candidates with `--version`, and registers `rail-connector`
 through the first executable candidate. It checks `codex` on `PATH`, then the
@@ -95,7 +108,7 @@ arguments, and process environment can be checked immediately.
 Override discovery with an exact path when needed:
 
 ```powershell
-.\install-windows.ps1 -BypassPolicy LocalHost -AllowedRoot "$HOME\Projects" `
+.\install-windows.ps1 -BypassPolicy LocalHost -AllowedRoot "$HOME\Projects" -ClientsClosed `
   -CodexPath "$HOME\.codex\.sandbox-bin\codex.exe"
 ```
 
@@ -149,6 +162,19 @@ On `stop_timeout`, the session remains tracked as recovery-only (`status`
 shows `recoveryOnly: true`) and requires its original generation ID and start
 timestamp, returned in the `stop_timeout` reply, before another cleanup lease
 or stop.
+An accepted client-socket error is contained to that connection. A Terminal
+error marks only the affected generation recovery-only and exposes its sanitized
+`terminalErrorCode` in broker metadata. Both output and input channel errors are
+contained. After a channel fault, only an integer exit code is accepted as exit
+evidence: node-pty can report an undefined code when a socket closes while its
+child still runs. Such a generation remains tracked, and an exact-bound stop can
+honestly return `stop_timeout` if node-pty never emits a later numeric exit.
+Inspect the generation and use the exact-bound stop path above. Other managed
+sessions stay available. The contained Terminal and accepted-client error
+diagnostics record only a sanitized code, not the native error message or
+request contents; this is not a promise about every existing broker diagnostic.
+These safeguards do not
+establish the cause of a historical broker exit or quantify host memory use.
 The current build does not contact the historical predictable pipe, because
 doing so would expose the token to a pipe-name squatter. A historical broker can
 coexist until it is stopped through its original MCP process.
@@ -246,26 +272,141 @@ See [Troubleshooting](TROUBLESHOOTING.md) for recovery guidance and
 
 ## Upgrade
 
-Let any active Claude turn finish and record its `resolvedSessionId`, then:
+Stop before replacement, while the old client still works:
+
+1. Let active work finish. Inspect the affected sessions through the old MCP and
+   retain their exact generation/session identity. A session count alone is not
+   cleanup proof.
+2. Stop only the sessions whose owner has authorized stopping. A foreign lease,
+   recovery-only uncertainty or unconfirmed exit blocks this upgrade; do not
+   force-stop unrelated work to satisfy the installer.
+3. Use the unchanged old checkout's exported client API below; broker shutdown is
+   not a registered MCP tool. Keep the old client available, but quiesce all
+   clients/agents that could start sessions or submit mutations. Run as the same
+   Windows user, with the old registration's actual `RAIL_CONNECTOR_STATE_DIR` and
+   `RAIL_CONNECTOR_CLAUDE_PATH` values when configured; do not guess or change those
+   values to bypass a mismatch. Set the target and immediately verified broker
+   PID from the preceding old-client inspection. Zero intentionally refuses.
+
+   ```powershell
+   $oldRoot = 'D:\existing-installed-checkout'
+   $expectedBrokerPid = 0 # Replace with the verified old broker PID.
+   Push-Location -LiteralPath $oldRoot -ErrorAction Stop
+   try {
+   @'
+   import assert from "node:assert/strict";
+   import {
+     WINDOWS_BROKER_PROTOCOL,
+     WINDOWS_BROKER_VERSION,
+     windowsBrokerLaunchPolicyFingerprint,
+     windowsBrokerRequest,
+   } from "./src/windows-broker-client.js";
+
+   try {
+     assert.equal(process.platform, "win32");
+     const expectedPid = Number(process.argv[2]);
+     assert(Number.isSafeInteger(expectedPid) && expectedPid > 0);
+     const options = { startIfMissing: false, timeoutMs: 5000 };
+     const before = await windowsBrokerRequest("status", {}, options);
+     assert.equal(before.protocol, WINDOWS_BROKER_PROTOCOL);
+     assert.equal(before.version, WINDOWS_BROKER_VERSION);
+     assert.equal(before.launchPolicyFingerprint,
+       windowsBrokerLaunchPolicyFingerprint());
+     assert.equal(before.pid, expectedPid);
+     assert(Array.isArray(before.managedSessions));
+     assert.equal(before.managedSessions.length, 0);
+     const result = await windowsBrokerRequest("shutdown", {}, options);
+     assert.equal(result?.status, "shutting_down");
+     assert.equal(result.pid, expectedPid);
+     console.log("Shutdown acknowledged. Close clients, then run CheckOnly.");
+   } catch (error) {
+     const code = /^[A-Z][A-Z0-9_]{0,39}$/.test(error?.code ?? "")
+       ? error.code : "EUNKNOWN";
+     console.error(`Shutdown refused or uncertain (${code}); do not update.`);
+     process.exitCode = 1;
+   }
+   '@ | node --input-type=module - $expectedBrokerPid
+     if ($LASTEXITCODE -ne 0) {
+       throw 'Broker shutdown refused or uncertain; stop the upgrade.'
+     }
+   } finally {
+     Pop-Location
+   }
+   ```
+
+   This no-start call reads the existing token internally; do not copy or print
+   it. Status does not expose lease ownership, so require an empty session array,
+   not merely entries marked exited. Any known unresolved lease, missing/invalid
+   token, incompatible build/policy, nonempty or malformed status, changed PID,
+   timeout, lost reply or unexpected acknowledgment blocks the upgrade. Reconcile
+   through the old owner; do not automatically replay shutdown or force cleanup.
+   The server drains admitted operations and refuses live sessions, but the PID
+   precheck and acknowledgment are not an atomic identity lock: other callers
+   must remain quiescent. `shutting_down` acknowledges the request, not process
+   exit. Do not treat `probeWindowsBroker() === null` alone as absence proof; it
+   can also hide some authentication failures. Close clients next and require the
+   final new-installer `CheckOnly` gate before replacement. The installer never
+   kills, drains, starts or repairs a broker.
+4. Close affected Codex/MCP/client applications and keep them closed throughout
+   checkout/dependency replacement. Do not discard the old client before the
+   preceding stops are verified.
+5. Run `CheckOnly` before `git pull` or any dependency command. For the first
+   transition, the old installer lacks this flag: use the reviewed new checkout's
+   script against the still-unchanged old target:
+
+```powershell
+& 'D:\reviewed-new-checkout\install-windows.ps1' -CheckOnly -ClientsClosed `
+  -TargetRoot 'D:\existing-installed-checkout'
+```
+
+`TargetRoot` is accepted only with `CheckOnly`. Select `-StateDirectory` when the
+old MCP uses a known custom state path; otherwise verify that the default
+`%USERPROFILE%\.rail-connector-mcp\state\v1` is its actual state. A guessed state
+path is not ownership evidence. Custom-state automatic registration is refused
+because this installer does not preserve that environment in the registration.
+CheckOnly/offline qualification leaves the existing registration untouched.
+
+After a successful check, keep clients closed and update the actual target:
 
 ```powershell
 git fetch --tags origin
 git checkout --detach "v<new-version>"
-npm ci
-npm test
-.\install-windows.ps1 -BypassPolicy LocalHost -AllowedRoot "$HOME\Projects"
+.\install-windows.ps1 -BypassPolicy LocalHost -AllowedRoot "$HOME\Projects" -ClientsClosed
 ```
 
-Open a fresh Codex task so a new MCP process and tool schema use the updated
-code. A broker session from the previous version may still exist. If the broker
-reports an upgrade block, finish any important work, then call
-`stop_remote_control` with
-`force: true` for the named session. Token-derived brokers from versions that
-support compatibility cleanup can be drained without reopening the previous
-Codex task. A broker predating that protocol still requires its original MCP
-process.
+The installer repeats qualification before `npm ci` and before registration;
+the earlier observation is not a reusable permission token. Any present endpoint
+(including an idle or incompatible broker), connection reset/abort/timeout,
+ambiguous state, linked dependency path, changed inventory or native resource
+owner refuses replacement. It queries exact ordinary `.node`, `.dll` and `.exe`
+files in the target's local `node-pty`; missing/hoisted/unsupported native
+layouts are not adopted. No token or request is sent by its connect-only probe.
 
-Builds that used the historical predictable pipe are intentionally not probed
-by the current MCP. Stop those sessions with the old MCP task, or terminate that
-old broker only after confirming no work is active. The current token-derived
-broker can otherwise run independently.
+Native owner observation uses only Restart Manager start/register/list/end.
+These calls create transient Windows session/registry state: **CheckOnly means
+no dependency/configuration replacement, not zero Windows writes**. API errors,
+owner-list growth, reboot reasons and session cleanup failure refuse. A zero
+result is a dated observation for those registered files, not proof of loaded
+native hashes, all historical brokers, or an atomic lock against clients
+reopening. Historical predictable-pipe brokers still require their old owner.
+
+For an offline known-state compatibility migration, after the same stop order
+and source update, run CheckOnly immediately before the existing postinstall:
+
+```powershell
+.\install-windows.ps1 -CheckOnly -ClientsClosed
+npm run postinstall
+```
+
+Keep clients closed between these commands. A bare package command bypasses the
+installer guard. For the reviewed combined compatibility fix, pristine,
+readiness-only and already-combined states retain the existing 4/1/0 writes;
+the guard neither changes those postimages nor accepts unknown patch bytes.
+It adds no dependency-only installer mode. Do not delete state to make a refusal
+look like a fresh install.
+
+After reviewed dependency verification, reopen a fresh Codex task and read back
+the new broker build and managed session identity. Source/mock checks do not
+constitute an installed-primary rollout or native lock qualification. The public
+installer preserves this guard contract, including custom-state refusal; source
+parity alone is not native/platform qualification.

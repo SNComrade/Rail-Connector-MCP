@@ -42,8 +42,13 @@ repeatable and can be read back:
 ./install.sh --bypass-policy LocalHost
 ```
 
+For an existing installation, first follow the [Windows upgrade order](WINDOWS.md#upgrade),
+including authorized session stops and old-broker shutdown through the old client.
+Then close MCP clients using the checkout and use a separate PowerShell window.
+`-ClientsClosed` acknowledges that preparation; it performs none of those steps.
+
 ```powershell
-.\install-windows.ps1 -BypassPolicy LocalHost
+.\install-windows.ps1 -BypassPolicy LocalHost -ClientsClosed
 ```
 
 Use `Disabled` to register without the environment entry, then confirm the

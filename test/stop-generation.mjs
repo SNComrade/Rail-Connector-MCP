@@ -3,10 +3,12 @@ import fs from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { windowsBrokerRequest } from "../src/windows-broker-client.js";
+import { windowsBrokerRequest, windowsBrokerPaths, windowsBrokerLaunchPolicyFingerprint,
+  WINDOWS_BROKER_VERSION } from "../src/windows-broker-client.js";
 import { createFixtureProcessLedger } from "./fixtures/fixture-process-ledger.mjs";
 import {
   createPortableWaitCursor,
@@ -14,6 +16,7 @@ import {
   expectedStopIdentity,
   expectedStopGeneration,
   parsePortableWaitCursor,
+  withManagedMutationLock, withRequestSignal, runSubmitPrompt,
 } from "../src/index.js";
 
 assert.equal(expectedStopGeneration({}), null);
@@ -2244,7 +2247,748 @@ async function waitTerminalGenerationCase(testCase) {
   }
 }
 
+
+async function cancellationMutationCoverage() {
+  const controller = new AbortController();
+  let textCalls = 0;
+  let keyCalls = 0;
+  let captures = 0;
+  await assert.rejects(withRequestSignal(controller.signal, () => runSubmitPrompt({
+    managedSession: "synthetic-cancel-submit", text: "synthetic inert prompt", submitRetries: 2,
+  }, {
+    isNativeWindows: true,
+    capture: async () => { captures++; return "> "; },
+    runtimeObservation: async () => ({ workflowActivity: {} }),
+    sendText: async () => { textCalls++; controller.abort(); return { bracketedPasteUsed: true }; },
+    sendKey: async () => { keyCalls++; },
+    promptAcknowledged: async () => false,
+  })), (error) => error.code === "ECANCELLED");
+  assert.equal(textCalls, 1);
+  assert.equal(captures, 1, "cancellation after delivery must not begin acknowledgement/retry work");
+  assert.equal(keyCalls, 0, "cancellation after delivery must not submit a later Enter");
+  console.log("stop-generation cancellation after delivery prevents later Enter/retry ok (inert injected backend)");
+  if (process.platform !== "win32") return;
+
+  for (const mode of ["delayed-grant", "lost-grant-known", "lost-grant-unknown", "lost-release", "read-abort", "busy-cancel", "undispatched-fallback",
+    "upgrade-lost-grant-known", "upgrade-lost-grant-unknown", "upgrade-lost-grant-stale", "send-lost-ack", "send-lost-ack-mcp"]) {
+    const upgrading = mode.startsWith("upgrade-");
+    const unknownPair = mode === "lost-grant-unknown" || mode === "upgrade-lost-grant-unknown";
+    const fixtureState = path.join(root, "cancel-" + mode);
+    fs.mkdirSync(fixtureState, { recursive: true });
+    const token = randomUUID().replaceAll("-", "").repeat(2);
+    const env = { ...process.env, RAIL_CONNECTOR_STATE_DIR: fixtureState,
+      ...(mode === "send-lost-ack-mcp" ? { CLAUDE_CONFIG_DIR: path.join(fixtureState, "config"),
+        RAIL_CONNECTOR_ALLOWED_ROOTS: repoRoot, RAIL_CONNECTOR_CLAUDE_PATH: wrapper } : {}) };
+    const paths = windowsBrokerPaths(env, token);
+    fs.writeFileSync(paths.tokenFile, token, { flag: "wx" });
+    const pair = { expectedGenerationId: "00000000-0000-4000-8000-000000000000", expectedStartedAtMs: 12345 };
+    const records = [];
+    const sockets = new Set();
+    let grant;
+    let release;
+    let productCalls = 0;
+    let acquireCalls = 0;
+    let submitCaptures = 0;
+    let submitKeys = 0;
+    let submitAcknowledgements = 0;
+    const promptMarker = "owned synthetic lost-ack prompt";
+    let heldRead;
+    const broker = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on("error", () => {});
+      socket.once("close", () => sockets.delete(socket));
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk;
+        if (!buffer.includes("\n")) return;
+        const request = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+        records.push({ operation: request.operation, payload: request.payload });
+        const reply = (result) => socket.end(JSON.stringify({ ok: true, result }) + "\n");
+        if (request.operation === "ping") reply({
+          version: WINDOWS_BROKER_VERSION, launchPolicyFingerprint: windowsBrokerLaunchPolicyFingerprint(env),
+        });
+        else if (request.operation === "acquireLease") {
+          acquireCalls++;
+          if (upgrading && acquireCalls === 1) socket.end(JSON.stringify({ ok: false, code: "EBROKERUPGRADE", error: "synthetic acquire upgrade" }) + "\n");
+          else if (mode === "busy-cancel") reply({ status: "busy", generationId: pair.expectedGenerationId, startedAtMs: pair.expectedStartedAtMs });
+          else if (mode.includes("lost-grant")) socket.destroy();
+          else if (mode === "delayed-grant") grant = () => reply({
+            status: "acquired", generationId: pair.expectedGenerationId, startedAtMs: pair.expectedStartedAtMs,
+          });
+          else reply({ status: "acquired", generationId: pair.expectedGenerationId, startedAtMs: pair.expectedStartedAtMs });
+        } else if (request.operation === "releaseLease") {
+          if (mode === "lost-release") socket.destroy();
+          else if (mode === "upgrade-lost-grant-stale") socket.end(JSON.stringify({ ok: false, code: "ESTALE", error: "synthetic generation changed" }) + "\n");
+          else if (mode === "delayed-grant") release = () => reply({ status: "released" });
+          else reply({ status: "released" });
+        } else if (request.operation === "status" && mode.startsWith("send-lost-ack")) {
+          reply({ version: WINDOWS_BROKER_VERSION, launchPolicyFingerprint: windowsBrokerLaunchPolicyFingerprint(env),
+            managedSessions: [{ name: "synthetic-cancellation-lease", cwd: repoRoot, canonicalCwd: canonicalWorkspace,
+              generationId: pair.expectedGenerationId, startedAtMs: pair.expectedStartedAtMs, exited: false }] });
+        } else if (request.operation === "sendText" && mode.startsWith("send-lost-ack")) {
+          socket.destroy();
+        } else if (request.operation === "capture") {
+          if (mode === "send-lost-ack-mcp") reply({ capture: "> " });
+          else if (request.payload.lines === 21) reply({ capture: "synthetic peer" });
+          else heldRead = socket;
+        } else assert.fail("unexpected fake operation " + request.operation);
+      });
+    });
+    if (mode !== "undispatched-fallback") {
+      await new Promise((resolve, reject) => { broker.once("error", reject); broker.listen(paths.pipeName, resolve); });
+    }
+    const priorState = process.env.RAIL_CONNECTOR_STATE_DIR;
+    process.env.RAIL_CONNECTOR_STATE_DIR = fixtureState;
+    const cancelled = new AbortController();
+    let pending;
+    let outcomeClient;
+    let outcomeTransport;
+    try {
+      if (mode === "read-abort") {
+        pending = windowsBrokerRequest("capture", { lines: 20 }, {
+          env, startIfMissing: false, signal: cancelled.signal,
+        }).then((value) => ({ value }), (error) => ({ error }));
+        await waitCancellationFixture(() => heldRead, "read must dispatch before cancellation");
+        const peer = windowsBrokerRequest("capture", { lines: 21 }, { env, startIfMissing: false });
+        const at = performance.now();
+        cancelled.abort();
+        const outcome = await pending;
+        assert.equal(outcome.error?.code, "ECANCELLED");
+        assert.equal(outcome.error.brokerRequestDispatched, true);
+        assert.ok(performance.now() - at < 1000);
+        assert.equal((await peer).capture, "synthetic peer");
+      } else {
+        if (mode === "send-lost-ack-mcp") {
+          outcomeTransport = new StdioClientTransport({ command: process.execPath, args: ["src/index.js"],
+            cwd: repoRoot, env, stderr: "pipe" });
+          outcomeClient = new Client({ name: "owned-cancellation-outcome", version: "1.0.0" }, { capabilities: {} });
+          await outcomeClient.connect(outcomeTransport);
+          pending = outcomeClient.callTool({ name: "send_text", arguments: {
+            managedSession: "synthetic-cancellation-lease", text: promptMarker, submit: true,
+          } }).then((value) => ({ value }), (error) => ({ error }));
+        } else pending = withRequestSignal(cancelled.signal, () => withManagedMutationLock(
+          "synthetic-cancellation-lease", async () => {
+            productCalls++;
+            if (mode !== "send-lost-ack") return { synthetic: true };
+            // Keep the actual index backendSendText/windowsBrokerRequest chain.
+            // Only observation/ack fixtures are inert; no real session exists.
+            return runSubmitPrompt({ managedSession: "synthetic-cancellation-lease", text: promptMarker, submitRetries: 2 }, {
+              capture: async () => { submitCaptures++; return "> "; },
+              runtimeObservation: async () => ({ workflowActivity: {} }),
+              sendKey: async () => { submitKeys++; },
+              promptAcknowledged: async () => { submitAcknowledgements++; return false; },
+            });
+          },
+          { ...(unknownPair || mode === "undispatched-fallback" ? {} : { expectedGeneration: pair }),
+            ...(upgrading ? { allowMissingBackend: true } : {}) }
+        )).then((value) => ({ value }), (error) => ({ error }));
+        if (mode !== "undispatched-fallback") {
+          await waitCancellationFixture(() => records.some((record) => record.operation === "acquireLease"), "acquire must dispatch");
+        }
+        if (mode === "busy-cancel") cancelled.abort();
+        if (mode === "delayed-grant") {
+          let settled = false;
+          pending.then(() => { settled = true; });
+          cancelled.abort();
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          assert.equal(settled, false, "dispatched acquire must not be aborted/abandoned");
+          grant();
+          await waitCancellationFixture(() => release, "granted cancelled lease must release exact pair");
+          assert.equal(settled, false, "release acknowledgement belongs to finally");
+          release();
+        }
+        const outcome = await pending;
+        if (mode === "undispatched-fallback") {
+          assert.equal(outcome.error, undefined);
+          assert.deepEqual(outcome.value, { synthetic: true });
+        } else if (mode === "busy-cancel") {
+          assert.equal(outcome.error?.code, "ECANCELLED");
+          assert.equal(outcome.error.controlOutcome.lease, "not_acquired");
+        } else if (mode === "delayed-grant") {
+          assert.equal(outcome.error?.code, "ECANCELLED");
+          assert.equal(outcome.error.controlOutcome.lease, "released");
+        } else if (mode === "send-lost-ack") {
+          assert.equal(outcome.error?.code, "EMUTATIONUNKNOWN", "actual index wrapper must classify lost mutation acknowledgement");
+          assert.equal(outcome.error.controlOutcome.delivery, "possibly_delivered");
+          assert.equal(outcome.error.controlOutcome.lease, "acquired", "direct error is a dispatch-time snapshot, not final cleanup evidence");
+          const diagnostic = JSON.stringify({ code: outcome.error.code, message: outcome.error.message, controlOutcome: outcome.error.controlOutcome });
+          for (const excluded of [promptMarker, "synthetic-cancellation-lease", token]) assert.equal(diagnostic.includes(excluded), false, "outcome diagnostic must omit input and identities");
+          assert.equal(submitCaptures, 1, "lost delivery ack must stop before later capture/ack/retry work");
+          assert.equal(submitKeys, 0, "lost delivery ack must not begin another Enter");
+          assert.equal(submitAcknowledgements, 0);
+          assert.equal(records.filter((record) => record.operation === "sendText").length, 1, "ambiguous sendText must never replay");
+        } else if (mode === "send-lost-ack-mcp") {
+          assert.equal(outcome.error, undefined);
+          assert.equal(outcome.value.isError, true);
+          assert.match(contentText(outcome.value), /Broker mutation outcome is unknown/);
+          assert.deepEqual(outcome.value._meta?.["rail-connector/control-outcome"], {
+            delivery: "possibly_delivered", lease: "released",
+          }, "actual emitted MCP metadata must reflect completed exact lease cleanup");
+          const diagnostic = JSON.stringify(outcome.value);
+          for (const excluded of [promptMarker, "synthetic-cancellation-lease", token]) assert.equal(diagnostic.includes(excluded), false, "emitted outcome must omit input and identities");
+          assert.equal(records.filter((record) => record.operation === "sendText").length, 1);
+          assert.equal(records.filter((record) => record.operation === "capture").length, 1, "MCP lost ack must not begin later capture work");
+          assert.equal(records.some((record) => /sendKey/i.test(record.operation)), false, "MCP lost ack must not send later Enter");
+          console.log("stop-generation emitted lost-ack outcome " + JSON.stringify(outcome.value._meta["rail-connector/control-outcome"]));
+        } else {
+          assert.equal(outcome.error?.code, "ELEASEUNKNOWN");
+          assert.equal(outcome.error.controlOutcome.lease,
+            mode === "upgrade-lost-grant-stale" ? "generation_changed" : unknownPair || mode === "lost-release" ? "unknown" : "released");
+        }
+        assert.equal(productCalls, ["lost-release", "undispatched-fallback", "send-lost-ack"].includes(mode) ? 1 : 0);
+        const acquisitions = records.filter((record) => record.operation === "acquireLease");
+        const releases = records.filter((record) => record.operation === "releaseLease");
+        assert.equal(acquisitions.length, mode === "undispatched-fallback" ? 0 : upgrading ? 2 : 1, "possible delivery never authorizes another acquisition");
+        assert.equal(releases.length, unknownPair || ["busy-cancel", "undispatched-fallback"].includes(mode) ? 0 : 1);
+        for (const record of releases) {
+          assert.equal(record.payload.leaseId, acquisitions[0].payload.leaseId);
+          assert.equal(record.payload.expectedGenerationId, pair.expectedGenerationId);
+          assert.equal(record.payload.expectedStartedAtMs, pair.expectedStartedAtMs);
+        }
+      }
+    } finally {
+      grant?.(); release?.();
+      await outcomeClient?.close();
+      await outcomeTransport?.close();
+      const closed = [...sockets].map((socket) => new Promise((resolve) => {
+        socket.once("close", resolve);
+        socket.destroy();
+      }));
+      if (priorState === undefined) delete process.env.RAIL_CONNECTOR_STATE_DIR;
+      else process.env.RAIL_CONNECTOR_STATE_DIR = priorState;
+      if (pending) await pending;
+      await Promise.all(closed);
+      if (broker.listening) await new Promise((resolve) => broker.close(resolve));
+      assert.equal(sockets.size, 0, "all exact-owned fake pipe connections must close");
+    }
+    console.log("stop-generation " + mode + " exact-owned native pipe contract ok (fake broker)");
+  }
+  await authoritativeLeaseRefusalCoverage();
+  await incompatibleCleanupCancellationCoverage();
+  await uncertainSubmissionAnchorCoverage();
+  await uncertainStartLeaseCoverage();
+}
+
+async function authoritativeLeaseRefusalCoverage() {
+  for (const mode of ["stale", "invalid", "upgrade", "upgrade-then-undispatched", "cancelled-refusal"]) {
+    const fixtureState = path.join(root, "negative-acquire-" + mode);
+    fs.mkdirSync(fixtureState, { recursive: true });
+    const env = { ...process.env, RAIL_CONNECTOR_STATE_DIR: fixtureState,
+      CLAUDE_CONFIG_DIR: path.join(fixtureState, "config"), RAIL_CONNECTOR_ALLOWED_ROOTS: repoRoot,
+      RAIL_CONNECTOR_CLAUDE_PATH: wrapper };
+    const noSpawn = path.join(fixtureState, "no-subprocess.mjs");
+    fs.writeFileSync(noSpawn, [
+      'import childProcess from "node:child_process";',
+      'import { syncBuiltinESMExports } from "node:module";',
+      'for (const key of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"]) {',
+      '  childProcess[key] = () => { throw new Error("Owned refusal fixture forbids all subprocess launches"); };',
+      '}',
+      'syncBuiltinESMExports();',
+    ].join("\n"));
+    const token = randomUUID().replaceAll("-", "").repeat(2);
+    const paths = windowsBrokerPaths(env, token);
+    fs.writeFileSync(paths.tokenFile, token, { flag: "wx" });
+    const records = [];
+    const sockets = new Set();
+    let sendRefusal;
+    let refusalSent = false;
+    let brokerClosing;
+    const code = mode.startsWith("upgrade") ? "EBROKERUPGRADE" : mode === "invalid" ? "EINVAL" : "ESTALE";
+    const broker = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on("error", () => {});
+      socket.once("close", () => sockets.delete(socket));
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk;
+        if (!buffer.includes("\n")) return;
+        const request = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+        records.push(request.operation);
+        if (request.operation === "ping") {
+          socket.end(JSON.stringify({ ok: true, result: { version: WINDOWS_BROKER_VERSION,
+            launchPolicyFingerprint: windowsBrokerLaunchPolicyFingerprint(env) } }) + "\n");
+        } else if (request.operation === "acquireLease") {
+          const refuse = () => {
+            if (refusalSent) return;
+            refusalSent = true;
+            socket.end(JSON.stringify({ ok: false, code, error: "synthetic authoritative refusal" }) + "\n");
+            if (mode === "upgrade-then-undispatched") {
+              // Readiness remains freshly cached. Stop only this exact-owned
+              // fake listener so retry fails before write, without a startup.
+              brokerClosing = new Promise((resolve) => broker.close(resolve));
+            }
+          };
+          if (mode === "cancelled-refusal") sendRefusal = refuse;
+          else refuse();
+        } else assert.fail("refused lease must not dispatch " + request.operation);
+      });
+    });
+    await new Promise((resolve, reject) => { broker.once("error", reject); broker.listen(paths.pipeName, resolve); });
+    const transport = new StdioClientTransport({ command: process.execPath,
+      args: ["--import", pathToFileURL(noSpawn).href, "src/index.js"], cwd: repoRoot, env, stderr: "pipe" });
+    const client = new Client({ name: "owned-authoritative-refusal", version: "1.0.0" }, { capabilities: {} });
+    let stderr = "";
+    transport.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
+    const send = transport.send.bind(transport);
+    let toolId;
+    transport.send = (message, options) => {
+      if (message.method === "tools/call") toolId = message.id;
+      return send(message, options);
+    };
+    let pending;
+    try {
+      await client.connect(transport);
+      // The upgrade fallback's operation rejects these incompatible selectors
+      // before any CLI, transcript lookup, start or other product action.
+      pending = client.callTool(mode === "upgrade-then-undispatched"
+        ? { name: "start_remote_control", arguments: { managedSession: "synthetic-refused-start", cwd: repoRoot,
+          sessionId: "11111111-1111-4111-8111-111111111111", continueLatest: true } }
+        : { name: "send_text", arguments: { managedSession: "synthetic-refused-mutation", text: "owned inert input" } })
+        .then((value) => ({ value }), (error) => ({ error }));
+      if (mode === "cancelled-refusal") {
+        await waitCancellationFixture(() => sendRefusal, "acquire must be in flight before cancellation");
+        await client.notification({ method: "notifications/cancelled", params: { requestId: toolId } });
+        // Public FIFO protocol barrier proves cancellation was processed before
+        // the authoritative negative acquisition reply is released.
+        await client.listTools();
+        sendRefusal();
+        await client.close();
+        await transport.close();
+        assert.equal((await pending).value, undefined, "cancelled request must not emit a late response");
+        assert.equal(stderr.includes("cancelled_request_cleanup"), false,
+          "a refused acquire must not emit a spurious unknown-lease cleanup diagnostic");
+      } else {
+        const outcome = await pending;
+        assert.equal(outcome.error, undefined);
+        assert.equal(outcome.value.isError, true);
+        assert.match(contentText(outcome.value), mode === "upgrade-then-undispatched" ? /mutually exclusive/ : /synthetic authoritative refusal/);
+        assert.equal(outcome.value._meta?.["rail-connector/control-outcome"], undefined,
+          "authoritative refusal plus undispatched delivery must leave no acquired/unknown outcome metadata");
+      }
+      assert.equal(records.filter((operation) => operation === "acquireLease").length, 1);
+      assert.equal(records.some((operation) => operation !== "ping" && operation !== "acquireLease"), false,
+        "no mutation/release follows an authoritative refusal");
+    } finally {
+      sendRefusal?.();
+      await client.close();
+      await transport.close();
+      if (pending) await pending;
+      const closing = [...sockets].map((socket) => new Promise((resolve) => { socket.once("close", resolve); socket.destroy(); }));
+      await Promise.all(closing);
+      if (broker.listening) await new Promise((resolve) => broker.close(resolve));
+      await brokerClosing;
+      assert.equal(sockets.size, 0);
+    }
+    console.log("stop-generation authoritative acquire " + mode + " final disposition ok (actual MCP/fake broker)");
+  }
+}
+
+async function incompatibleCleanupCancellationCoverage() {
+  for (const mode of ["before-acquire-cancel", "busy-cancel", "delayed-grant-cancel", "success",
+    "lost-acquire-ack", "lost-stop-ack", "lost-release-ack"]) {
+    const fixtureState = path.join(root, "incompatible-cleanup-" + mode);
+    fs.mkdirSync(fixtureState, { recursive: true });
+    const env = { ...process.env, RAIL_CONNECTOR_STATE_DIR: fixtureState,
+      CLAUDE_CONFIG_DIR: path.join(fixtureState, "config"), RAIL_CONNECTOR_ALLOWED_ROOTS: repoRoot,
+      RAIL_CONNECTOR_CLAUDE_PATH: wrapper };
+    const noSpawn = path.join(fixtureState, "no-subprocess.mjs");
+    fs.writeFileSync(noSpawn, [
+      'import childProcess from "node:child_process";',
+      'import { syncBuiltinESMExports } from "node:module";',
+      'for (const key of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"]) {',
+      '  childProcess[key] = () => { throw new Error("Owned compatibility fixture forbids subprocess launches"); };',
+      '}',
+      'syncBuiltinESMExports();',
+    ].join("\n"));
+    const token = randomUUID().replaceAll("-", "").repeat(2);
+    const paths = windowsBrokerPaths(env, token);
+    fs.writeFileSync(paths.tokenFile, token, { flag: "wx" });
+    const sessionName = "synthetic-incompatible-cleanup";
+    const pair = { expectedGenerationId: "00000000-0000-4000-8000-000000000000",
+      expectedStartedAtMs: Date.now() - 10_000 };
+    const records = [];
+    const sockets = new Set();
+    let gate;
+    let fixtureError;
+    const broker = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on("error", () => {});
+      socket.once("close", () => sockets.delete(socket));
+      let buffer = "";
+      let handled = false;
+      socket.on("data", (chunk) => {
+        buffer += chunk;
+        if (handled || !buffer.includes("\n")) return;
+        handled = true;
+        try {
+          const request = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+          assert.equal(request.token, token);
+          records.push({ operation: request.operation, payload: request.payload });
+          const reply = (result) => {
+            if (!socket.destroyed) socket.end(JSON.stringify({ ok: true, result }) + "\n");
+          };
+          if (request.operation === "status") {
+            const status = () => reply({ protocol: 1, version: "synthetic-incompatible-broker",
+              launchPolicyFingerprint: windowsBrokerLaunchPolicyFingerprint(env), pid: process.pid,
+              managedSessions: [{ name: sessionName, cwd: repoRoot, canonicalCwd: canonicalWorkspace,
+                generationId: pair.expectedGenerationId, startedAtMs: pair.expectedStartedAtMs,
+                exited: false, args: [] }] });
+            if (mode === "before-acquire-cancel") gate = status;
+            else status();
+          } else if (request.operation === "acquireCleanupLease") {
+            const grant = () => reply({ status: mode === "busy-cancel" ? "busy" : "acquired" });
+            if (mode === "lost-acquire-ack") socket.destroy();
+            else if (mode === "busy-cancel" || mode === "delayed-grant-cancel") gate = grant;
+            else grant();
+          } else if (request.operation === "cleanupStop") {
+            if (mode === "lost-stop-ack") socket.destroy();
+            else reply({ status: "stopped", exitCode: 0 }); // Synthetic receipt, not native exit proof.
+          } else if (request.operation === "releaseCleanupLease") {
+            if (mode === "lost-release-ack") socket.destroy();
+            else reply({ status: "released" });
+          } else assert.fail("unexpected compatibility operation " + request.operation);
+        } catch (error) {
+          fixtureError ??= error;
+          socket.destroy();
+        }
+      });
+    });
+    await new Promise((resolve, reject) => { broker.once("error", reject); broker.listen(paths.pipeName, resolve); });
+    const transport = new StdioClientTransport({ command: process.execPath,
+      args: ["--import", pathToFileURL(noSpawn).href, "src/index.js"], cwd: repoRoot, env, stderr: "pipe" });
+    const client = new Client({ name: "owned-incompatible-cleanup", version: "1.0.0" }, { capabilities: {} });
+    let stderr = "";
+    transport.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-16384); });
+    const send = transport.send.bind(transport);
+    let toolId;
+    transport.send = (message, options) => {
+      if (message.method === "tools/call") toolId = message.id;
+      return send(message, options);
+    };
+    let pending;
+    let responses = 0;
+    try {
+      await client.connect(transport);
+      const onmessage = transport.onmessage;
+      transport.onmessage = (message, extra) => {
+        if (message.id === toolId && (message.result || message.error)) responses++;
+        onmessage?.(message, extra);
+      };
+      pending = client.callTool({ name: "stop_remote_control", arguments: {
+        managedSession: sessionName, graceful: false, force: true,
+      } }, undefined, { timeout: 15000 }).then((value) => ({ value }), (error) => ({ error }));
+      if (mode.endsWith("-cancel")) {
+        await waitCancellationFixture(() => gate, "compatibility request must reach its gated boundary");
+        await client.notification({ method: "notifications/cancelled", params: { requestId: toolId } });
+        await client.listTools(); // Public FIFO barrier before the status/acquire reply is released.
+        gate(); gate = undefined;
+        if (mode === "delayed-grant-cancel") {
+          await waitCancellationFixture(() => records.some((r) => r.operation === "releaseCleanupLease"),
+            "a grant received after cancellation must still release its exact original lease");
+        }
+        await client.close();
+        await transport.close();
+        assert.equal((await pending).value, undefined, "cancelled compatibility request must suppress its response");
+        assert.equal(responses, 0);
+        assert.equal(stderr.includes("cancelled_request_cleanup"), false,
+          "known refusal/release after cancellation must not claim unknown cleanup");
+      } else {
+        const outcome = await pending;
+        assert.equal(outcome.error, undefined);
+        const failed = mode.startsWith("lost-");
+        assert.equal(outcome.value.isError === true, failed, contentText(outcome.value));
+        const expected = mode === "lost-acquire-ack" ? { delivery: "not_dispatched", lease: "released" }
+          : mode === "lost-stop-ack" ? { delivery: "possibly_delivered", lease: "released" }
+          : mode === "lost-release-ack" ? { delivery: "acknowledged", lease: "unknown" }
+          : { delivery: "acknowledged", lease: "released" };
+        assert.deepEqual(outcome.value._meta?.["rail-connector/control-outcome"], expected,
+          "emitted metadata must reflect final release disposition, not a dispatch-time snapshot");
+        if (mode === "lost-acquire-ack") assert.match(contentText(outcome.value), /lease outcome is unknown.*no stop was run/i);
+        if (mode === "lost-stop-ack") assert.match(contentText(outcome.value), /stop outcome is unknown.*do not replay/i);
+        if (mode === "lost-release-ack") assert.match(contentText(outcome.value), /lease release acknowledgement is unknown.*TTL is not proof/i);
+        if (!failed) {
+          const result = JSON.parse(contentText(outcome.value));
+          assert.equal(result.status, "stopped");
+          assert.equal(result.compatibilityCleanup, true);
+          assert.equal(result.terminalCaptureRead, false);
+        }
+        const diagnostic = JSON.stringify(outcome.value);
+        for (const excluded of [token, sessionName, pair.expectedGenerationId]) {
+          assert.equal(diagnostic.includes(excluded), false,
+            "uncertain compatibility outcomes must not disclose token/session identity");
+        }
+      }
+      assert.equal(fixtureError, undefined);
+      const acquire = records.filter((r) => r.operation === "acquireCleanupLease");
+      const stop = records.filter((r) => r.operation === "cleanupStop");
+      const release = records.filter((r) => r.operation === "releaseCleanupLease");
+      assert.equal(acquire.length, mode === "before-acquire-cancel" ? 0 : 1, "cancel/unknown never authorizes a retry");
+      assert.equal(stop.length, ["success", "lost-stop-ack", "lost-release-ack"].includes(mode) ? 1 : 0);
+      assert.equal(release.length, ["before-acquire-cancel", "busy-cancel"].includes(mode) ? 0 : 1);
+      for (const record of [...acquire, ...stop, ...release]) {
+        assert.equal(record.payload.sessionName, sessionName);
+        assert.equal(record.payload.expectedGenerationId, pair.expectedGenerationId);
+        assert.equal(record.payload.expectedStartedAtMs, pair.expectedStartedAtMs);
+        assert.equal(record.payload.leaseId, acquire[0].payload.leaseId);
+        assert.equal(typeof record.payload.leaseId, "string");
+      }
+      assert.equal(records.some((r) => !["status", "acquireCleanupLease", "cleanupStop", "releaseCleanupLease"].includes(r.operation)), false,
+        "compatibility cleanup must not capture, send input, Enter, start, upgrade or use unbound normal leases");
+    } finally {
+      gate?.();
+      await client.close();
+      await transport.close();
+      if (pending) await pending;
+      const closed = [...sockets].map((socket) => new Promise((resolve) => { socket.once("close", resolve); socket.destroy(); }));
+      await Promise.all(closed);
+      if (broker.listening) await new Promise((resolve) => broker.close(resolve));
+      assert.equal(sockets.size, 0);
+    }
+    console.log("stop-generation incompatible cleanup " + mode + " exact outcome ok (actual MCP/fake broker)");
+  }
+}
+
+async function uncertainSubmissionAnchorCoverage() {
+  for (const mode of ["lost-ack", "preflight-blocked"]) {
+    const fixtureState = path.join(root, "submission-anchor-" + mode);
+    const fixtureConfig = path.join(fixtureState, "config");
+    fs.mkdirSync(fixtureState, { recursive: true });
+    const env = { ...process.env, RAIL_CONNECTOR_STATE_DIR: fixtureState, CLAUDE_CONFIG_DIR: fixtureConfig,
+      RAIL_CONNECTOR_ALLOWED_ROOTS: repoRoot, RAIL_CONNECTOR_CLAUDE_PATH: wrapper };
+    const token = randomUUID().replaceAll("-", "").repeat(2);
+    const paths = windowsBrokerPaths(env, token);
+    fs.writeFileSync(paths.tokenFile, token, { flag: "wx" });
+    const sessionName = "synthetic-submission-anchor";
+    const sessionId = "67676767-6767-4676-8676-676767676767";
+    const pair = { expectedGenerationId: "00000000-0000-4000-8000-000000000000", expectedStartedAtMs: Date.now() - 10_000 };
+    const metadata = { name: sessionName, cwd: repoRoot, canonicalCwd: canonicalWorkspace,
+      generationId: pair.expectedGenerationId, startedAtMs: pair.expectedStartedAtMs, resolvedSessionId: sessionId,
+      args: [], exited: false, requestedPosture: { permissionMode: "default" }, resolvedPosture: { permissionMode: "default" } };
+    const logFile = path.join(fixtureConfig, "projects", canonicalWorkspace.replace(/[^A-Za-z0-9]/g, "-"), sessionId + ".jsonl");
+    fs.mkdirSync(path.dirname(logFile), { recursive: true });
+    const append = (record) => fs.appendFileSync(logFile, JSON.stringify({
+      uuid: randomUUID(), sessionId, timestamp: new Date().toISOString(), ...record,
+    }) + "\n");
+    append({ type: "user", message: { role: "user", content: "synthetic baseline before first submission" } });
+    let phase = "first";
+    let sends = 0;
+    const records = [];
+    const sockets = new Set();
+    const broker = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on("error", () => {});
+      socket.once("close", () => sockets.delete(socket));
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk;
+        if (!buffer.includes("\n")) return;
+        const request = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+        records.push({ operation: request.operation, payload: request.payload });
+        const reply = (result) => socket.end(JSON.stringify({ ok: true, result }) + "\n");
+        if (request.operation === "ping") reply({ version: WINDOWS_BROKER_VERSION, launchPolicyFingerprint: windowsBrokerLaunchPolicyFingerprint(env) });
+        else if (request.operation === "status") reply({ version: WINDOWS_BROKER_VERSION,
+          launchPolicyFingerprint: windowsBrokerLaunchPolicyFingerprint(env), managedSessions: [metadata] });
+        else if (request.operation === "conditionalMetadata") {
+          assert.equal(request.payload.expectedGenerationId, pair.expectedGenerationId);
+          assert.equal(request.payload.expectedStartedAtMs, pair.expectedStartedAtMs);
+          reply({ metadata });
+        } else if (request.operation === "acquireLease") reply({ status: "acquired", generationId: pair.expectedGenerationId, startedAtMs: pair.expectedStartedAtMs });
+        else if (request.operation === "releaseLease") reply({ status: "released" });
+        else if (request.operation === "capture") {
+          const idle = phase === "first" || phase === "second-ready";
+          reply({ capture: idle ? "> " : "ctrl-c to cancel" });
+        } else if (request.operation === "sendText") {
+          sends++;
+          assert.equal(request.payload.expectedGenerationId, pair.expectedGenerationId);
+          assert.equal(request.payload.expectedStartedAtMs, pair.expectedStartedAtMs);
+          if (sends === 1) {
+            append({ type: "user", message: { role: "user", content: request.payload.text } });
+            phase = "first-sent";
+            reply({ status: "sent", bracketedPasteUsed: true });
+          } else {
+            assert.equal(mode, "lost-ack", "preflight refusal must not begin another delivery");
+            phase = "waiting";
+            socket.destroy();
+          }
+        } else assert.fail("unexpected anchor fixture operation " + request.operation);
+      });
+    });
+    await new Promise((resolve, reject) => { broker.once("error", reject); broker.listen(paths.pipeName, resolve); });
+    const transport = new StdioClientTransport({ command: process.execPath, args: ["src/index.js"], cwd: repoRoot, env, stderr: "pipe" });
+    const client = new Client({ name: "owned-submission-anchor", version: "1.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      const submit = (text) => client.callTool({ name: "submit_prompt", arguments: {
+        managedSession: sessionName, text, submitRetries: 0, ...pair,
+      } });
+      const first = await submit("synthetic first anchored prompt");
+      assert.equal(first.isError, undefined, contentText(first));
+      const firstResult = JSON.parse(contentText(first));
+      assert.equal(firstResult.status, "submitted");
+      const cursor = parsePortableWaitCursor(firstResult.waitAfterCursor);
+      assert.equal(cursor.generationId, pair.expectedGenerationId);
+      assert.equal(cursor.startedAtMs, pair.expectedStartedAtMs);
+      assert.equal(cursor.resolvedSessionId, sessionId);
+      append({ type: "assistant", message: { role: "assistant", stop_reason: "end_turn",
+        content: [{ type: "text", text: "synthetic completed first turn" }] } });
+      const completionLogHash = createHash("sha256").update(fs.readFileSync(logFile)).digest("hex");
+      phase = mode === "lost-ack" ? "second-ready" : "blocked";
+      const second = await submit("synthetic second uncertain prompt");
+      if (mode === "lost-ack") {
+        assert.equal(second.isError, true);
+        assert.match(contentText(second), /Broker mutation outcome is unknown/);
+        assert.equal(sends, 2, "the second prompt must reach its one uncertain sendText");
+      } else {
+        assert.equal(second.isError, undefined, contentText(second));
+        assert.equal(JSON.parse(contentText(second)).status, "preflight_blocked");
+        assert.equal(sends, 1, "preflight-blocked submission must not clear the anchor by delivering");
+      }
+      assert.equal(createHash("sha256").update(fs.readFileSync(logFile)).digest("hex"), completionLogHash,
+        "the synthetic old completion must be the last log record throughout the second attempt");
+      phase = "waiting";
+      const waited = await client.callTool({ name: "wait_for_claude_turn", arguments: {
+        managedSession: sessionName, timeoutSeconds: 1, pollIntervalMs: 250, lines: 20,
+      } }); // Deliberately no cursor or pair: exercise the actual remembered anchor.
+      assert.equal(waited.isError, undefined, contentText(waited));
+      const result = JSON.parse(contentText(waited));
+      console.log("stop-generation submission anchor " + mode + " " + JSON.stringify({ status: result.status,
+        completionEvidence: result.completionEvidence ?? null, sends }));
+      assert.equal(result.signals.state, "busy", "neutral non-idle terminal must avoid latest_settled_turn fallback");
+      assert.equal(result.status, mode === "lost-ack" ? "timeout" : "completed",
+        "a new possible delivery invalidates the old anchor; a preflight refusal preserves it");
+      if (mode === "preflight-blocked") assert.equal(result.completionEvidence, "after_cursor_changed");
+      else assert.notEqual(result.completionEvidence, "after_cursor_changed");
+      const acquired = records.filter((record) => record.operation === "acquireLease");
+      const released = records.filter((record) => record.operation === "releaseLease");
+      assert.equal(acquired.length, 2);
+      assert.equal(released.length, 2);
+      for (let index = 0; index < released.length; index++) {
+        assert.equal(released[index].payload.leaseId, acquired[index].payload.leaseId);
+        assert.equal(released[index].payload.expectedGenerationId, pair.expectedGenerationId);
+        assert.equal(released[index].payload.expectedStartedAtMs, pair.expectedStartedAtMs);
+      }
+    } finally {
+      await client.close();
+      await transport.close();
+      const closing = [...sockets].map((socket) => new Promise((resolve) => { socket.once("close", resolve); socket.destroy(); }));
+      await Promise.all(closing);
+      if (broker.listening) await new Promise((resolve) => broker.close(resolve));
+      assert.equal(sockets.size, 0);
+    }
+  }
+}
+
+async function uncertainStartLeaseCoverage() {
+  for (const mode of ["lost-reply"]) {
+    const fixtureState = path.join(root, "start-reserved-lease-" + mode);
+    fs.mkdirSync(fixtureState, { recursive: true });
+    const env = { ...process.env, RAIL_CONNECTOR_STATE_DIR: fixtureState,
+      CLAUDE_CONFIG_DIR: path.join(fixtureState, "config"), RAIL_CONNECTOR_ALLOWED_ROOTS: repoRoot,
+      RAIL_CONNECTOR_CLAUDE_PATH: process.execPath };
+    const probeAudit = path.join(fixtureState, "inert-probes.jsonl");
+    const preload = path.join(fixtureState, "inert-capabilities-no-spawn.mjs");
+    fs.writeFileSync(preload, [
+      'import fs from "node:fs";',
+      'import childProcess from "node:child_process";',
+      'import { syncBuiltinESMExports } from "node:module";',
+      'import { promisify } from "node:util";',
+      `const audit = ${JSON.stringify(probeAudit)};`,
+      `const executable = ${JSON.stringify(process.execPath)};`,
+      'const record = (kind) => fs.appendFileSync(audit, JSON.stringify({ kind }) + "\\n");',
+      'const deny = () => { record("denied-subprocess"); throw new Error("Owned start fixture forbids subprocess launches"); };',
+      'for (const key of ["spawn", "spawnSync", "exec", "execSync", "execFileSync", "fork"]) childProcess[key] = deny;',
+      'const inspect = (file, args) => {',
+      '  if (fs.realpathSync.native(file).toLowerCase() !== fs.realpathSync.native(executable).toLowerCase()) return deny();',
+      '  const key = JSON.stringify(args);',
+      '  if (![\'["--version"]\', \'["--help"]\', \'["--effort=ultracode","--version"]\', \'["--effort=rail-invalid-probe","--version"]\'].includes(key)) return deny();',
+      '  record(key);',
+      '  if (args[0] === "--effort=rail-invalid-probe") { const error = new Error("synthetic invalid effort"); error.code = 64; error.stderr = "Unknown effort"; throw error; }',
+      '  return { stdout: args[0] === "--help" ? "Usage: claude [options]\\n --permission-mode <mode> (choices: default, dontAsk)\\n --remote-control [name]\\n" : "2.1.234 (inert start capability fixture)\\n", stderr: "" };',
+      '};',
+      'const inertExecFile = (file, args, options, callback) => {',
+      '  if (typeof callback !== "function") return deny();',
+      '  queueMicrotask(() => { try { const result = inspect(file, args); callback(null, result.stdout, result.stderr); } catch (error) { callback(error); } });',
+      '};',
+      'inertExecFile[promisify.custom] = async (file, args) => inspect(file, args);',
+      'childProcess.execFile = inertExecFile;',
+      'syncBuiltinESMExports();',
+    ].join("\n"));
+    const token = randomUUID().replaceAll("-", "").repeat(2);
+    const paths = windowsBrokerPaths(env, token);
+    fs.writeFileSync(paths.tokenFile, token, { flag: "wx" });
+    const records = [];
+    const sockets = new Set();
+    const broker = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on("error", () => {});
+      socket.once("close", () => sockets.delete(socket));
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk;
+        if (!buffer.includes("\n")) return;
+        const request = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+        // Never retain the launch payload's environment/argv as evidence.
+        records.push({ operation: request.operation, leaseId: request.payload?.leaseId ?? null });
+        const reply = (result) => socket.end(JSON.stringify({ ok: true, result }) + "\n");
+        if (request.operation === "ping") reply({ version: WINDOWS_BROKER_VERSION,
+          launchPolicyFingerprint: windowsBrokerLaunchPolicyFingerprint(env) });
+        else if (request.operation === "acquireLease") reply({ status: "not_running" });
+        else if (request.operation === "status") reply({ version: WINDOWS_BROKER_VERSION,
+          launchPolicyFingerprint: windowsBrokerLaunchPolicyFingerprint(env), managedSessions: [] });
+        else if (request.operation === "start") {
+          assert.equal(typeof request.payload.leaseId, "string");
+          assert.ok(request.payload.leaseId.length > 0, "start must carry the reserved lease identity");
+          socket.destroy();
+        } else assert.fail("uncertain start must not dispatch " + request.operation);
+      });
+    });
+    await new Promise((resolve, reject) => { broker.once("error", reject); broker.listen(paths.pipeName, resolve); });
+    const transport = new StdioClientTransport({ command: process.execPath,
+      args: ["--import", pathToFileURL(preload).href, "src/index.js"], cwd: repoRoot, env, stderr: "pipe" });
+    const client = new Client({ name: "owned-uncertain-start-lease", version: "1.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      const outcome = await client.callTool({ name: "start_remote_control", arguments: {
+        managedSession: "synthetic-uncertain-start-lease", cwd: repoRoot,
+      } });
+      assert.equal(outcome.isError, true);
+      assert.match(contentText(outcome), /Broker mutation outcome is unknown/);
+      const control = outcome._meta?.["rail-connector/control-outcome"];
+      console.log("stop-generation reserved start lease " + mode + " " + JSON.stringify(control));
+      assert.deepEqual(control, { delivery: "possibly_delivered", lease: "unknown" },
+        "a lost reserved-start reply cannot prove absence of a broker-owned lease");
+      const acquisitions = records.filter(({ operation }) => operation === "acquireLease");
+      const starts = records.filter(({ operation }) => operation === "start");
+      assert.equal(acquisitions.length, 1);
+      assert.equal(starts.length, 1, "an uncertain launch must not be retried");
+      assert.equal(starts[0].leaseId, acquisitions[0].leaseId);
+      assert.equal(records.some(({ operation }) => ["releaseLease", "releaseCleanupLease", "stop", "cleanupStop", "replace"].includes(operation)), false,
+        "no generation reply means no guessed exact release or recovery mutation");
+      const probes = fs.readFileSync(probeAudit, "utf8").trim().split("\n").map((line) => JSON.parse(line).kind);
+      assert.equal(probes.length, 4);
+      assert.equal(probes.includes("denied-subprocess"), false, "capability callbacks must remain inert and no process launch may be attempted");
+    } finally {
+      await client.close();
+      await transport.close();
+      const closing = [...sockets].map((socket) => new Promise((resolve) => { socket.once("close", resolve); socket.destroy(); }));
+      await Promise.all(closing);
+      if (broker.listening) await new Promise((resolve) => broker.close(resolve));
+      assert.equal(sockets.size, 0);
+    }
+  }
+}
+
+async function waitCancellationFixture(predicate, message) {
+  const deadline = performance.now() + 3000;
+  while (!predicate()) {
+    assert.ok(performance.now() < deadline, message);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+
 async function defaultStopGenerationCoverage() {
+  await cancellationMutationCoverage();
   await conditionalStopRejectsWithoutBroker();
   await pairedReviewOperationsRejectWithoutBroker();
   await client.connect(transport, { timeout: 30000 });
@@ -2472,6 +3216,11 @@ async function defaultStopGenerationCoverage() {
     before: await initialExitSnapshot(),
     expectedSyntheticTuple: { generationId: initialMetadata.generationId, startedAtMs: initialMetadata.startedAtMs, resolvedSessionId: initialMetadata.resolvedSessionId },
   };
+  assert.equal(initialExitDiagnostic.before.readable, true);
+  assert.equal(initialExitDiagnostic.before.present, true);
+  assert.equal(initialExitDiagnostic.before.exited, false);
+  assert.equal(initialExitDiagnostic.before.generationMatchesInitial, true);
+  const expectedExitTuple = initialExitDiagnostic.before.syntheticTuple;
   const initialExitDiagnosticFile = path.join(root, "initial-exit-status.json");
   fs.writeFileSync(initialExitDiagnosticFile, `${JSON.stringify(initialExitDiagnostic, null, 2)}\n`);
   const initialExit = await callTool("send_text", {
@@ -2482,7 +3231,20 @@ async function defaultStopGenerationCoverage() {
   initialExitDiagnostic.after = await initialExitSnapshot();
   initialExitDiagnostic.sendTextIsError = initialExit.isError === true;
   fs.writeFileSync(initialExitDiagnosticFile, `${JSON.stringify(initialExitDiagnostic, null, 2)}\n`);
-  assert.equal(initialExit.isError, undefined, contentText(initialExit));
+  // The broker rechecks sendability after its final pacing wait. A prompt
+  // that deliberately exits this fixture can therefore be refused as exited
+  // instead of being acknowledged as sent. Accept only that exact clean exit;
+  // any other error, missing identity, drift or abnormal exit still fails.
+  if (initialExit.isError === true) {
+    assert.equal(contentText(initialExit), `Managed native Windows Claude session has exited: ${managedSession}`);
+    assert.equal(initialExitDiagnostic.after.readable, true);
+    assert.equal(initialExitDiagnostic.after.present, true);
+    assert.equal(initialExitDiagnostic.after.exited, true);
+    assert.equal(initialExitDiagnostic.after.exitCode, 0);
+    assert.deepEqual(initialExitDiagnostic.after.syntheticTuple, expectedExitTuple);
+  } else {
+    assert.equal(initialExit.isError, undefined, contentText(initialExit));
+  }
   let exited = null;
   const exitDeadline = Date.now() + 5000;
   while (!exited?.exited && Date.now() < exitDeadline) {
@@ -2495,6 +3257,11 @@ async function defaultStopGenerationCoverage() {
   }
   assert.equal(exited?.generationId, initialMetadata.generationId);
   assert.equal(exited?.exited, true, "the original generation must exit before name reuse");
+  assert.equal(exited?.exitCode, 0);
+  assert.deepEqual({
+    pid: exited.pid, generationId: exited.generationId,
+    startedAtMs: exited.startedAtMs, resolvedSessionId: exited.resolvedSessionId,
+  }, expectedExitTuple);
 
   const replacement = await callTool("start_remote_control", {
     cwd: workspace,
@@ -2632,9 +3399,15 @@ async function defaultStopGenerationCoverage() {
 
 const focusedWaitTerminal = process.argv.includes("--wait-terminal-generation-only");
 const focusedCaptureTerminal = process.argv.includes("--capture-terminal-generation-only");
+const focusedCancellation = process.argv.includes("--cancellation-contract-only");
+const focusedIncompatibleCleanup = process.argv.includes("--incompatible-cleanup-contract-only");
 let primaryError = null;
 try {
-  if (focusedCaptureTerminal) {
+  if (focusedIncompatibleCleanup) {
+    await incompatibleCleanupCancellationCoverage();
+  } else if (focusedCancellation) {
+    await cancellationMutationCoverage();
+  } else if (focusedCaptureTerminal) {
     await client.connect(transport, { timeout: 30000 });
     await productionBoundaryHookIsInert();
     await captureTerminalGenerationCoverage();

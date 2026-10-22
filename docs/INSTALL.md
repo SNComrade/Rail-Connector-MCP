@@ -6,8 +6,9 @@ Install the MCP in the same OS context as Codex and Claude Code.
 - [Linux/WSL Install](LINUX.md)
 - [macOS Install](MACOS.md)
 
-Tagged release instructions use the immutable `v1.0.0-beta.4` source. Clone
-without `--branch` only when intentionally evaluating mutable `main`.
+The commands below use mutable `main`. To install a published release, use
+the instructions shipped in its immutable tag; older installers do not define
+all current switches.
 
 ## Requirements
 
@@ -23,17 +24,22 @@ without `--branch` only when intentionally evaluating mutable `main`.
 Linux/macOS:
 
 ```bash
-git clone --branch v1.0.0-beta.4 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 ./install.sh
 ```
 
 Windows:
 
+For an existing installation, first follow the [Windows upgrade order](WINDOWS.md#upgrade),
+including authorized session stops and old-broker shutdown through the old client.
+Then close MCP clients using the checkout and use a separate PowerShell window.
+`-ClientsClosed` acknowledges that preparation; it performs none of those steps.
+
 ```powershell
-git clone --branch v1.0.0-beta.4 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
-.\install-windows.ps1
+.\install-windows.ps1 -ClientsClosed
 ```
 
 To expose explicitly authorized local-host bypass mode on Linux/macOS:
@@ -45,7 +51,7 @@ To expose explicitly authorized local-host bypass mode on Linux/macOS:
 On Windows:
 
 ```powershell
-.\install-windows.ps1 -BypassPolicy LocalHost -AllowedRoot "$HOME\Projects"
+.\install-windows.ps1 -BypassPolicy LocalHost -AllowedRoot "$HOME\Projects" -ClientsClosed
 ```
 
 Use `-CodexPath <absolute-path>` when Codex CLI discovery needs an explicit
@@ -94,9 +100,11 @@ Machine-wide Claude agent details require `includeAgentDetails: true`.
 
 ## Upgrade
 
-For a release install, fetch and check out the new immutable tag shown in its
-release notes. A deliberate `main` development checkout may instead use
-`git pull --ff-only origin main`.
+For a release install, first complete the platform-specific prerequisites below.
+On Windows, old-client stops, closed clients and unchanged-target CheckOnly must
+precede tag checkout or any other source/dependency replacement. Then fetch and
+check out the immutable tag shown in its release notes. A deliberate `main`
+development checkout may instead use `git pull --ff-only origin main`.
 
 Linux/macOS:
 
@@ -106,22 +114,24 @@ git checkout --detach "v<new-version>"
 ./install.sh --bypass-policy LocalHost --allowed-root "$HOME/projects"
 ```
 
-Windows:
+Windows: follow the complete [Windows upgrade order](WINDOWS.md#upgrade)
+**before `git pull`, `npm ci`, or any native dependency replacement**. Through
+the old client, stop only authorized sessions, verify their exits, shut down the
+old broker through its authenticated no-start route, then close affected clients.
+For the first transition, use the reviewed new checkout's installer with
+`-CheckOnly -ClientsClosed -TargetRoot <old-checkout>` while the old target is
+unchanged. A missing old shutdown route or uncertain ownership blocks replacement.
 
-```powershell
-git fetch --tags origin
-git checkout --detach "v<new-version>"
-.\install-windows.ps1 -BypassPolicy LocalHost -AllowedRoot "$HOME\Projects"
-```
+After that check, keep clients closed, update the target and run its new
+installer with `-ClientsClosed`; it repeats the guard before dependency
+replacement and registration. Choose the same bypass policy or explicitly select
+`Disabled`. Custom-state registration needs the separate documented route.
+CheckOnly performs no replacement, but its Restart Manager query creates transient
+Windows session state. It is not an atomic lock or permission to stop unrelated
+work. Reopen a fresh Codex task only after the guarded upgrade and verification.
 
-Use the same policy selected for the existing install, or explicitly choose
-`Disabled`. Open a fresh Codex task so it loads the new tool schema and process
-environment. Windows broker sessions may survive the client refresh. A broker
-upgrade refuses to strand active sessions, so stop an
-explicitly reported previous-build session before retrying the refresh.
-Token-derived brokers supporting compatibility cleanup can be force-stopped by
-the refreshed MCP without reading terminal capture; historical-pipe brokers
-still require their original MCP process.
+For Linux/macOS, use the existing policy or explicitly choose `Disabled`, then
+open a fresh Codex task to load the new schema and process environment.
 
 ## CI Coverage
 

@@ -19,6 +19,66 @@ Mutation operations are serialized per managed session. On Windows, the broker
 also leases mutations across independent MCP clients so concurrent Codex agents
 cannot interleave prompt text, keys, rename commands, or stop requests.
 
+## Request Cancellation And Connection Closure
+
+MCP cancellation is scoped to the exact request ID, including numeric `0`, an
+empty string, and distinct numeric/string IDs. It cancels read-only polling and
+prevents unsent mutations. A cancelled queued operation remains in the session's
+ordering chain until its predecessor finishes, so a later operation cannot pass
+an active predecessor. Duplicate active IDs close that connection through the
+same cleanup barrier; unknown cancellation IDs do not create retained state.
+Cancellation is bound synchronously to the currently admitted generation. It
+cannot target a later request that reuses that ID, including reuse in the same
+parser chunk or while the SDK retires an older handler.
+
+Cancellation does not undo delivered input. A dispatched Windows lease acquisition
+must settle before an exact original-generation release can complete. A lost grant
+or release reply is reported as unknown; lease expiry is not proof of release.
+An authoritative stale-generation rejection of the exact release is recorded as
+`generation_changed`, without claiming release of the replacement. Available tool
+results include redacted categories in `_meta["rail-connector/control-outcome"]`.
+An acquisition whose reply was lost cannot fall through to an unleased operation
+or authorize another acquisition. Only a provably undispatched unavailable
+endpoint retains the existing fallback. Product mutations with uncertain replies
+are not replayed, and cancellation prevents later separate Enter/retry calls.
+The same lost-reply and exact-release rules apply after an authoritative broker
+upgrade refusal permits a new acquisition attempt.
+An authoritative acquisition refusal records that no lease was acquired; it
+does not report an unknown grant or emit an unknown-lease cleanup event.
+An unacknowledged launch can also leave a broker-owned lease whose new generation
+is unknown. The outcome stays unknown; this client does not guess a release identity.
+An already-dispatched native `sendText` RPC may finish its combined chunks and
+Enter; this client cannot retract or interrupt those broker-side actions.
+
+A new `submit_prompt` delivery attempt discards the previous remembered turn
+anchor before sending, including when the new acknowledgement is lost. A
+`preflight_blocked` result preserves that anchor because no delivery began.
+Unbound idle waits can still report the latest settled turn; this does not make
+that old turn the completion of an uncertain new submission.
+
+Client EOF, output failure and parser/transport closure stop admission, cancel
+safe waits, and await owned operations and their lease/finally cleanup before
+closing the SDK transport. Shared capability probes belong to the MCP process;
+cancelling one waiter detaches it while other waiters continue. Their bounded
+owned subprocess work is included in EOF cleanup. No unrelated managed session
+or persistent broker is stopped because a request or connection closes.
+If one capability probe fails early, its bounded sibling probes still settle
+before their shared result and EOF cleanup complete.
+
+Response write callbacks, drain, errors and close settle once and remove their
+listeners. The response-drain deadline is two seconds after the operation's
+cleanup; connection closure also allows at most two seconds for remaining
+responses after owned cleanup. This is not a two-second total shutdown promise:
+already-dispatched work retains its existing bounded RPC/pacing and release
+budgets. A drained response does not prove the client received it. Cancelled
+mutations emit only redacted delivery/lease outcome categories on stderr, without
+request IDs, prompts, transcript text or session URLs.
+
+The focused synthetic contract checks are `node test/stdio-lifecycle.mjs` and
+`node test/stop-generation.mjs --cancellation-contract-only`. Injected writable
+checks and native Windows fake-pipe/owned-child checks are distinct from POSIX
+qualification, ConPTY descendant extinction, and actual account/model behavior.
+
 ## Inspect Capabilities
 
 `get_claude_capabilities` runs bounded `claude --version`, `claude --help`, and
@@ -286,8 +346,13 @@ Linux/macOS:
 
 Windows:
 
+For an existing installation, first follow the [Windows upgrade order](WINDOWS.md#upgrade),
+including authorized session stops and old-broker shutdown through the old client.
+Then close MCP clients using the checkout and use a separate PowerShell window.
+`-ClientsClosed` acknowledges that preparation; it performs none of those steps.
+
 ```powershell
-.\install-windows.ps1 -BypassPolicy LocalHost
+.\install-windows.ps1 -BypassPolicy LocalHost -ClientsClosed
 ```
 
 Use `Disabled` to remove the opt-in or `Isolated` for the legacy isolation
@@ -441,14 +506,64 @@ authorized but no budget is supplied, bound Claude to at most 3 workflow
 agents, one pass, no recursive delegation, 5 findings, 10 minutes, and 200k
 aggregate tokens. Stop and synthesize when any bound is reached.
 
-The tool uses Unicode-safe chunks, bracketed paste only when the terminal
-reports that mode enabled, a short Windows paste-settle delay, JSONL prompt
+The tool uses Unicode-safe chunks, confirmed bracketed paste, a short
+Windows paste-settle delay, JSONL prompt
 acknowledgement, and bounded Enter retries. After the first Enter it also polls
 a short visibility window so a delayed pasted-text placeholder can appear
 before it decides whether a retry is needed. It refuses to type over busy,
 approval, trust, limit, or non-empty composer states unless `force: true` is
 explicitly supplied. The result reports whether bracketed paste was requested
-and actually used.
+and actually used. Missing or contradictory backend delivery evidence is an
+error, not assumed framing; the first backend call may already have written
+input, so inspect the composer before retrying that error.
+
+`auto` requests framing. If mode support is unavailable or cannot be observed,
+it permits literal fallback only when the prompt contains no TAB, CR or LF,
+and reports `bracketedPasteUsed: false` with a delivery warning. Multiline/TAB
+input is refused before input writes instead of being sent as keystrokes.
+Explicit `bracketed` mode requires confirmed framing for every prompt, including
+single-line text. All framed intent rejects ESC and other C0/C1 terminal controls
+before capture/preflight/input, including with `force: true`; TAB, LF, CR,
+ordinary Unicode and line endings are retained without normalization.
+Explicit `literal` and the low-level raw `send_text` API keep their intentional
+raw terminal semantics and are not covered by this framed-input protection.
+
+Windows flushes pending renderer output before checking mode support and
+rechecks after paced waits, before closing the frame and before Enter. If a recheck
+observes lost mode support after partial delivery, it sends no further input and leaves
+the generation recovery-only; no repair frame or automatic replay is attempted.
+The check observes screen output already received, not a guarantee that the TUI
+cannot change immediately afterward.
+
+On tmux, one targeted server command chooses confirmed framed paste or the
+allowed literal/refusal branch, with explicit delivery evidence. After the
+ordinary settle delay, framed Enter is separately gated on the same pane's
+current mode; a refusal then means the body was already pasted and requires
+composer inspection. Older supported tmux versions that cannot report the
+bracketed-paste mode refuse restricted input honestly; this does not silently
+raise the general tmux minimum or treat conditional `paste-buffer -p` as proof.
+
+An exact framed/literal nonce line records `paste-buffer -d` consumption before
+late cancellation, even when a later hook adds output or fails. Delivery success
+still requires a successful command and the clean whole delivery receipt.
+Successful raw `paste-buffer -d` also records consumption. Known consumption
+never triggers buffer cleanup or a replay.
+
+Uncertain load/paste outcomes and mode refusals use one shielded internal cleanup
+command list: `set-buffer -b OWNED x` replaces/creates only the generated owned
+name with inert text, then a server-side exact-top conditional deletes only that
+owned name. This avoids older tmux's missing-name delete fallback. An after-set
+hook may change the top; the guard then refuses deletion and cleanup remains
+`ECLEANUP`/UNCONFIRMED, although a completed exact set replaced the prompt text.
+A positive cleanup nonce acknowledges the guarded delete action. An after-delete
+hook can recreate the owned name before that nonce; final absence under arbitrary
+hooks is not established. Lost/wrong cleanup receipts or failed commands also
+report UNCONFIRMED, without
+claiming buffer absence or guessing input delivery. Aggregate failures retain
+the original error message/cause and carry `ECLEANUP`. The cleanup option is
+internal, suppresses delivery-dispatch accounting, and does not replace shielding.
+No shell, separate query/delete, unrelated buffer deletion, global lock, version
+floor change or automatic replay is introduced.
 
 Keyword mode requires an empty composer even with `force: true`. A draft or
 unresolved paste placeholder returns `preflight_blocked` with reason
@@ -479,7 +594,7 @@ input, then brackets the remaining text and sends one Enter inside the same
 managed mutation. It preserves multiline content and Unicode, requires active
 bracketed-paste support, and rejects malformed prefixes or terminal control
 characters before sending input. It is currently Windows-only; normal modes
-retain their existing cross-platform behavior. The receipt reports
+are cross-platform under the framing requirements above. The receipt reports
 `literalPrefixCharacters: 10`; check `transcriptAcknowledged` and the returned
 wait cursor normally. CLI 2.1.289 logs bracketed-paste input inside an
 id-matched `<pasted_content id="...">` pair, after a blank line (and after the typed
@@ -662,12 +777,56 @@ When the middle was skipped, head-only model, effort, and permission posture is
 discarded rather than presented as current. Any workflow launch or pending
 state from the head remains historical evidence, but current workflow state is
 reported as `unknown_due_to_gap` with `workflowObservationUncertain: true`, a
-null `workflowPendingCount`, and `claude_session_log_incomplete` evidence until
-the tail supplies a current explicit global counter or bound interruption.
-Such a checkpoint can restore current-state certainty; a counter still cannot
-clear known pending workflows by itself. The MCP does not replay the skipped
-middle. Coverage remains `head_tail` and the skipped-byte count remains, so
-aggregate snapshot completion cannot use that observation as full history.
+null `workflowPendingCount`, and `claude_session_log_incomplete` evidence unless
+a separate complete workflow reconstruction succeeds. This reconstruction reads
+every byte through one captured file extent, in physical record order, using
+the same launch/task/run, counter, terminal-notification and interruption rules.
+A counter cannot clear known pending workflows by itself. No range is skipped
+because its first timestamp is old, and idle or an ordinary `end_turn` is never
+workflow completion evidence.
+
+Reconstruction is limited to 16 MiB, 100,000 nonempty records, 8 MiB per record,
+4,096 active task identities and a one-second cooperative deadline. The deadline
+is checked around reads and parses; an individual OS read or synchronous parse
+is not forcibly cancelled. Exhaustion, short/failed reads, invalid UTF-8,
+malformed/partial records or ambiguous session/timestamp evidence leave workflow
+certainty incomplete, even if a later tail counter or interruption looks idle.
+Workflow timestamps must be strings interpreted by the same date parser as the
+launch filter. Each fully parsed record may be excluded by that filter's exact
+timestamp cutoff; this never excludes a surrounding range or relies on ordering.
+Decoded incomplete records share the existing process-wide 32 MiB fragment
+allowance and release their reservations on completion, refusal or failure.
+Only workflow fields are retained for reconstruction. Their logical string
+payload is limited during replay to 128 Ki UTF-16 code units per cached
+projection, conservatively counting aliases, collection keys/values, timestamps
+and counter identity arrays. Overflow refuses recovery without truncating or
+dropping pending identities. Across the existing 128 cache entries this caps
+that logical string payload at 32 MiB; collection overhead, temporary parsed
+objects and process RSS are not covered by this bound.
+The file handle and current path must retain the captured identity, size, mtime
+and ctime through validation. Append/rewrite/rotation during the scan refuses
+the candidate. An unchanged observation can reuse completed evidence or a
+deterministic refusal only after ordinary cache guards and the unchanged
+metadata tuple validate. This avoids replaying an unchanged malformed or
+unsupported range on every wait poll. Byte/record/identity/retained-string limits,
+malformed/partial JSON and invalid encoding remain conservatively unknown until
+the source changes; a later counter alone cannot complete a failed range.
+Transient deadline, read, file-change, `future_timestamp` and shared-fragment-budget
+failures are not retained as refusals. A future timestamp is rechecked even when
+the file is unchanged, because advancing the clock may make it current.
+Each later append requires a new bounded replay from
+byte zero. This assumes
+cooperative local filesystem metadata, not an adversarial immutable snapshot.
+
+`workflowActivity.reconstruction` reports `status` (`complete` or `incomplete`),
+a closed refusal `reason`, `bytesRead`, `recordsRead` and cache reuse when
+applicable. On a cache hit these counts describe the original proof attempt,
+not new reconstruction I/O. Coverage remains `head_tail` and the skipped-byte count remains:
+this proof restores only workflow certainty, never head-only posture or full
+UltraCode history. A complete workflow proof can support the existing verified
+snapshot-completion and stale-terminal-wait reconciliation rules without
+claiming complete posture/history coverage. Existing snapshot identity,
+generation, timestamp and counter checks still apply.
 While current-state uncertainty remains, it fails
 closed as `workflowPending: true`, so ordinary submit, text, Enter, rename,
 replacement, and stop operations remain blocked. Inspect before using an
@@ -691,9 +850,9 @@ window before appended records are accepted; the digest is extended during the
 incremental read instead of re-reading the file, and unchanged observations do
 not rehash it. Unchanged file metadata is never trusted by itself: stored
 boundary guards are still compared before cached state is reused. Oversized
-logs remain head/tail-bounded; a later authoritative record may restore current
-state without triggering an unbounded full replay or relabeling skipped history
-as complete. A valid final JSON object is accepted without requiring a trailing
+logs retain head/tail posture coverage; workflow reconstruction remains bounded
+and cannot relabel skipped posture/history as complete. A valid final JSON object
+is accepted without requiring a trailing
 newline, while a genuinely partial record remains uncertain.
 Timestamp-regressing release records and untracked completions cannot release
 newer workflow evidence.

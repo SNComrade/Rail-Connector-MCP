@@ -183,8 +183,13 @@ with the user's authorization.
 
 If policy is disabled, configure it in the same OS context as Codex:
 
+For an existing installation, first follow the [Windows upgrade order](../../../../docs/WINDOWS.md#upgrade),
+including authorized session stops and old-broker shutdown through the old client.
+Then close MCP clients using the checkout and use a separate PowerShell window.
+`-ClientsClosed` acknowledges that preparation; it performs none of those steps.
+
 ```powershell
-.\install-windows.ps1 -BypassPolicy LocalHost
+.\install-windows.ps1 -BypassPolicy LocalHost -ClientsClosed
 ```
 
 ```bash

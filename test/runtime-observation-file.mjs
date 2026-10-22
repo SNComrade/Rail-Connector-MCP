@@ -17,6 +17,10 @@ const {
   runtimeObservationFromRecords,
   sessionRuntimeObservation,
   freshWorkflowSnapshotLogIdentity,
+  reconstructWorkflowObservation,
+  signalsWithWorkflowActivity,
+  lifecycleBlockReason,
+  waitTurnDecision,
 } = await import(
   `../src/index.js?runtime-observation=${Date.now()}`
 );
@@ -86,21 +90,22 @@ try {
   assert.equal(initial.evidence.permissionMode, "");
   assert.equal(initial.evidence.model, "");
   assert.equal(initial.evidence.effort, "");
-  assert.equal(initial.workflowActivity.state, "unknown_due_to_gap");
+  assert.equal(initial.workflowActivity.state, "pending");
   assert.equal(initial.workflowActivity.launchObserved, true);
   assert.equal(initial.workflowActivity.launchStatus, "async_launched");
-  assert.equal(initial.workflowActivity.pendingCount, null);
-  assert.equal(initial.workflowActivity.lastKnownPendingCount, 1);
-  assert.equal(initial.workflowActivity.pendingObservedAt, "");
+  assert.equal(initial.workflowActivity.pendingCount, 1);
+  assert.equal(initial.workflowActivity.lastKnownPendingCount, null);
+  assert.equal(initial.workflowActivity.pendingObservedAt, "2026-08-18T08:00:03Z");
   assert.equal(
     initial.workflowActivity.lastObservedAt,
     "2026-08-18T08:00:03Z"
   );
   assert.equal(
     initial.workflowActivity.evidence,
-    "claude_session_log_incomplete"
+    "claude_session_log"
   );
-  assert.equal(initial.workflowActivity.observationUncertain, true);
+  assert.equal(initial.workflowActivity.observationUncertain, false);
+  assert.equal(initial.workflowActivity.reconstruction.status, "complete");
   assert.equal(initial.workflowActivity.observationCoverage, "head_tail");
   assert.ok(initial.workflowActivity.observationSkippedBytes > 0);
   assert.doesNotMatch(
@@ -130,7 +135,7 @@ try {
   );
   assert.equal(blockedSubmit.status, "preflight_blocked");
   assert.equal(blockedSubmit.reason, "workflow_pending");
-  assert.equal(blockedSubmit.signals.workflowObservationUncertain, true);
+  assert.equal(blockedSubmit.signals.workflowObservationUncertain, false);
   assert.equal(mutationCount, 0);
 
   fs.appendFileSync(
@@ -153,11 +158,11 @@ try {
   assert.equal(appended.permissionMode, null);
   assert.equal(appended.model, "claude-fable-5-1");
   assert.equal(appended.effort, "max");
-  assert.equal(appended.workflowActivity.state, "unknown_due_to_gap");
+  assert.equal(appended.workflowActivity.state, "pending");
   assert.equal(appended.workflowActivity.launchObserved, true);
-  assert.equal(appended.workflowActivity.pendingCount, null);
-  assert.equal(appended.workflowActivity.lastKnownPendingCount, 1);
-  assert.equal(appended.workflowActivity.observationUncertain, true);
+  assert.equal(appended.workflowActivity.pendingCount, 1);
+  assert.equal(appended.workflowActivity.lastKnownPendingCount, null);
+  assert.equal(appended.workflowActivity.observationUncertain, false);
   assert.equal(appended.workflowActivity.observationCoverage, "head_tail");
 
   fs.appendFileSync(
@@ -179,13 +184,13 @@ try {
     "utf8"
   );
   const terminalResultOnly = await sessionRuntimeObservation(metadata);
-  assert.equal(terminalResultOnly.workflowActivity.state, "unknown_due_to_gap");
-  assert.equal(terminalResultOnly.workflowActivity.pendingCount, null);
-  assert.equal(terminalResultOnly.workflowActivity.lastKnownPendingCount, 1);
-  assert.equal(terminalResultOnly.workflowActivity.observationUncertain, true);
+  assert.equal(terminalResultOnly.workflowActivity.state, "launch_observed");
+  assert.equal(terminalResultOnly.workflowActivity.pendingCount, 0);
+  assert.equal(terminalResultOnly.workflowActivity.lastKnownPendingCount, null);
+  assert.equal(terminalResultOnly.workflowActivity.observationUncertain, false);
   assert.equal(
     terminalResultOnly.workflowActivity.lastObservedAt,
-    "2026-08-18T08:00:03Z"
+    "2026-08-18T09:00:02Z"
   );
 
   fs.appendFileSync(
@@ -475,7 +480,8 @@ try {
   const beforeInterruption = await sessionRuntimeObservation(
     interruptionMetadata
   );
-  assert.equal(beforeInterruption.workflowActivity.observationUncertain, true);
+  assert.equal(beforeInterruption.workflowActivity.observationUncertain, false);
+  assert.equal(beforeInterruption.workflowActivity.pendingCount, 1);
   fs.appendFileSync(
     interruptionLogFile,
     jsonl([
@@ -1477,8 +1483,8 @@ try {
     resolvedSessionId: replaySessionId,
     startedAtMs,
   });
-  assert.equal(boundedGap.workflowActivity.state, "idle_count_observed");
-  assert.equal(boundedGap.workflowActivity.pendingCount, 0);
+  assert.equal(boundedGap.workflowActivity.state, "pending");
+  assert.equal(boundedGap.workflowActivity.pendingCount, 1);
   assert.equal(boundedGap.workflowActivity.observationUncertain, false);
   assert.equal(boundedGap.workflowActivity.observationCoverage, "head_tail");
   const replayBytes = fs.readFileSync(replayLogFile);
@@ -1499,7 +1505,7 @@ try {
   );
   assert.equal(
     boundedGap.workflowActivity.lastObservedAt,
-    "2026-08-18T15:30:15Z"
+    "2026-08-18T15:30:20Z"
   );
   assert.doesNotMatch(
     JSON.stringify(boundedGap),
@@ -2512,6 +2518,395 @@ try {
     JSON.stringify(noNewline),
     /no-newline-private-name|no-newline-private-task-id/
   );
+
+  // Complete workflow reconstruction is independent of posture/history replay.
+  const recoverySession = "34343434-3434-4343-8343-343434343434";
+  const recoveryFile = path.join(projectDirectory, `${recoverySession}.jsonl`);
+  const recoveryMetadata = { cwd, resolvedSessionId: recoverySession, startedAtMs };
+  const recoveryRecord = (record) => ({ sessionId: recoverySession, ...record });
+  const recoveryLaunch = recoveryRecord({
+    timestamp: "2026-08-18T18:00:02Z",
+    toolUseResult: { taskType: "local_workflow", status: "async_launched",
+      workflowName: "synthetic-private-workflow", taskId: "recover-task", runId: "recover-run" },
+  });
+  const recoveryTerminal = recoveryRecord({
+    timestamp: "2026-08-18T18:00:03Z",
+    toolUseResult: { taskType: "local_workflow", status: "completed",
+      taskId: "recover-task", runId: "recover-run" },
+  });
+  const recoveryHead = recoveryRecord({ timestamp: "2026-08-18T18:00:01Z",
+    type: "permission-mode", permissionMode: "bypassPermissions" });
+  const recoveryFiller = (bytes) => recoveryRecord({
+    timestamp: "2026-08-18T07:00:00Z", padding: "x".repeat(bytes),
+  });
+  const workflowConclusion = (observation) => Object.fromEntries([
+    "state", "launchObserved", "launchStatus", "pendingCount", "lastKnownPendingCount",
+    "pendingObservedAt", "lastObservedAt", "observationUncertain",
+  ].map((key) => [key, observation.workflowActivity[key]]));
+
+  // Exact threshold boundaries, not just approximate megabyte sizes.
+  for (const extent of [2359295, 2359296, 2359297]) {
+    const records = [recoveryHead, recoveryLaunch, recoveryTerminal, recoveryFiller(0)];
+    records.at(-1).padding = "x".repeat(extent - Buffer.byteLength(jsonl(records)));
+    fs.writeFileSync(recoveryFile, jsonl(records));
+    assert.equal(fs.statSync(recoveryFile).size, extent);
+    const observation = await sessionRuntimeObservation({ ...recoveryMetadata, generationId: `threshold-${extent}` });
+    assert.equal(observation.workflowActivity.pendingCount, 0);
+    assert.equal(observation.workflowActivity.observationUncertain, false);
+    assert.equal(observation.workflowActivity.observationCoverage, extent > 2359296 ? "head_tail" : "full");
+    if (extent > 2359296) {
+      assert.equal(observation.permissionMode, null);
+      assert.equal(observation.workflowActivity.reconstruction.status, "complete");
+      assert.equal(observation.workflowActivity.reconstruction.bytesRead, extent);
+    }
+  }
+
+  // Same final bytes observed incrementally and cold, including unordered time.
+  fs.writeFileSync(recoveryFile, jsonl([recoveryHead, recoveryLaunch]));
+  const incrementalMetadata = { ...recoveryMetadata, generationId: "incremental" };
+  assert.equal((await sessionRuntimeObservation(incrementalMetadata)).workflowActivity.pendingCount, 1);
+  fs.appendFileSync(recoveryFile, jsonl([recoveryFiller(2500000), recoveryTerminal]));
+  const incrementalRecovery = await sessionRuntimeObservation(incrementalMetadata);
+  const coldRecovery = await sessionRuntimeObservation({ ...recoveryMetadata, generationId: "cold" });
+  assert.deepEqual(workflowConclusion(coldRecovery), workflowConclusion(incrementalRecovery));
+  assert.equal(coldRecovery.permissionMode, null);
+  assert.equal(coldRecovery.ultraEffortAttachment.historyCoverage, "partial");
+  assert.equal((await sessionRuntimeObservation({ ...recoveryMetadata, generationId: "cold" }))
+    .workflowActivity.reconstruction.cacheHit, true);
+  const recoveredSignals = signalsWithWorkflowActivity({ state: "busy", terminalState: "idle",
+    terminalBusy: false, workflowPending: true }, coldRecovery.workflowActivity);
+  assert.equal(recoveredSignals.workflowPending, false, "complete identity-bound replay supersedes only the stale waiting row");
+  assert.equal(lifecycleBlockReason(recoveredSignals), "");
+  assert.equal(waitTurnDecision({ signals: recoveredSignals, transcript: {
+    turnComplete: true, lastAssistant: { cursor: "new-complete-record" },
+  } }).status, "completed");
+  let recoveredWrites = 0;
+  assert.equal((await runSubmitPrompt({ managedSession: "synthetic-recovery", text: "synthetic prompt", force: false }, {
+    capture: async () => "> ", sendText: async () => { recoveredWrites += 1; return { bracketedPasteUsed: true }; },
+    sendKey: async () => { recoveredWrites += 1; }, delay: async () => {},
+    promptAcknowledged: async () => true, runtimeObservation: async () => coldRecovery,
+  })).status, "submitted");
+  assert.ok(recoveredWrites > 0);
+  assert.equal(lifecycleBlockReason(signalsWithWorkflowActivity({ state: "approval_required",
+    terminalState: "approval_required" }, coldRecovery.workflowActivity)), "approval_required");
+
+  // An old first tail timestamp never permits skipping a hidden active launch.
+  const unorderedRecords = [recoveryFiller(350000), recoveryLaunch, recoveryFiller(2200000),
+    recoveryRecord({ timestamp: "2026-08-18T18:00:01Z", pendingWorkflowCount: 0 }),
+    recoveryRecord({ timestamp: "2026-08-18T18:00:04Z", message: {
+      role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } }),
+  ];
+  fs.writeFileSync(recoveryFile, jsonl(unorderedRecords));
+  const unordered = await sessionRuntimeObservation({ ...recoveryMetadata, generationId: "unordered" });
+  assert.equal(unordered.workflowActivity.pendingCount, 1);
+  assert.equal(unordered.workflowActivity.reconstruction.status, "complete");
+  const pendingSignals = signalsWithWorkflowActivity({ state: "idle", terminalState: "idle" }, unordered.workflowActivity);
+  assert.equal(lifecycleBlockReason(pendingSignals), "workflow_pending");
+  assert.equal(waitTurnDecision({ signals: pendingSignals, transcript: { turnComplete: true } }).evidence, "workflow_pending");
+  assert.equal((await runSubmitPrompt({ managedSession: "synthetic-pending", text: "must not send" }, {
+    capture: async () => "> ", sendText: async () => assert.fail("active workflow must block"),
+    sendKey: async () => assert.fail("active workflow must block"),
+    runtimeObservation: async () => unordered,
+  })).reason, "workflow_pending");
+
+  // Bounded reader tests use only in-memory JSONL and injected reads/clock.
+  const scanBytes = async (input, options = {}, readOverride = null) => {
+    const bytes = Buffer.isBuffer(input) ? input : Buffer.from(input);
+    const handle = { read: async (target, offset, length, position) => {
+      if (readOverride) return readOverride(target, offset, length, position, bytes);
+      const bytesRead = bytes.copy(target, offset, position, position + length);
+      return { bytesRead };
+    } };
+    return reconstructWorkflowObservation(handle, bytes.length, recoveryMetadata, options);
+  };
+  const completeBytes = jsonl([recoveryLaunch, recoveryTerminal]);
+  assert.equal((await scanBytes(completeBytes)).proof.status, "complete");
+  assert.equal((await scanBytes(completeBytes.trimEnd())).proof.status, "complete");
+  for (const [options, reason] of [
+    [{ maxBytes: 1 }, "byte_limit"], [{ maxRecords: 1 }, "record_limit"],
+    [{ maxRecordBytes: 1 }, "record_too_large"], [{ timeoutMs: 0 }, "deadline"],
+  ]) assert.equal((await scanBytes(completeBytes, options)).proof.reason, reason);
+  let clock = 0;
+  assert.equal((await scanBytes(completeBytes, { now: () => clock }, async (target, offset, length, position, bytes) => {
+    const bytesRead = bytes.copy(target, offset, position, position + length);
+    clock = 1001;
+    return { bytesRead };
+  })).proof.reason, "deadline", "a read finishing beyond the deadline cannot publish proof");
+  assert.equal((await scanBytes(completeBytes, {}, async () => ({ bytesRead: 0 }))).proof.reason, "short_read");
+  assert.equal((await scanBytes(completeBytes, {}, async () => { throw new Error("synthetic read error"); })).proof.reason, "read_error");
+  assert.equal((await scanBytes(`${jsonl([recoveryLaunch])}{bad}\n${jsonl([recoveryTerminal])}`)).proof.reason, "malformed_record");
+  assert.equal((await scanBytes(`${completeBytes}{"unfinished":`)).proof.reason, "partial_record");
+  assert.equal((await scanBytes(Buffer.concat([Buffer.from(completeBytes), Buffer.from([0xc3])]))).proof.reason, "invalid_encoding");
+  assert.equal((await scanBytes(jsonl([{ ...recoveryLaunch, timestamp: undefined }, recoveryTerminal]))).proof.reason, "identity_ambiguous");
+  assert.equal((await scanBytes(jsonl([{ ...recoveryLaunch,
+    timestamp: Date.parse(recoveryLaunch.timestamp) }]))).proof.reason, "identity_ambiguous",
+  "numeric timestamps cannot pass validation and then become untimestamped in the generation filter");
+  assert.equal((await scanBytes(jsonl([{ ...recoveryLaunch, sessionId }, recoveryTerminal]))).proof.reason, "identity_ambiguous");
+  assert.equal((await scanBytes(jsonl([{ ...recoveryLaunch, sessionId,
+    timestamp: new Date(startedAtMs - 1).toISOString() }, recoveryLaunch, recoveryTerminal])))
+    .state.pendingWorkflowCount, 0, "an individually parsed old foreign record is safely outside the exact run-identity cutoff");
+  assert.equal((await scanBytes(jsonl([{ ...recoveryLaunch, sessionId,
+    timestamp: new Date(startedAtMs).toISOString() }]))).proof.reason, "identity_ambiguous");
+  assert.equal((await scanBytes(jsonl([recoveryRecord({ pendingWorkflowCount: 1,
+    sessionId, timestamp: new Date(startedAtMs - 5000).toISOString() })]))).proof.reason, "identity_ambiguous",
+  "counter records preserve the existing five-second attribution allowance");
+  const mismatch = { ...recoveryTerminal, toolUseResult: { ...recoveryTerminal.toolUseResult, runId: "wrong-run" } };
+  const mismatchState = await scanBytes(jsonl([recoveryLaunch, mismatch, recoveryRecord({
+    timestamp: "2026-08-18T18:00:04Z", pendingWorkflowCount: 0,
+  })]));
+  assert.equal(mismatchState.state.pendingWorkflowCount, 1);
+  const unicodeBytes = jsonl([{ ...recoveryLaunch, toolUseResult: {
+    ...recoveryLaunch.toolUseResult, workflowName: "synthetic-\u20ac-\ud83d\ude80" } }, recoveryTerminal]);
+  assert.equal((await scanBytes(unicodeBytes, {}, async (target, offset, length, position, bytes) => ({
+    bytesRead: bytes.copy(target, offset, position, position + Math.min(length, 1)),
+  }))).proof.status, "complete", "UTF-8 codepoints may cross read boundaries");
+  let oversizedRead = false;
+  assert.equal((await reconstructWorkflowObservation({ read: async () => {
+    oversizedRead = true;
+    assert.fail("source extent beyond cap must not be read");
+  } }, 16 * 1024 * 1024 + 1, recoveryMetadata)).proof.reason, "byte_limit");
+  assert.equal(oversizedRead, false);
+
+  const irrelevantPayload = "x".repeat(800000);
+  const projectionOnly = await scanBytes(jsonl([{ ...recoveryLaunch,
+    type: "custom-title", customTitle: irrelevantPayload, version: "2.1.1",
+    permissionMode: "bypassPermissions", url: irrelevantPayload,
+    message: { role: "assistant", model: irrelevantPayload },
+  }, recoveryTerminal]));
+  assert.equal(projectionOnly.proof.status, "complete");
+  for (const field of ["titleCandidates", "permissionMode", "model", "claudeVersion", "remoteUrl", "searchTextParts",
+    "runtimeUntimestampedRecords", "ultraEffortAttachmentTransitionEvents"]) {
+    assert.equal(Object.hasOwn(projectionOnly.state, field), false, `${field} must not be retained in the workflow cache projection`);
+  }
+  const oversizedIdentityInput = jsonl([{ ...recoveryLaunch, toolUseResult: {
+    ...recoveryLaunch.toolUseResult, taskId: "t".repeat(40000), runId: "r".repeat(40000),
+  } }, recoveryFiller(2500000)]);
+  const oversizedIdentity = await scanBytes(oversizedIdentityInput);
+  assert.equal(oversizedIdentity.proof.reason, "retained_string_limit");
+  assert.equal(oversizedIdentity.state, null, "pending identities must not be truncated or silently dropped");
+  assert.ok(oversizedIdentity.proof.bytesRead < Buffer.byteLength(oversizedIdentityInput),
+    "retained string ceiling is enforced during reduction, before EOF");
+
+  // Five 7 MiB incomplete records would exceed the shared 32 MiB logical
+  // fragment allowance. Pause after each holds 6 MiB so the contention is real.
+  const largeFragment = Buffer.from(jsonl([recoveryFiller(7 * 1024 * 1024)]));
+  let heldReaders = 0;
+  let readyReaders;
+  let releaseReaders;
+  const readersReady = new Promise((resolve) => { readyReaders = resolve; });
+  const readersReleased = new Promise((resolve) => { releaseReaders = resolve; });
+  const contended = Array.from({ length: 5 }, () => scanBytes(largeFragment, { now: () => 0 },
+    async (target, offset, length, position, bytes) => {
+      if (position === 6 * 1024 * 1024) {
+        if (++heldReaders === 5) readyReaders();
+        await readersReleased;
+      }
+      return { bytesRead: bytes.copy(target, offset, position, position + length) };
+    }));
+  await readersReady;
+  releaseReaders();
+  const contentionResults = await Promise.all(contended);
+  assert.ok(contentionResults.some(({ proof }) => proof.reason === "buffer_limit"));
+  assert.ok(contentionResults.some(({ proof }) => proof.status === "complete"));
+  assert.ok(contentionResults.every(({ proof }) => proof.status === "complete" || proof.reason === "buffer_limit"));
+  const readFailure = await scanBytes(largeFragment, { now: () => 0 },
+    async (target, offset, length, position, bytes) => {
+      if (position >= 5 * 1024 * 1024) throw new Error("synthetic failure with held fragments");
+      return { bytesRead: bytes.copy(target, offset, position, position + length) };
+    });
+  assert.equal(readFailure.proof.reason, "read_error");
+  let throwClock = false;
+  await assert.rejects(scanBytes(largeFragment, { now: () => {
+    if (throwClock) throw new Error("synthetic exceptional exit");
+    return 0;
+  } }, async (target, offset, length, position, bytes) => {
+    const bytesRead = bytes.copy(target, offset, position, position + length);
+    if (position >= 5 * 1024 * 1024) throwClock = true;
+    return { bytesRead };
+  }), /synthetic exceptional exit/);
+  const afterFailure = await Promise.all(Array.from({ length: 4 }, () =>
+    scanBytes(largeFragment, { now: () => 0 })));
+  assert.ok(afterFailure.every(({ proof }) => proof.status === "complete"),
+    "failure, refusal, success and thrown exits release their exact shared fragment charges");
+
+  // Strict failure cannot be cleared by a later counter/interrupt in the tail.
+  fs.writeFileSync(recoveryFile, `${jsonl([recoveryFiller(350000)])}{bad}\n${jsonl([
+    recoveryFiller(2200000), recoveryRecord({ timestamp: "2026-08-18T18:00:05Z", pendingWorkflowCount: 0 }),
+    recoveryRecord({ timestamp: "2026-08-18T18:00:06Z", interruptedMessageId: "synthetic-interruption" }),
+  ])}`);
+  const malformedRecovery = await sessionRuntimeObservation({ ...recoveryMetadata, generationId: "malformed" });
+  assert.equal(malformedRecovery.workflowActivity.reconstruction.reason, "malformed_record");
+  assert.equal(malformedRecovery.workflowActivity.observationUncertain, true);
+  assert.equal(malformedRecovery.workflowActivity.pendingCount, null);
+  assert.equal(lifecycleBlockReason(signalsWithWorkflowActivity({ state: "idle" }, malformedRecovery.workflowActivity)), "workflow_pending");
+  const originalFailureOpen = fs.promises.open;
+  let failureReplayReads = 0;
+  fs.promises.open = async function (file, ...args) {
+    const handle = await originalFailureOpen.call(this, file, ...args);
+    if (file !== recoveryFile) return handle;
+    return new Proxy(handle, { get(target, property) {
+      if (property === "read") return async (...readArgs) => {
+        if (readArgs[3] === 0 && readArgs[2] === 256 * 1024) failureReplayReads += 1;
+        return target.read(...readArgs);
+      };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  };
+  try {
+    const failureReused = await sessionRuntimeObservation({ ...recoveryMetadata, generationId: "malformed" });
+    assert.equal(failureReused.workflowActivity.reconstruction.cacheHit, true);
+    assert.equal(failureReused.workflowActivity.observationUncertain, true);
+    assert.equal(failureReplayReads, 0, "unchanged deterministic failure must not repeat reconstruction reads");
+    fs.appendFileSync(recoveryFile, jsonl([recoveryRecord({ timestamp: "2026-08-18T18:00:07Z", pendingWorkflowCount: 0 })]));
+    const failedAgain = await sessionRuntimeObservation({ ...recoveryMetadata, generationId: "malformed" });
+    assert.equal(failedAgain.workflowActivity.reconstruction.cacheHit, false);
+    assert.equal(failedAgain.workflowActivity.reconstruction.reason, "malformed_record");
+    assert.ok(failureReplayReads > 0, "append invalidates a cached refusal and rechecks the complete range");
+    assert.equal(failedAgain.workflowActivity.pendingCount, null);
+  } finally { fs.promises.open = originalFailureOpen; }
+
+  // A mutation during the complete scan invalidates its candidate. Owned file
+  // only; this wrapper never observes or invokes a real Claude session.
+  fs.writeFileSync(recoveryFile, jsonl([recoveryLaunch, recoveryFiller(2500000), recoveryTerminal]));
+  const originalOpen = fs.promises.open;
+  let injectedMutation = false;
+  let readsFromZero = 0;
+  fs.promises.open = async function (file, ...args) {
+    const handle = await originalOpen.call(this, file, ...args);
+    if (file !== recoveryFile) return handle;
+    return new Proxy(handle, { get(target, property) {
+      if (property === "read") return async (...readArgs) => {
+        const result = await target.read(...readArgs);
+        if (readArgs[3] === 0 && readArgs[2] === 256 * 1024) readsFromZero += 1;
+        if (!injectedMutation && readsFromZero === 2) {
+          injectedMutation = true;
+          fs.appendFileSync(recoveryFile, jsonl([recoveryRecord({ timestamp: "2026-08-18T18:00:07Z", pendingWorkflowCount: 1 })]));
+        }
+        return result;
+      };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  };
+  let changedRecovery;
+  try { changedRecovery = await sessionRuntimeObservation({ ...recoveryMetadata, generationId: "changed-during-scan" }); }
+  finally { fs.promises.open = originalOpen; }
+  assert.equal(injectedMutation, true);
+  assert.equal(changedRecovery.workflowActivity.reconstruction.reason, "file_changed");
+  assert.equal(changedRecovery.workflowActivity.observationUncertain, true);
+  assert.equal((await sessionRuntimeObservation({ ...recoveryMetadata,
+    generationId: "changed-during-scan" })).workflowActivity.pendingCount, 1);
+
+  // No workflow records establishes not_observed, not an invented zero count.
+  const stableMetadata = { ...recoveryMetadata, generationId: "stable-cache" };
+  fs.writeFileSync(recoveryFile, jsonl([recoveryHead, recoveryFiller(2500000)]));
+  const noWorkflow = await sessionRuntimeObservation(stableMetadata);
+  assert.equal(noWorkflow.workflowActivity.state, "not_observed");
+  assert.equal(noWorkflow.workflowActivity.pendingCount, null);
+  assert.equal(noWorkflow.workflowActivity.observationUncertain, false);
+  assert.equal((await sessionRuntimeObservation(stableMetadata)).workflowActivity.reconstruction.cacheHit, true);
+  fs.appendFileSync(recoveryFile, jsonl([recoveryLaunch]));
+  const appendAfterProof = await sessionRuntimeObservation(stableMetadata);
+  assert.equal(appendAfterProof.workflowActivity.pendingCount, 1);
+  assert.equal(appendAfterProof.workflowActivity.reconstruction.cacheHit, false);
+  fs.appendFileSync(recoveryFile, '{"sessionId":');
+  const invalidAppend = await sessionRuntimeObservation(stableMetadata);
+  assert.equal(invalidAppend.workflowActivity.pendingCount, null);
+  assert.equal(invalidAppend.workflowActivity.reconstruction.reason, "partial_record");
+  assert.equal(invalidAppend.workflowActivity.observationUncertain, true);
+  const rotatedRecovery = `${recoveryFile}.owned-rotation`;
+  fs.renameSync(recoveryFile, rotatedRecovery);
+  fs.writeFileSync(recoveryFile, jsonl([recoveryLaunch, recoveryFiller(2500000), recoveryTerminal]));
+  const rotated = await sessionRuntimeObservation(stableMetadata);
+  assert.equal(rotated.workflowActivity.pendingCount, 0);
+  assert.equal(rotated.workflowActivity.reconstruction.cacheHit, false);
+  assert.equal(rotated.permissionMode, null);
+
+  // Snapshot release uses workflow completeness while posture/history remains
+  // head_tail, and cached proof never permanently applies a snapshot overlay.
+  const recoverySnapshotMetadata = { ...recoveryMetadata, generationId: "recovery-snapshot" };
+  fs.writeFileSync(recoveryFile, jsonl([recoveryHead, recoveryLaunch, recoveryFiller(2500000)]));
+  bindSnapshotLog(recoverySnapshotMetadata, recoveryFile);
+  const recoverySnapshotDir = path.join(projectDirectory, recoverySession, "workflows");
+  fs.mkdirSync(recoverySnapshotDir, { recursive: true });
+  fs.writeFileSync(path.join(recoverySnapshotDir, "recover-run.json"), JSON.stringify({
+    status: "completed", taskId: "recover-task", runId: "recover-run",
+    startTime: Date.parse("2026-08-18T18:00:02Z"), timestamp: "2026-08-18T18:00:03Z",
+  }));
+  const recoveredSnapshot = await sessionRuntimeObservation(recoverySnapshotMetadata);
+  assert.equal(recoveredSnapshot.workflowActivity.pendingCount, 0);
+  assert.equal(recoveredSnapshot.workflowActivity.completedSnapshotCount, 1);
+  assert.equal(recoveredSnapshot.workflowActivity.observationCoverage, "head_tail");
+  assert.equal(recoveredSnapshot.permissionMode, null);
+  fs.rmSync(path.join(recoverySnapshotDir, "recover-run.json"));
+  const snapshotRemoved = await sessionRuntimeObservation(recoverySnapshotMetadata);
+  assert.equal(snapshotRemoved.workflowActivity.pendingCount, 1);
+  assert.equal(snapshotRemoved.workflowActivity.completedSnapshotCount, 0);
+  assert.equal(snapshotRemoved.workflowActivity.reconstruction.cacheHit, true);
+
+  // A future timestamp is time-dependent, not an immutable source failure.
+  // The same cold file/generation must recover when the controlled clock moves.
+  fs.writeFileSync(recoveryFile, jsonl([recoveryLaunch, recoveryFiller(2500000)]));
+  const futureMetadata = { ...recoveryMetadata, generationId: "future-clock" };
+  const futureFileStat = fs.statSync(recoveryFile);
+  const originalDateNow = Date.now;
+  try {
+    Date.now = () => Date.parse(recoveryLaunch.timestamp) - 1000;
+    const future = await sessionRuntimeObservation(futureMetadata);
+    assert.equal(future.workflowActivity.reconstruction.reason, "future_timestamp");
+    assert.equal(future.workflowActivity.observationUncertain, true);
+    assert.equal(future.workflowActivity.pendingCount, null);
+    Date.now = () => Date.parse(recoveryLaunch.timestamp) + 1000;
+    const current = await sessionRuntimeObservation(futureMetadata);
+    assert.equal(current.workflowActivity.reconstruction.cacheHit, false);
+    assert.equal(current.workflowActivity.reconstruction.status, "complete");
+    assert.equal(current.workflowActivity.observationUncertain, false);
+    assert.equal(current.workflowActivity.pendingCount, 1);
+    assert.equal(current.workflowActivity.state, "pending");
+  } finally { Date.now = originalDateNow; }
+  const currentFileStat = fs.statSync(recoveryFile);
+  for (const field of ["dev", "ino", "birthtimeMs", "size", "mtimeMs", "ctimeMs"]) {
+    assert.equal(currentFileStat[field], futureFileStat[field], `${field} unchanged across clock-only recovery`);
+  }
+
+  // The normal reducer supports session_id when the primary field is absent,
+  // null or empty. Complete replay must retain that compatibility and still
+  // require an explicit matching identity before canonicalizing the record.
+  const aliasRecord = ({ sessionId: omitted, ...record }) => ({ ...record, session_id: recoverySession });
+  const aliasLaunch = aliasRecord(recoveryLaunch);
+  const aliasTerminal = aliasRecord(recoveryTerminal);
+  const aliasFiller = aliasRecord(recoveryFiller(2500000));
+  const aliasIncrementalMetadata = { ...recoveryMetadata, generationId: "alias-incremental" };
+  fs.writeFileSync(recoveryFile, jsonl([aliasLaunch]));
+  assert.equal((await sessionRuntimeObservation(aliasIncrementalMetadata)).workflowActivity.pendingCount, 1);
+  fs.appendFileSync(recoveryFile, jsonl([aliasFiller, aliasTerminal]));
+  const aliasIncremental = await sessionRuntimeObservation(aliasIncrementalMetadata);
+  const aliasCold = await sessionRuntimeObservation({ ...recoveryMetadata, generationId: "alias-cold" });
+  assert.deepEqual(workflowConclusion(aliasCold), workflowConclusion(aliasIncremental));
+  assert.equal(aliasCold.workflowActivity.reconstruction.status, "complete");
+  assert.equal(aliasCold.workflowActivity.observationCoverage, "head_tail");
+  assert.equal(aliasCold.workflowActivity.pendingCount, 0);
+  fs.writeFileSync(recoveryFile, jsonl([aliasLaunch, aliasFiller]));
+  const aliasPending = await sessionRuntimeObservation({ ...recoveryMetadata, generationId: "alias-pending" });
+  assert.equal(aliasPending.workflowActivity.pendingCount, 1);
+  assert.equal(aliasPending.workflowActivity.observationUncertain, false);
+  for (const primary of [undefined, null, ""]) {
+    const fallback = await scanBytes(jsonl([{ ...aliasLaunch, sessionId: primary },
+      { ...aliasTerminal, sessionId: primary }]));
+    assert.equal(fallback.proof.status, "complete");
+    assert.equal(fallback.state.pendingWorkflowCount, 0);
+  }
+  for (const rejected of [
+    { ...aliasLaunch, session_id: sessionId },
+    { ...aliasLaunch, session_id: undefined },
+    { ...aliasLaunch, sessionId, session_id: recoverySession },
+  ]) assert.equal((await scanBytes(jsonl([rejected]))).proof.reason, "identity_ambiguous");
+  const primaryPrecedence = await scanBytes(jsonl([
+    { ...recoveryLaunch, session_id: sessionId }, { ...recoveryTerminal, session_id: sessionId },
+  ]));
+  assert.equal(primaryPrecedence.state.pendingWorkflowCount, 0,
+    "matching primary identity retains existing matcher precedence over a foreign fallback");
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

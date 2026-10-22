@@ -4,7 +4,7 @@ import net from "node:net";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import * as pty from "node-pty";
-import { createTerminalRenderer, workflowKeywordPrefixLength } from "./terminal.js";
+import { assertFramedPromptText, createTerminalRenderer, workflowKeywordPrefixLength } from "./terminal.js";
 import { verifyNodePtyFix } from "../tools/install-node-pty-fix.mjs";
 import {
   WINDOWS_BROKER_PROTOCOL,
@@ -164,6 +164,16 @@ async function withOperationLock(sessionName, operation) {
     release();
     if (operationLocks.get(sessionName) === current) operationLocks.delete(sessionName);
   }
+}
+
+function reportBrokerError(kind, error, fallbackCode) {
+  const code = typeof error?.code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code)
+    ? error.code
+    : fallbackCode;
+  // Error messages may contain prompts, paths or protocol data. Only a closed
+  // diagnostic kind and sanitized code belong in the broker log.
+  try { process.stderr.write(`windows-broker: ${kind} ${code}\n`); } catch {}
+  return code;
 }
 
 function liveSession(sessionName) {
@@ -443,6 +453,7 @@ function sessionMetadata(sessionName, session) {
     snapshotIdentityBinding: session.snapshotIdentityBinding ?? null,
     observedPosture: session.observedPosture ?? null,
     recoveryOnly: Boolean(session.recoveryOnly),
+    ...(session.terminalErrorCode ? { terminalErrorCode: session.terminalErrorCode } : {}),
     exited: session.exited,
     exitCode: session.exitCode,
   };
@@ -576,7 +587,7 @@ function assertRecoveryGeneration(sessionName, session, payload) {
     !Number.isSafeInteger(payload.expectedStartedAtMs)
   ) {
     const error = new Error(
-      `Session ${sessionName} is recovery-only (after a stop timeout or an interrupted keyword send); stop it with its exact expectedGenerationId and expectedStartedAtMs.`
+      `Session ${sessionName} is recovery-only (after a terminal error, stop timeout or interrupted keyword send); stop it with its exact expectedGenerationId and expectedStartedAtMs.`
     );
     error.code = "EINVAL";
     throw error;
@@ -751,11 +762,32 @@ async function startSession(
         Date.now() + clampInteger(payload.leaseTtlMs, 120000, 5000, 300000),
     },
   };
+  const onTerminalError = (error) => {
+    if (!session.terminalErrorCode) {
+      session.terminalErrorCode = reportBrokerError("terminal_error", error, "EPTY");
+    }
+    // A failed output channel is not child-exit proof. Preserve the generation,
+    // lease and PTY for exact-owned stop until numeric exit evidence arrives.
+    session.recoveryOnly = true;
+  };
+  ptyProcess.on("error", onTerminalError);
+  // In the pinned Windows backend Terminal.on delegates to the output socket.
+  // Its separate input socket has no upstream error listener. Keep this
+  // private-interface access guarded; inert PTY doubles expose the same shape.
+  try {
+    const inputSocket = ptyProcess._agent?.inSocket;
+    if (!inputSocket || typeof inputSocket.on !== "function" ||
+        typeof inputSocket.write !== "function" || typeof inputSocket.destroy !== "function") {
+      onTerminalError({ code: "EPTYINPUT" });
+    } else {
+      inputSocket.on("error", onTerminalError);
+    }
+  } catch (error) { onTerminalError(error); }
   renderer.onData((data) => {
-    if (!session.exited) session.ptyProcess.write(data);
+    if (!session.exited && !session.terminalErrorCode) session.ptyProcess.write(data);
   });
   renderer.onBinary((data) => {
-    if (!session.exited) session.ptyProcess.write(data);
+    if (!session.exited && !session.terminalErrorCode) session.ptyProcess.write(data);
   });
   const observePid = () => {
     const pid = ptyProcess.pid;
@@ -768,8 +800,13 @@ async function startSession(
   });
   ptyProcess.onExit(({ exitCode }) => {
     observePid();
-    session.exitCode = exitCode;
-    session.exited = true;
+    // An output-socket close can emit onExit before the native child exits.
+    // After a channel fault, an undefined code is not child-exit evidence.
+    if (session.terminalErrorCode && !Number.isInteger(exitCode)) return;
+    if (!session.exited) {
+      session.exitCode = exitCode;
+      session.exited = true;
+    }
   });
   sessions.set(sessionName, session);
   // node-pty connects asynchronously after its output worker becomes ready.
@@ -1249,25 +1286,51 @@ async function handleOperation(operation, payload) {
     if (!liveSession(sessionName)) {
       throw new Error(`Managed native Windows Claude session has exited: ${sessionName}`);
     }
-    if (operation === "sendText") {
-      if (session.recoveryOnly) {
-        const error = new Error("Recovery-only session (after a stop timeout or an interrupted keyword send) accepts only an exact-generation stop.");
+    // A terminal fault or exit can arrive while this serialized operation is
+    // awaiting pacing/renderer work. Recheck the captured generation and lease
+    // after every await and immediately before every prompt/key write.
+    const assertSendable = () => {
+      if (sessions.get(sessionName) !== session) {
+        const error = new Error(`Managed session generation changed for ${sessionName}; refusing a stale send.`);
+        error.code = "ESTALE";
+        throw error;
+      }
+      if (session.recoveryOnly || session.terminalErrorCode) {
+        const error = new Error("Recovery-only session (after a terminal error, stop timeout or interrupted keyword send) accepts only an exact-generation stop.");
         error.code = "ERECOVERY";
         throw error;
       }
+      if (session.exited) {
+        throw new Error(`Managed native Windows Claude session has exited: ${sessionName}`);
+      }
+      assertExpectedGeneration(sessionName, session, payload.expectedStartedAtMs, payload.expectedGenerationId);
       assertMutationLease(session, payload.leaseId);
-      assertExpectedGeneration(
-        sessionName,
-        session,
-        payload.expectedStartedAtMs,
-        payload.expectedGenerationId
-      );
+    };
+    const writeToSession = (text) => {
+      assertSendable();
+      session.ptyProcess.write(text);
+    };
+    if (operation === "sendText") {
+      assertSendable();
       if (payload.keywordPrefix !== undefined && typeof payload.keywordPrefix !== "boolean") {
         const error = new Error("keywordPrefix must be a boolean.");
         error.code = "EINVAL";
         throw error;
       }
+      for (const field of ["bracketedPaste", "requireBracketedPaste"]) {
+        if (payload[field] !== undefined && typeof payload[field] !== "boolean") {
+          const error = new Error(`${field} must be a boolean.`);
+          error.code = "EINVAL";
+          throw error;
+        }
+      }
+      if (payload.requireBracketedPaste && !payload.bracketedPaste) {
+        const error = new Error("Strict framing requires bracketedPaste.");
+        error.code = "EINVAL";
+        throw error;
+      }
       const prefixLength = payload.keywordPrefix ? workflowKeywordPrefixLength(payload.text) : 0;
+      if (payload.bracketedPaste && !prefixLength) assertFramedPromptText(payload.text);
       const chunks = textChunks(prefixLength ? payload.text.slice(prefixLength) : payload.text, payload.chunkSize);
       const delayMs = clampInteger(payload.chunkDelayMs, DEFAULT_TEXT_CHUNK_DELAY_MS, 0, 250);
       // A keyword body must leave a real observation window between PTY
@@ -1277,7 +1340,10 @@ async function handleOperation(operation, payload) {
       const keywordChunkDelayMs = prefixLength
         ? Math.max(delayMs, KEYWORD_MODE_OBSERVATION_MS)
         : delayMs;
-      if (prefixLength) await session.renderer.flush();
+      if (payload.bracketedPaste) {
+        await session.renderer.flush();
+        assertSendable();
+      }
       let bracketedPasteUsed =
         Boolean(payload.bracketedPaste) && session.renderer.bracketedPasteMode;
       if (prefixLength && !bracketedPasteUsed) {
@@ -1285,12 +1351,20 @@ async function handleOperation(operation, payload) {
         error.code = "EPASTEMODE";
         throw error;
       }
+      if (payload.bracketedPaste && !bracketedPasteUsed &&
+          (payload.requireBracketedPaste || /[\t\r\n]/.test(payload.text))) {
+        const error = new Error("Bracketed paste is unavailable; no input was sent.");
+        error.code = "EPASTEMODE";
+        throw error;
+      }
       if (prefixLength) {
         // Both segments and the final Enter stay inside one generation-bound
         // operation/lease. Only caller-selected, unchanged prefix bytes are literal.
-        session.ptyProcess.write(payload.text.slice(0, prefixLength));
+        writeToSession(payload.text.slice(0, prefixLength));
         await sleep(DEFAULT_SUBMIT_SETTLE_MS);
+        assertSendable();
         await session.renderer.flush();
+        assertSendable();
         bracketedPasteUsed =
           Boolean(payload.bracketedPaste) && session.renderer.bracketedPasteMode;
         if (!bracketedPasteUsed) {
@@ -1302,15 +1376,17 @@ async function handleOperation(operation, payload) {
           throw error;
         }
       }
-      if (bracketedPasteUsed) session.ptyProcess.write("\x1b[200~");
+      if (bracketedPasteUsed) writeToSession("\x1b[200~");
       for (let index = 0; index < chunks.length; index += 1) {
-        session.ptyProcess.write(chunks[index]);
+        writeToSession(chunks[index]);
         if (prefixLength) {
           // Yield after every body chunk, including when the requested pacing
           // delay is zero, so pending terminal mode output is observed before
           // another chunk, a closing frame, or Enter can be sent.
           await sleep(keywordChunkDelayMs);
+          assertSendable();
           await session.renderer.flush();
+          assertSendable();
           if (!session.renderer.bracketedPasteMode) {
             session.recoveryOnly = true;
             const error = new Error(
@@ -1319,38 +1395,53 @@ async function handleOperation(operation, payload) {
             error.code = "EPASTEMODE";
             throw error;
           }
-        } else if (delayMs > 0 && index + 1 < chunks.length) {
+        } else if ((delayMs > 0 || bracketedPasteUsed) && index + 1 < chunks.length) {
           await sleep(delayMs);
+          assertSendable();
+          if (bracketedPasteUsed) {
+            await session.renderer.flush();
+            assertSendable();
+            if (!session.renderer.bracketedPasteMode) {
+              session.recoveryOnly = true;
+              const error = new Error("Framed body was partially sent, but bracketed-paste support changed; no later body, closing frame, or Enter was sent. This generation is recovery-only.");
+              error.code = "EPASTEMODE";
+              throw error;
+            }
+          }
         }
       }
-      if (prefixLength) {
+      if (bracketedPasteUsed) {
         await session.renderer.flush();
+        assertSendable();
         if (!session.renderer.bracketedPasteMode) {
           session.recoveryOnly = true;
           const error = new Error(
-            "Keyword body was sent, but bracketed-paste support changed before the closing frame; no closing frame or Enter was sent. This generation is recovery-only."
+            `${prefixLength ? "Keyword" : "Framed"} body was sent, but bracketed-paste support changed before the closing frame; no closing frame or Enter was sent. This generation is recovery-only.`
           );
           error.code = "EPASTEMODE";
           throw error;
         }
       }
-      if (bracketedPasteUsed) session.ptyProcess.write("\x1b[201~");
+      if (bracketedPasteUsed) writeToSession("\x1b[201~");
       if (payload.submit) {
         await sleep(clampInteger(payload.submitSettleMs, DEFAULT_SUBMIT_SETTLE_MS, 50, 500));
-        if (prefixLength) {
+        assertSendable();
+        if (bracketedPasteUsed) {
           await session.renderer.flush();
+          assertSendable();
           if (!session.renderer.bracketedPasteMode) {
             session.recoveryOnly = true;
             const error = new Error(
-              "Keyword body and closing frame were sent, but bracketed-paste support changed before Enter; no Enter was sent. This generation is recovery-only."
+              `${prefixLength ? "Keyword" : "Framed"} body and closing frame were sent, but bracketed-paste support changed before Enter; no Enter was sent. This generation is recovery-only.`
             );
             error.code = "EPASTEMODE";
             throw error;
           }
         }
-        session.ptyProcess.write("\r");
+        writeToSession("\r");
       }
       await sleep(400);
+      assertSendable();
       return {
         status: "sent",
         bracketedPasteRequested: Boolean(payload.bracketedPaste),
@@ -1359,20 +1450,10 @@ async function handleOperation(operation, payload) {
       };
     }
     if (operation === "sendKey") {
-      if (session.recoveryOnly) {
-        const error = new Error("Recovery-only session (after a stop timeout or an interrupted keyword send) accepts only an exact-generation stop.");
-        error.code = "ERECOVERY";
-        throw error;
-      }
-      assertMutationLease(session, payload.leaseId);
-      assertExpectedGeneration(
-        sessionName,
-        session,
-        payload.expectedStartedAtMs,
-        payload.expectedGenerationId
-      );
-      session.ptyProcess.write(keySequence(payload.key));
+      assertSendable();
+      writeToSession(keySequence(payload.key));
       await sleep(400);
+      assertSendable();
       return { status: "sent" };
     }
     throw new Error(`Unsupported Windows broker operation: ${operation}`);
@@ -1380,6 +1461,10 @@ async function handleOperation(operation, payload) {
 }
 
 const server = net.createServer((socket) => {
+  socket.on("error", (error) => {
+    reportBrokerError("client_socket_error", error, "ESOCKET");
+    socket.destroy();
+  });
   socket.setEncoding("utf8");
   socket.setTimeout(REQUEST_READ_TIMEOUT_MS);
   socket.on("timeout", () => socket.destroy());
