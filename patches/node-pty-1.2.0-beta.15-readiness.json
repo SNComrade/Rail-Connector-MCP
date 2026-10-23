@@ -2,7 +2,7 @@
   "format": 1,
   "package": "node-pty",
   "version": "1.2.0-beta.15",
-  "fix": "conpty-readiness-budget-v1",
+  "fix": "conpty-readiness-output-worker-cleanup-v2",
   "upstreamIssue": "https://github.com/microsoft/node-pty/issues/955",
   "preservedSafeguards": "https://github.com/microsoft/node-pty/pull/943",
   "patches": [
@@ -40,6 +40,17 @@
         {
           "from": "    conptyInheritCursor?: boolean;\n",
           "to": "    conptyInheritCursor?: boolean;\n\n    /**\n     * Downstream compatibility option: bounded worker-readiness budget in milliseconds.\n     * Integer 1..30000; the unconfigured upstream default remains 5000.\n     * Native connection still requires observed worker readiness.\n     */\n    conptyConnectionTimeout?: number;\n"
+        }
+      ]
+    },
+    {
+      "path": "lib/windowsConoutConnection.js",
+      "sha256Before": "c87159520fc74cb0745f273260cc701cdb9e4c01ab0bae12cb4bd8d7f6e2f7c9",
+      "sha256After": "3950a820de1e49d2433edd688b8cb3c4b03c2b5323e7c07472773f9ade90c5c2",
+      "replacements": [
+        {
+          "from": "    ConoutConnection.prototype.connectSocket = function (socket) {\n        socket.connect((0, conout_1.getWorkerPipeName)(this._conoutPipeName));\n    };",
+          "to": "    ConoutConnection.prototype.connectSocket = function (socket) {\n        var _this = this;\n        // Output close owns cleanup unless an existing kill/failure drain already does.\n        socket.once('close', function () {\n            if (!_this._isDisposed) {\n                _this.dispose();\n            }\n        });\n        socket.connect((0, conout_1.getWorkerPipeName)(this._conoutPipeName));\n    };"
         }
       ]
     }

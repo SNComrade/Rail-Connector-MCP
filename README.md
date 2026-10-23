@@ -21,7 +21,7 @@ only to describe interoperability. See [NOTICE](NOTICE).
 
 ## Status
 
-The current candidate is `1.0.0-beta.4`. Treat
+The current candidate is `1.0.0-beta.5`. Treat
 the MCP tool schemas and response fields as prerelease interfaces until a stable
 release is published. See [Compatibility](COMPATIBILITY.md).
 
@@ -79,7 +79,7 @@ For a published release, clone the immutable tag:
 Linux:
 
 ```bash
-git clone --branch v1.0.0-beta.4 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.5 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
 ./install.sh
 ```
@@ -87,13 +87,25 @@ cd Rail-Connector-MCP
 macOS uses the same installer after the prerequisites in
 [macOS Install](docs/MACOS.md) are present.
 
-Native Windows PowerShell:
+Native Windows PowerShell for `v1.0.0-beta.5`, once published:
+complete the [Windows upgrade preparation](docs/WINDOWS.md#upgrade) on an
+existing installation before replacing source or dependencies. Close affected
+MCP clients and use a separate PowerShell window for installation:
 
 ```powershell
-git clone --branch v1.0.0-beta.4 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
+git clone --branch v1.0.0-beta.5 --depth 1 https://github.com/SNComrade/Rail-Connector-MCP.git
 cd Rail-Connector-MCP
-.\install-windows.ps1
+.\install-windows.ps1 -ClientsClosed
 ```
+
+Historical `v1.0.0-beta.4` installer exception: that tagged installer predates
+`-ClientsClosed` and does not define that parameter; do not pass it to beta.4.
+The beta.5 and current source installers require it. For an existing installation,
+preparation includes authorized session stops and old-broker shutdown through
+the old client before source or dependency replacement.
+
+`-ClientsClosed` acknowledges that preparation; it performs none of those steps.
+Follow [Windows Install](docs/WINDOWS.md) for the guarded installer preflight.
 
 To evaluate unreleased work, clone `main` without `--branch`; do not describe a
 mutable `main` checkout as a released version. The source-tree installers are
@@ -119,8 +131,11 @@ host, install with the explicit local-host policy:
 ./install.sh --bypass-policy LocalHost --allowed-root "$HOME/projects"
 ```
 
+The Windows command below applies to the guarded source installer. For the
+published beta.4 installer, omit `-ClientsClosed` as explained above.
+
 ```powershell
-.\install-windows.ps1 -BypassPolicy LocalHost -AllowedRoot "$HOME\Projects"
+.\install-windows.ps1 -BypassPolicy LocalHost -AllowedRoot "$HOME\Projects" -ClientsClosed
 ```
 
 Each bypass launch must still include `confirmBypassPermissions: true`. Bypass

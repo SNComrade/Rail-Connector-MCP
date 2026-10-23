@@ -6,13 +6,27 @@ const DEFAULT_COLS = 140;
 const DEFAULT_ROWS = 40;
 const DEFAULT_SCROLLBACK = 4000;
 
+const TERMINAL_CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/u;
+
+function terminalControlFreeText(text) {
+  return typeof text === "string" && !TERMINAL_CONTROL_RE.test(text);
+}
+
+export function assertFramedPromptText(text) {
+  if (!terminalControlFreeText(text)) {
+    const error = new Error("Framed prompt text must contain no terminal control characters other than tab, newline, or carriage return.");
+    error.code = "EINVAL";
+    throw error;
+  }
+  return text;
+}
+
 // Explicit transport intent, never inferred from quoted/pasted prompt contents.
 export function workflowKeywordPrefixLength(text) {
   if (
-    typeof text !== "string" ||
+    !terminalControlFreeText(text) ||
     !text.startsWith("ultracode:") ||
-    !text.slice(10).trim() ||
-    /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/u.test(text)
+    !text.slice(10).trim()
   ) {
     const error = new Error(
       "Keyword delivery requires an intentional leading ultracode: prefix, a nonempty body, and no terminal control characters."

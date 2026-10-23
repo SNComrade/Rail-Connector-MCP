@@ -8,19 +8,48 @@ import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import { applyNodePtyFix, verifyNodePtyFix, nodePtyFixSpecPath } from "../tools/install-node-pty-fix.mjs";
 
-// Read the installed compiled modules verbatim. Only install-guard fixtures
-// reconstruct reviewed before bytes; the behavioral VMs never rewrite input.
+// Behavioral VMs read the reviewed installed postimages verbatim. Installer
+// fixtures and an explicit hash-qualified negative control reconstruct before
+// bytes without rewriting any installed dependency file.
 const require = createRequire(import.meta.url);
 const libraryRoot = path.dirname(require.resolve("node-pty"));
 const packageRoot = path.dirname(libraryRoot);
 const spec = JSON.parse(fs.readFileSync(nodePtyFixSpecPath, "utf8"));
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+// Historical99f readiness identities are independent of the new descriptor.
+// In particular, a future recipe edit must not silently redefine this upgrade.
+const historicalReadiness = [
+  { path: "lib/windowsTerminal.js",
+    sha256Before: "b05d53d49cf9f422c2836029676ac2829f59cc14f5bbbbfaafa08382ff044267",
+    sha256After: "75fd46726fb2bf55b9461e365413867fdad223764de974532024d206817a2494" },
+  { path: "lib/windowsPtyAgent.js",
+    sha256Before: "4f503c377b11cbd113e1f32b3932fdc35e8132b0e647f4c6b70dc84224127c53",
+    sha256After: "b0596fd3813b9bf1428531c504b6e0bdce311a484e743e3623a3966cc40804aa" },
+  { path: "typings/node-pty.d.ts",
+    sha256Before: "5e2960f29b6d3ca6b8a438cca419e0485d046cb7d9acf67471d5627803ad8db0",
+    sha256After: "915230c6276abe2eeb0c74319c18967187970f4d960bd8d29a9d806b7d7beb2c" },
+];
+assert.deepEqual(spec.patches.slice(0, 3).map(({ path, sha256Before, sha256After }) =>
+  ({ path, sha256Before, sha256After })), historicalReadiness);
+const originalConoutHash = "c87159520fc74cb0745f273260cc701cdb9e4c01ab0bae12cb4bd8d7f6e2f7c9";
 const sources = Object.fromEntries(["windowsTerminal", "windowsPtyAgent", "windowsConoutConnection"]
   .map((name) => [name, fs.readFileSync(path.join(libraryRoot, `${name}.js`), "utf8")]));
 assert.equal(JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")).version, spec.version);
-for (const name of ["windowsTerminal", "windowsPtyAgent"]) {
+for (const name of ["windowsTerminal", "windowsPtyAgent", "windowsConoutConnection"]) {
   const patch = spec.patches.find((item) => item.path === `lib/${name}.js`);
-  assert.ok([patch.sha256Before, patch.sha256After].includes(sha256(sources[name])), "VM input must match reviewed installed bytes");
+  assert.equal(sha256(sources[name]), patch.sha256After, "behavioral VM input must match reviewed installed postimage");
+}
+
+function reconstructBefore(patch, afterBytes) {
+  assert.equal(sha256(afterBytes), patch.sha256After, "reconstruction requires a reviewed postimage");
+  let text = afterBytes.toString("utf8");
+  for (const { from, to } of [...patch.replacements].reverse()) {
+    assert.equal(text.split(to).length, 2, "known postimage must have exactly one reverse anchor");
+    text = text.replace(to, from);
+  }
+  const bytes = Buffer.from(text);
+  assert.equal(sha256(bytes), patch.sha256Before);
+  return bytes;
 }
 
 function clock() {
@@ -60,7 +89,7 @@ class InertEmitter {
   fire(value) { for (const listener of [...this.listeners]) listener(value); }
 }
 
-function evaluate(name, dependencies, virtualClock) {
+function evaluate(name, dependencies, virtualClock, beforeConout) {
   const exports = {};
   const context = {
     exports, module: { exports }, __dirname: libraryRoot,
@@ -72,7 +101,11 @@ function evaluate(name, dependencies, virtualClock) {
     console: { warn() {} },
     setTimeout: virtualClock.setTimeout, clearTimeout: virtualClock.clearTimeout,
   };
-  vm.runInNewContext(sources[name], context, { filename: `inert/${name}.js`, timeout: 1000 });
+  if (beforeConout !== undefined) {
+    assert.equal(name, "windowsConoutConnection", "only the explicit Conout negative control may override VM input");
+    assert.equal(sha256(beforeConout), originalConoutHash);
+  }
+  vm.runInNewContext(beforeConout ?? sources[name], context, { filename: `inert/${name}.js`, timeout: 1000 });
   return exports;
 }
 
@@ -81,7 +114,7 @@ function terminalBase() {
   Object.setPrototypeOf(Terminal.prototype, EventEmitter.prototype);
   Terminal.prototype._checkType = () => {};
   Terminal.prototype._parseEnv = (environment) => Object.entries(environment).map(([key, value]) => `${key}=${value}`);
-  Terminal.prototype._forwardEvents = () => {};
+  Terminal.prototype._forwardEvents = function () { this._socket.on("data", (data) => this.emit("data", data)); };
   Terminal.prototype._close = function () { this.closed = true; };
   Object.defineProperty(Terminal.prototype, "pid", { get() { return this._pid; } });
   return { Terminal, DEFAULT_COLS: 80, DEFAULT_ROWS: 24 };
@@ -94,17 +127,25 @@ function terminalModule(Agent, virtualClock) {
   }, virtualClock).WindowsTerminal;
 }
 
-function agentHarness(options, { terminalBudget } = {}) {
+function agentHarness(options, { terminalBudget, throughTerminal = false, useConptyDll = true, connectError,
+  closeOnTerminate = false, beforeConout } = {}) {
   const virtualClock = clock();
   const sockets = [];
   const workers = [];
-  const calls = { start: 0, connect: 0, kill: 0, open: 0, errors: [] };
+  const calls = { start: 0, connect: 0, kill: 0, open: 0, helpers: 0, errors: [], events: [] };
+  let onNativeExit;
   class Socket extends EventEmitter {
-    constructor() { super(); this.destroyed = false; sockets.push(this); }
+    constructor() { super(); this.destroyed = false; this.closed = false; sockets.push(this); }
     setEncoding() {}
     write() {}
-    connect() { virtualClock.setTimeout(() => this.emit("connect"), 0); }
-    destroy() { this.destroyed = true; }
+    connect() { virtualClock.setTimeout(() => { if (!this.destroyed) this.emit("connect"); }, 0); }
+    destroy() {
+      if (this.destroyed) return this;
+      this.destroyed = true;
+      // Model net.Socket's asynchronous, once-only close notification.
+      virtualClock.setTimeout(() => { this.closed = true; this.emit("close"); }, 0);
+      return this;
+    }
   }
   class Worker extends EventEmitter {
     constructor() { super(); this.ready = false; this.terminations = 0; workers.push(this); }
@@ -112,45 +153,74 @@ function agentHarness(options, { terminalBudget } = {}) {
       if (event === "message" && value === 1) this.ready = true;
       return super.emit(event, value);
     }
-    terminate() { this.terminations++; return Promise.resolve(0); }
+    terminate() {
+      this.terminations++;
+      calls.events.push({ kind: "terminate", at: virtualClock.now });
+      if (closeOnTerminate) sockets[0].destroy(); // Inert relay-close consequence of Worker shutdown.
+      return Promise.resolve(0);
+    }
   }
   const ConoutConnection = evaluate("windowsConoutConnection", {
     worker_threads: { Worker }, path,
     "./shared/conout": { getWorkerPipeName: () => "inert-output-pipe" },
     "./eventEmitter2": { EventEmitter2: InertEmitter },
-  }, virtualClock).ConoutConnection;
+  }, virtualClock, beforeConout).ConoutConnection;
   const native = {
     startProcess() { calls.start++; return { fd: -1, pty: 1, conin: "inert-input", conout: "inert-output" }; },
-    connect() {
+    connect(...args) {
       calls.connect++;
       assert.equal(workers[0]?.ready, true, "native connect must follow observed worker READY");
+      if (connectError) throw connectError;
+      onNativeExit = args.at(-1);
       return { pid: 101 }; // Metadata only; never supplied to an OS API.
     },
     kill() { calls.kill++; }, resize() {}, clear() {},
   };
   const Agent = evaluate("windowsPtyAgent", {
     fs: { openSync() { calls.open++; return 4; } }, path,
-    child_process: { fork: () => assert.fail("VM must never fork a console helper") },
+    child_process: { fork() {
+      // The default backend queries a console helper on kill. This boundary is
+      // an inert emitter, never child_process.fork or an OS process handle.
+      calls.helpers++;
+      const helper = new EventEmitter();
+      helper.kill = () => assert.fail("inert console helper must answer before its timeout");
+      virtualClock.setTimeout(() => helper.emit("message", { consoleProcessList: [] }), 0);
+      return helper;
+    } },
     net: { Socket }, "./windowsConoutConnection": { ConoutConnection },
     "./eventEmitter2": { EventEmitter2: InertEmitter },
     "./utils": { loadNativeModule(name) { assert.equal(name, "conpty"); return { module: native }; } },
   }, virtualClock).WindowsPtyAgent;
   let agent;
   let terminal;
-  if (terminalBudget !== undefined) {
+  if (terminalBudget !== undefined || throughTerminal) {
     const Terminal = terminalModule(Agent, virtualClock);
-    terminal = new Terminal("inert-shell.exe", [], { cwd: libraryRoot, env: {}, useConptyDll: true,
+    terminal = new Terminal("inert-shell.exe", [], { cwd: libraryRoot, env: {}, useConptyDll,
       conptyConnectionTimeout: terminalBudget });
-    terminal.on("exit", (code) => calls.errors.push({ code, at: virtualClock.now }));
+    agent = terminal._agent;
+    terminal.on("exit", (code) => calls.events.push({ kind: "exit", code, at: virtualClock.now }));
+    terminal.on("data", (data) => calls.events.push({ kind: "data", data, at: virtualClock.now }));
   } else {
-    agent = new Agent("inert-shell.exe", [], [], libraryRoot, 80, 24, false, true, false, options);
+    agent = new Agent("inert-shell.exe", [], [], libraryRoot, 80, 24, false, useConptyDll, false, options);
     agent.onError((error) => calls.errors.push({ message: error.message, at: virtualClock.now }));
   }
-  return { clock: virtualClock, sockets, workers, calls, agent, terminal };
+  return { clock: virtualClock, sockets, workers, calls, agent, terminal,
+    nativeExit(code) {
+      assert.equal(typeof onNativeExit, "function", "native exit requires a completed connection");
+      onNativeExit(code);
+    },
+    output(data) {
+      assert.equal(sockets[0].closed, false, "no output may arrive after socket close");
+      sockets[0].emit("data", data);
+    },
+    closeOutput() { sockets[0].destroy(); virtualClock.advance(0); },
+    ready() { workers[0].emit("message", 1); virtualClock.advance(0); },
+  };
 }
 
 const results = [];
 const failures = [];
+const installerEvidence = {};
 function check(name, action) {
   try { action(); results.push({ name, passed: true }); }
   catch (error) { results.push({ name, passed: false, message: error.message }); failures.push(error); }
@@ -205,8 +275,8 @@ check("partial agent option preserves default factory", () => {
   assert.equal(h.agent.innerPid, 101);
 });
 
-check("unconfigured upstream timeout remains5000", () => {
-  const h = agentHarness();
+for (const useConptyDll of [false, true]) check(`backend${useConptyDll} unconfigured upstream timeout remains5000`, () => {
+  const h = agentHarness(undefined, { useConptyDll });
   h.clock.advance(4999);
   assert.equal(h.calls.kill, 0);
   h.clock.advance(1);
@@ -216,8 +286,8 @@ check("unconfigured upstream timeout remains5000", () => {
   assert.equal(h.agent.exitCode, -1);
 });
 
-check("configured15000 timeout disposes and ignores late READY", () => {
-  const h = agentHarness({ connectionTimeout: 15000 });
+for (const useConptyDll of [false, true]) check(`backend${useConptyDll} configured15000 timeout disposes and ignores late READY`, () => {
+  const h = agentHarness({ connectionTimeout: 15000 }, { useConptyDll });
   h.clock.advance(14999);
   assert.equal(h.calls.kill, 0);
   h.clock.advance(1);
@@ -234,8 +304,8 @@ check("configured15000 timeout disposes and ignores late READY", () => {
   assert.equal(h.workers[0].terminations, 1);
 });
 
-for (const reason of ["error", "exit0", "exit1"]) check(`pre-ready worker ${reason} is fatal`, () => {
-  const h = agentHarness({ connectionTimeout: 15000 });
+for (const useConptyDll of [false, true]) for (const reason of ["error", "exit0", "exit1"]) check(`backend${useConptyDll} pre-ready worker ${reason} is fatal`, () => {
+  const h = agentHarness({ connectionTimeout: 15000 }, { useConptyDll });
   if (reason === "error") h.workers[0].emit("error", new Error("inert worker failure"));
   else h.workers[0].emit("exit", reason === "exit0" ? 0 : 1);
   assert.equal(h.calls.kill, 1);
@@ -250,10 +320,11 @@ for (const reason of ["error", "exit0", "exit1"]) check(`pre-ready worker ${reas
   assert.equal(h.workers[0].terminations, 1);
 });
 
-check("explicit kill clears timer and ignores late READY", () => {
+check("pre-ready DLL kill remains outside connected-close cleanup", () => {
   const h = agentHarness({ connectionTimeout: 15000 });
   h.clock.advance(1000);
   h.agent.kill();
+  h.clock.advance(0); // Deliver the input socket's ordinary asynchronous close.
   assert.equal(h.calls.kill, 1);
   assert.equal(h.clock.pending, 0);
   h.workers[0].emit("message", 1);
@@ -261,10 +332,234 @@ check("explicit kill clears timer and ignores late READY", () => {
   assert.equal(h.calls.connect, 0);
   assert.equal(h.calls.kill, 1);
   assert.equal(h.calls.errors.length, 0);
+  assert.equal(h.workers[0].terminations, 0, "no connectSocket means no new close observer; this boundary is unchanged");
   // Simulate already-buffered output so the unchanged DLL drain path runs.
   h.agent.outSocket.emit("data", "inert buffered output");
   h.clock.advance(1000);
   assert.equal(h.workers[0].terminations, 1);
+});
+
+for (const useConptyDll of [false, true]) {
+  const backend = useConptyDll ? "bundled" : "default";
+  for (const nativeExitDelay of [500, 1500]) check(`${backend} output close before native exit at${nativeExitDelay} preserves cleanup`, () => {
+    const h = agentHarness(undefined, { throughTerminal: true, useConptyDll });
+    h.ready();
+    h.output("final output before close");
+    h.closeOutput();
+    assert.deepEqual(h.calls.events.map(({ kind }) => kind), ["data", "exit"]);
+    // This is the existing Terminal contract: close may precede the native
+    // status callback. Worker cleanup must not depend on that callback.
+    assert.equal(h.calls.events[1].code, undefined);
+    if (nativeExitDelay < 1000) {
+      h.clock.advance(nativeExitDelay);
+      h.nativeExit(12);
+      h.clock.advance(999 - nativeExitDelay);
+    } else h.clock.advance(999);
+    assert.equal(h.workers[0].terminations, 0);
+    h.clock.advance(1);
+    assert.equal(h.workers[0].terminations, 1);
+    assert.equal(h.calls.events.find((event) => event.kind === "terminate").at, 1000);
+    if (nativeExitDelay > 1000) {
+      h.clock.advance(nativeExitDelay - 1000);
+      h.nativeExit(12);
+    }
+    assert.equal(h.agent.exitCode, 12);
+    h.clock.advance(30000);
+    assert.equal(h.workers[0].terminations, 1);
+    assert.equal(h.calls.events.filter((event) => event.kind === "exit").length, 1);
+    assert.equal(h.calls.kill, 0);
+    assert.equal(h.calls.connect, 1);
+    assert.equal(h.clock.pending, 0);
+  });
+
+  check(`${backend} natural close without late output drains worker`, () => {
+    const h = agentHarness(undefined, { throughTerminal: true, useConptyDll });
+    h.ready();
+    h.nativeExit(7);
+    assert.equal(h.calls.events.length, 0, "native exit must not itself terminate the worker or emit terminal exit");
+    if (useConptyDll) h.closeOutput();
+    else {
+      h.clock.advance(999);
+      assert.equal(h.sockets[0].closed, false, "retain the default backend's pre-close output drain");
+      h.clock.advance(1);
+    }
+    assert.deepEqual(h.calls.events, [{ kind: "exit", code: 7, at: h.clock.now }]);
+    const closedAt = h.clock.now;
+    h.clock.advance(999);
+    assert.equal(h.workers[0].terminations, 0, "output close must retain the existing1000ms worker drain");
+    h.clock.advance(1);
+    assert.deepEqual(h.calls.events.at(-1), { kind: "terminate", at: closedAt + 1000 });
+    assert.equal(h.workers[0].terminations, 1);
+    assert.equal(h.calls.kill, 0, "natural close must not issue native kill after exit");
+    assert.equal(h.clock.pending, 0);
+  });
+
+  check(`${backend} buffered output precedes exit and worker termination`, () => {
+    const h = agentHarness(undefined, { throughTerminal: true, useConptyDll });
+    h.ready();
+    h.output("before exit");
+    h.nativeExit(9);
+    h.clock.advance(900);
+    h.output("final buffered output");
+    h.clock.advance(999);
+    assert.equal(h.sockets[0].closed, false, "late output must retain the default drain reset");
+    assert.equal(h.workers[0].terminations, 0);
+    if (useConptyDll) h.closeOutput();
+    else h.clock.advance(1);
+    assert.deepEqual(h.calls.events.map(({ kind, data, code }) => ({ kind, data, code })), [
+      { kind: "data", data: "before exit", code: undefined },
+      { kind: "data", data: "final buffered output", code: undefined },
+      { kind: "exit", data: undefined, code: 9 },
+    ]);
+    h.clock.advance(999);
+    assert.equal(h.workers[0].terminations, 0);
+    h.clock.advance(1);
+    assert.equal(h.calls.events.at(-1).kind, "terminate");
+    assert.equal(h.workers[0].terminations, 1);
+    assert.equal(h.calls.kill, 0);
+  });
+
+  check(`${backend} connected kill needs no post-kill output`, () => {
+    const h = agentHarness(undefined, { throughTerminal: true, useConptyDll });
+    h.ready();
+    h.output("ready"); // WindowsTerminal intentionally defers public kill until first data.
+    h.terminal.kill();
+    assert.equal(h.calls.kill, 1);
+    h.nativeExit(0);
+    h.closeOutput();
+    h.clock.advance(999);
+    assert.equal(h.workers[0].terminations, 0);
+    h.clock.advance(1);
+    assert.equal(h.workers[0].terminations, 1);
+    assert.equal(h.calls.events.filter((event) => event.kind === "exit").length, 1);
+    assert.equal(h.calls.events.filter((event) => event.kind === "data").length, 1);
+    assert.equal(h.calls.kill, 1);
+    assert.equal(h.clock.pending, 0);
+  });
+
+  check(`${backend} repeated close and worker notifications do not rearm cleanup`, () => {
+    const h = agentHarness(undefined, { useConptyDll });
+    h.ready();
+    h.nativeExit(0);
+    h.nativeExit(0);
+    h.closeOutput();
+    h.clock.advance(500);
+    // Deliberately repeat the close at the ConoutConnection boundary. Real
+    // net.Socket closes once; the observer must also be consumed once.
+    h.sockets[0].emit("close");
+    h.workers[0].emit("message", 1);
+    h.workers[0].emit("error", new Error("inert post-ready notification"));
+    h.workers[0].emit("exit", 0);
+    h.clock.advance(500);
+    assert.equal(h.workers[0].terminations, 1, "duplicate close must not postpone the original drain deadline");
+    h.clock.advance(30000);
+    assert.equal(h.workers[0].terminations, 1);
+    assert.equal(h.calls.connect, 1);
+    assert.equal(h.calls.kill, 0);
+    assert.equal(h.calls.errors.length, 0);
+    assert.equal(h.clock.pending, 0);
+  });
+
+  check(`${backend} kill drain followed by worker-owned close does not dispose twice`, () => {
+    const h = agentHarness(undefined, { throughTerminal: true, useConptyDll, closeOnTerminate: true });
+    h.ready();
+    h.output("ready");
+    h.terminal.kill();
+    h.nativeExit(0);
+    h.output("buffered after kill");
+    h.clock.advance(999);
+    assert.equal(h.workers[0].terminations, 0);
+    h.clock.advance(1);
+    assert.equal(h.workers[0].terminations, 1);
+    assert.equal(h.calls.events.filter((event) => event.kind === "exit").length, 1);
+    assert.equal(h.sockets[0].closed, true);
+    h.clock.advance(30000);
+    assert.equal(h.workers[0].terminations, 1, "worker shutdown closing its relay must not schedule another termination");
+    assert.equal(h.calls.kill, 1);
+    assert.equal(h.clock.pending, 0);
+  });
+
+  check(`${backend} connected native failure keeps readiness cleanup`, () => {
+    const h = agentHarness(undefined, { throughTerminal: true, useConptyDll,
+      connectError: new Error("inert connect failure, error code: 87") });
+    h.ready();
+    assert.equal(h.calls.connect, 1);
+    assert.equal(h.calls.kill, 1);
+    assert.ok(h.sockets.every((socket) => socket.destroyed));
+    assert.deepEqual(h.calls.events, [{ kind: "exit", code: 87, at: 0 }]);
+    h.workers[0].emit("message", 1);
+    h.clock.advance(1000);
+    assert.equal(h.workers[0].terminations, 1);
+    h.clock.advance(30000);
+    assert.equal(h.calls.connect, 1);
+    assert.equal(h.calls.kill, 1);
+    assert.equal(h.calls.events.filter((event) => event.kind === "exit").length, 1);
+    assert.equal(h.clock.pending, 0);
+  });
+}
+
+for (const killAt of [1500, 2500]) check(`default natural close then agent kill at${killAt} retains original disposal`, () => {
+  const h = agentHarness(undefined, { throughTerminal: true, useConptyDll: false });
+  h.ready();
+  h.nativeExit(0);
+  h.clock.advance(1000);
+  assert.equal(h.sockets[0].closed, true);
+  assert.equal(h.workers[0].terminations, 0);
+  h.clock.advance(killAt - 1000);
+  h.agent.kill(); // Native boundary stays mocked; this is a disposal-state regression.
+  h.clock.advance(0);
+  if (killAt < 2000) {
+    h.clock.advance(1999 - killAt);
+    assert.equal(h.workers[0].terminations, 0);
+    h.clock.advance(1);
+  }
+  assert.equal(h.workers[0].terminations, 1);
+  assert.equal(h.calls.events.find((event) => event.kind === "terminate").at, 2000,
+    "later kill must not replace the original dispose deadline with a bespoke timer");
+  h.clock.advance(30000);
+  assert.equal(h.workers[0].terminations, 1);
+  assert.equal(h.calls.events.filter((event) => event.kind === "exit").length, 1);
+  assert.equal(h.clock.pending, 0);
+});
+
+const conoutPatch = spec.patches.find((patch) => patch.path === "lib/windowsConoutConnection.js");
+const beforeConout = reconstructBefore(conoutPatch, Buffer.from(sources.windowsConoutConnection)).toString("utf8");
+assert.equal(sha256(beforeConout), originalConoutHash, "negative control must be the published compiled Conout preimage");
+for (const useConptyDll of [false, true]) check(`backend${useConptyDll} original Conout negative control retains inert worker`, () => {
+  const h = agentHarness(undefined, { throughTerminal: true, useConptyDll, beforeConout });
+  h.ready();
+  h.nativeExit(0);
+  if (useConptyDll) h.closeOutput();
+  h.clock.advance(30000);
+  assert.equal(h.sockets[0].closed, true);
+  assert.equal(h.calls.events.filter((event) => event.kind === "exit").length, 1);
+  assert.equal(h.workers[0].terminations, 0, "unpatched natural close must expose the missing termination request");
+  assert.equal(h.calls.kill, 0);
+  assert.equal(h.calls.connect, 1);
+  assert.equal(h.clock.pending, 0);
+});
+
+check("bundled kill retains repeated-data drain reset before output close", () => {
+  const h = agentHarness(undefined, { throughTerminal: true, useConptyDll: true, closeOnTerminate: true });
+  h.ready();
+  h.output("ready");
+  h.terminal.kill();
+  h.nativeExit(0);
+  h.output("first buffered output");
+  h.clock.advance(900);
+  h.output("last buffered output");
+  h.clock.advance(999);
+  assert.equal(h.workers[0].terminations, 0, "later data must keep resetting the existing DLL1000ms drain");
+  h.clock.advance(1);
+  assert.equal(h.workers[0].terminations, 1);
+  assert.equal(h.sockets[0].closed, true);
+  assert.equal(h.calls.events.find((event) => event.kind === "terminate").at, 1900);
+  assert.equal(h.calls.events.filter((event) => event.kind === "data").length, 3);
+  assert.equal(h.calls.events.filter((event) => event.kind === "exit").length, 1);
+  h.clock.advance(30000);
+  assert.equal(h.workers[0].terminations, 1);
+  assert.equal(h.calls.kill, 1);
+  assert.equal(h.clock.pending, 0);
 });
 
 check("install guards idempotence tamper and partial known state", () => {
@@ -273,12 +568,7 @@ check("install guards idempotence tamper and partial known state", () => {
   const beforeBytes = new Map(spec.patches.map((patch) => {
     let bytes = fs.readFileSync(path.join(packageRoot, patch.path));
     if (sha256(bytes) === patch.sha256After) {
-      let text = bytes.toString("utf8");
-      for (const { from, to } of [...patch.replacements].reverse()) {
-        assert.equal(text.split(to).length, 2, "known patched fixture must have one reverse anchor");
-        text = text.replace(to, from);
-      }
-      bytes = Buffer.from(text);
+      bytes = reconstructBefore(patch, bytes);
     }
     assert.equal(sha256(bytes), patch.sha256Before);
     return [patch.path, bytes];
@@ -296,32 +586,80 @@ check("install guards idempotence tamper and partial known state", () => {
     return directory;
   };
   const hashes = (directory) => spec.patches.map((patch) => sha256(fs.readFileSync(path.join(directory, patch.path))));
+  const identity = (directory, relative) => {
+    const file = path.join(directory, relative);
+    const stat = fs.lstatSync(file, { bigint: true });
+    assert.ok(stat.isFile() && stat.ino > 0n, "migration evidence requires ordinary file identity");
+    return { path: relative, sha256: sha256(fs.readFileSync(file)),
+      ...Object.fromEntries(["dev", "ino", "mode", "nlink", "size", "birthtimeNs", "mtimeNs", "ctimeNs"]
+        .map((key) => [key, stat[key].toString()])) };
+  };
+  const noStaging = (directory) => {
+    const residues = [directory, path.join(directory, "lib"), path.join(directory, "typings")]
+      .flatMap((folder) => fs.readdirSync(folder).filter((name) => name.includes(".readiness-") && name.endsWith(".tmp")));
+    assert.deepEqual(residues, [], "compatibility staging files must not remain");
+  };
   try {
     const pristine = makePackage("pristine");
     assert.throws(() => verifyNodePtyFix({ packageRoot: pristine }), (error) => error.code === "EPTYCOMPAT");
-    assert.equal(applyNodePtyFix({ packageRoot: pristine }).appliedFiles, 3);
-    assert.equal(verifyNodePtyFix({ packageRoot: pristine }).verifiedFiles.length, 3);
+    installerEvidence.pristineWrites = applyNodePtyFix({ packageRoot: pristine }).appliedFiles;
+    assert.equal(installerEvidence.pristineWrites, 4);
+    assert.equal(verifyNodePtyFix({ packageRoot: pristine }).verifiedFiles.length, 4);
     assert.deepEqual(hashes(pristine), spec.patches.map((patch) => patch.sha256After));
     const installed = hashes(pristine);
-    assert.equal(applyNodePtyFix({ packageRoot: pristine }).appliedFiles, 0);
+    installerEvidence.combinedWrites = applyNodePtyFix({ packageRoot: pristine }).appliedFiles;
+    assert.equal(installerEvidence.combinedWrites, 0);
     assert.deepEqual(hashes(pristine), installed);
+    noStaging(pristine);
+
+    const readinessOnly = makePackage("previous-readiness-install");
+    for (const patch of historicalReadiness) {
+      fs.copyFileSync(path.join(pristine, patch.path), path.join(readinessOnly, patch.path));
+    }
+    const oldIdentities = historicalReadiness.map(({ path }) => identity(readinessOnly, path));
+    assert.deepEqual(oldIdentities.map(({ sha256 }) => sha256), historicalReadiness.map(({ sha256After }) => sha256After));
+    assert.throws(() => verifyNodePtyFix({ packageRoot: readinessOnly }), (error) => error.code === "EPTYCOMPAT");
+    installerEvidence.readinessUpgradeWrites = applyNodePtyFix({ packageRoot: readinessOnly }).appliedFiles;
+    assert.equal(installerEvidence.readinessUpgradeWrites, 1, "old readiness postimages upgrade without rewriting");
+    const unchangedIdentities = historicalReadiness.map(({ path }) => identity(readinessOnly, path));
+    assert.deepEqual(unchangedIdentities, oldIdentities, "one-write upgrade must preserve all three existing file identities and metadata");
+    installerEvidence.unchangedReadinessFiles = unchangedIdentities;
+    assert.deepEqual(hashes(readinessOnly), installed);
+    assert.equal(applyNodePtyFix({ packageRoot: readinessOnly }).appliedFiles, 0);
+    noStaging(readinessOnly);
+
+    const tamperedReadiness = makePackage("previous-readiness-tampered-conout");
+    for (const patch of historicalReadiness) {
+      fs.copyFileSync(path.join(pristine, patch.path), path.join(tamperedReadiness, patch.path));
+    }
+    fs.appendFileSync(path.join(tamperedReadiness, conoutPatch.path), "\n// unknown Conout fixture bytes\n");
+    const tamperedIdentities = spec.patches.map(({ path }) => identity(tamperedReadiness, path));
+    assert.throws(() => applyNodePtyFix({ packageRoot: tamperedReadiness }), (error) => error.code === "EPTYCOMPAT");
+    assert.deepEqual(spec.patches.map(({ path }) => identity(tamperedReadiness, path)), tamperedIdentities,
+      "readiness-only plus unknown Conout must refuse before any target or identity changes");
+    noStaging(tamperedReadiness);
+    installerEvidence.tamperedReadinessRefusedWithZeroChanges = true;
 
     const tampered = makePackage("tampered-last-target");
     fs.appendFileSync(path.join(tampered, spec.patches.at(-1).path), "\n// unknown fixture modification\n");
     const tamperedBefore = hashes(tampered);
     assert.throws(() => applyNodePtyFix({ packageRoot: tampered }), (error) => error.code === "EPTYCOMPAT");
     assert.deepEqual(hashes(tampered), tamperedBefore, "all targets must preflight before the first write");
+    noStaging(tampered);
 
     const wrongVersion = makePackage("unsupported-version");
     fs.writeFileSync(path.join(wrongVersion, "package.json"), JSON.stringify({ name: spec.package, version: "0.0.0" }));
     const unsupportedBefore = hashes(wrongVersion);
     assert.throws(() => applyNodePtyFix({ packageRoot: wrongVersion }), (error) => error.code === "EPTYCOMPAT");
     assert.deepEqual(hashes(wrongVersion), unsupportedBefore);
+    noStaging(wrongVersion);
 
     const interrupted = makePackage("known-partial-install");
     fs.copyFileSync(path.join(pristine, spec.patches[0].path), path.join(interrupted, spec.patches[0].path));
-    assert.equal(applyNodePtyFix({ packageRoot: interrupted }).appliedFiles, 2);
+    assert.equal(applyNodePtyFix({ packageRoot: interrupted }).appliedFiles, 3);
     assert.deepEqual(hashes(interrupted), installed);
+    noStaging(interrupted);
+    installerEvidence.noStagingResidue = true;
   } catch (error) {
     primaryError = error;
     console.error(`node-pty install-guard evidence preserved: ${path.basename(fixtureRoot)}`);
@@ -337,6 +675,7 @@ check("install guards idempotence tamper and partial known state", () => {
 });
 
 console.log(JSON.stringify({ test: "node-pty-startup", virtualClock: true, realNativeCalls: 0,
-  sourceHashes: Object.fromEntries(Object.entries(sources).map(([name, text]) => [name, sha256(text)])), results }));
+  sourceHashes: Object.fromEntries(Object.entries(sources).map(([name, text]) => [name, sha256(text)])),
+  negativeControlSourceHash: sha256(beforeConout), installerEvidence, results }));
 if (failures.length) throw new AggregateError(failures, "node-pty startup compatibility checks failed");
 console.log("node-pty-startup ok");

@@ -18,38 +18,46 @@ const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "rail-connector-tmux-"));
 const unmanagedName = `rail-unmanaged-${process.pid}`;
 const managedName = `rail-managed-${process.pid}`;
-const outputFile = path.join(root, "multiline.txt");
+const wireFile = path.join(root, "wire.jsonl");
 const fakeClaude = path.join(root, "claude");
+function fakeTmuxClaude(wireFile) {
+  const fs = require("node:fs");
+  const { StringDecoder } = require("node:string_decoder");
+  if (process.argv.includes("--version")) { console.log("2.1.220 (Claude Code)"); return; }
+  if (process.argv.includes("--help")) {
+    console.log("--effort <level> low, medium, high, xhigh, max, ultracode\n--permission-mode <mode> default, manual, plan, acceptEdits, auto, dontAsk, bypassPermissions\n--settings <file-or-json>\n--remote-control");
+    return;
+  }
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+  const decoder = new StringDecoder("utf8");
+  let wire = "";
+  let input = "";
+  let pasted = false;
+  process.stdout.write("https://claude.ai/code/session_tmux_integration\r\n> ");
+  process.stdin.on("data", (data) => {
+    fs.appendFileSync(wireFile, `${JSON.stringify(data.toString("base64"))}\n`);
+    wire += decoder.write(data);
+    while (wire.length) {
+      if (wire.startsWith("\x1b[200~")) { pasted = true; wire = wire.slice(6); continue; }
+      if (wire.startsWith("\x1b[201~")) { pasted = false; wire = wire.slice(6); continue; }
+      if ("\x1b[200~".startsWith(wire) || "\x1b[201~".startsWith(wire)) break;
+      const character = wire[0];
+      wire = wire.slice(1);
+      if (!pasted && /[\r\n]/.test(character)) {
+        const command = input;
+        input = "";
+        if (command === "/exit") process.exit(0);
+        if (command === "/frame-mode-on") process.stdout.write("\x1b[?2004h\r\nFRAME_MODE:on\r\n> ");
+        else if (command === "/workflow-test") process.stdout.write("\r\nWaiting for 1 dynamic workflow to finish\r\n> ");
+        else if (command === "/workflow-clear") process.stdout.write("\r\nWorked for 2s\r\n> ");
+        else process.stdout.write(`\r\nACK:${JSON.stringify(command)}\r\n> `);
+      } else input += character;
+    }
+  });
+}
 fs.writeFileSync(
   fakeClaude,
-  [
-    "#!/usr/bin/env bash",
-    "if [[ \"${1:-}\" == \"--version\" ]]; then",
-    "  printf '2.1.220 (Claude Code)\\n'",
-    "  exit 0",
-    "fi",
-    "if [[ \"${1:-}\" == \"--help\" ]]; then",
-    "  printf '%s\\n' '  --effort <level> low, medium, high, xhigh, max, ultracode'",
-    "  printf '%s\\n' '  --permission-mode <mode> default, manual, plan, acceptEdits, auto, dontAsk, bypassPermissions'",
-    "  printf '%s\\n' '  --settings <file-or-json>'",
-    "  printf '%s\\n' '  --remote-control'",
-    "  exit 0",
-    "fi",
-    "printf 'https://claude.ai/code/session_tmux_integration\\n'",
-    "while IFS= read -r command; do",
-    "  if [[ \"$command\" == \"/exit\" ]]; then exit 0; fi",
-    "  if [[ \"$command\" == \"/workflow-test\" ]]; then",
-    "    printf 'Waiting for 1 dynamic workflow to finish\\n'",
-    "    continue",
-    "  fi",
-    "  if [[ \"$command\" == \"/workflow-clear\" ]]; then",
-    "    printf 'Worked for 2s\\n'",
-    "    continue",
-    "  fi",
-    "  eval \"$command\"",
-    "done",
-    "",
-  ].join("\n"),
+  `#!/usr/bin/env node\n(${fakeTmuxClaude.toString()})(${JSON.stringify(wireFile)});\n`,
   { mode: 0o755 }
 );
 
@@ -207,15 +215,37 @@ try {
   assert.match(otherPaneId, /^%\d+$/);
   await tmux(["select-pane", "-t", otherPaneId]);
 
-  const shellPath = outputFile.replaceAll("'", "'\\''");
-  const prompt = `printf 'alpha\\n' > '${shellPath}'\nprintf 'beta\\n' >> '${shellPath}'`;
+  const readWire = () => fs.existsSync(wireFile) ? Buffer.concat(fs.readFileSync(wireFile, "utf8")
+    .split("\n").filter(Boolean).map((line) => Buffer.from(JSON.parse(line), "base64"))) : Buffer.alloc(0);
+  const prompt = "Unicode 🧪 résumé\tTAB\nLF\rCR\r\nlast";
+  const modeOffWire = readWire();
+  for (const [text, pasteMode] of [[prompt, "auto"], ["strict single line", "bracketed"]]) {
+    const refused = await client.callTool({ name: "submit_prompt", arguments: {
+      managedSession: managedName, text, pasteMode, submitRetries: 0,
+    } }, undefined, { timeout: 30000 });
+    assert.equal(refused.isError, true);
+    assert.match(refused.content?.[0]?.text ?? "", /no input was sent/);
+    assert.deepEqual(readWire(), modeOffWire, "unavailable framing must not deliver body or Enter");
+  }
+  const enabled = await client.callTool({ name: "send_text", arguments: {
+    managedSession: managedName, text: "/frame-mode-on", submit: true,
+  } }, undefined, { timeout: 30000 });
+  assert.equal(enabled.isError, undefined, enabled.content?.[0]?.text);
+  let mode = "";
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    mode = (await tmux(["display-message", "-p", "-t", currentMetadata.paneId,
+      "#{bracket_paste_flag}"])).stdout.trim();
+    if (mode !== "0") break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const beforeFramed = readWire().length;
   const submitted = await client.callTool(
     {
       name: "submit_prompt",
       arguments: {
         managedSession: managedName,
         text: prompt,
-        pasteMode: "auto",
+        pasteMode: "bracketed",
         submitRetries: 0,
         chunkDelayMs: 0,
       },
@@ -223,14 +253,24 @@ try {
     undefined,
     { timeout: 30000 }
   );
-  assert.equal(submitted.isError, undefined);
-  const submitPayload = JSON.parse(submitted.content[0].text);
-  assert.equal(submitPayload.status, "submitted", submitted.content[0].text);
-
-  for (let i = 0; i < 20 && !fs.existsSync(outputFile); i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
+  if (mode === "1") {
+    assert.equal(submitted.isError, undefined, submitted.content?.[0]?.text);
+    const submitPayload = JSON.parse(submitted.content[0].text);
+    assert.equal(submitPayload.status, "submitted", submitted.content[0].text);
+    assert.equal(submitPayload.bracketedPasteUsed, true);
+    assert.equal(readWire().subarray(beforeFramed).toString("utf8"), `\x1b[200~${prompt}\x1b[201~\r`);
+    const ack = `ACK:${JSON.stringify(prompt)}`;
+    assert.ok(submitPayload.capture.replaceAll("\n", "").includes(ack),
+      "wire framing and synthetic ACK must preserve the complete logical prompt");
+    assert.equal(submitPayload.transcriptAcknowledged, false,
+      "a synthetic terminal ACK is not a Claude transcript acknowledgement");
+  } else {
+    assert.equal(mode, "", "expected unknown format on older supported tmux, not an observed disabled mode");
+    assert.equal(submitted.isError, true);
+    assert.match(submitted.content?.[0]?.text ?? "", /no input was sent/);
+    assert.equal(readWire().length, beforeFramed);
+    console.log("tmux-integration: mode format unavailable; strict refusal verified, mode-on wire acceptance UNTESTED");
   }
-  assert.equal(fs.readFileSync(outputFile, "utf8"), "alpha\nbeta\n");
 
   const workflowStarted = await client.callTool(
     {

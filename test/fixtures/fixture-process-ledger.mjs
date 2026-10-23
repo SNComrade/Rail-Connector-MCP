@@ -15,6 +15,49 @@ const validPid = (value) => Number.isSafeInteger(value) && value > 0 && value <=
 const runArgument = (runId) => `--rail-fixture-run=${runId}`;
 const HANDLE_LIMIT = 256;
 const INSPECT_TIMEOUT_MS = 15000;
+// Admission retains its existing native/client deadline. Readiness additionally
+// allows the fixture's original UI budget after that bounded admission phase.
+export const FIXTURE_ADMISSION_TIMEOUT_MS = 15000;
+export const FIXTURE_UI_READY_TIMEOUT_MS = 5000;
+export const FIXTURE_READY_TIMEOUT_MS = FIXTURE_ADMISSION_TIMEOUT_MS + FIXTURE_UI_READY_TIMEOUT_MS;
+export const DIRECT_FIXTURE_LEASE_TTL_MS = FIXTURE_READY_TIMEOUT_MS + 10000;
+
+// Capture must remain bound to the caller's exact generation. Injected clock,
+// sleep and capture keep deadline/error regressions independent of native PTYs.
+export async function waitForFixtureReady({ capture, banner, description = "exact test fixture",
+  now = () => performance.now(), sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)) }) {
+  if (typeof capture !== "function" || typeof banner !== "string" || !banner) throw new TypeError("Invalid fixture readiness request");
+  const deadline = now() + FIXTURE_READY_TIMEOUT_MS;
+  const timeout = () => Object.assign(new Error(
+    description + " did not become ready with banner " + banner + " within " + FIXTURE_READY_TIMEOUT_MS +
+    "ms (admission " + FIXTURE_ADMISSION_TIMEOUT_MS + "ms + UI " + FIXTURE_UI_READY_TIMEOUT_MS + "ms)"
+  ), { code: "EFIXTUREREADY" });
+  while (true) {
+    const remaining = deadline - now();
+    if (remaining <= 0) throw timeout();
+    // Bound the broker request too; its normal default exceeds this whole wait.
+    // Preserve early transport/generation errors. At the readiness boundary,
+    // retain an expired broker timeout as the cause of the contextual failure.
+    let captured;
+    try { captured = await capture(Math.ceil(remaining)); }
+    catch (error) {
+      if (error?.code === "ETIMEDOUT" && deadline - now() <= 1) throw Object.assign(timeout(), { cause: error });
+      throw error;
+    }
+    if (typeof captured !== "string") throw new TypeError("Fixture capture must return text");
+    // Exited captures may retain a ready banner, so exit takes precedence.
+    if (captured.startsWith("[managed session exited, code ")) {
+      const code = /^\[managed session exited, code (-?\d+|null)\]/.exec(captured)?.[1] ?? "unreported";
+      throw Object.assign(new Error(description + " exited before readiness (code " + code + ")"), { code: "EFIXTUREEXIT" });
+    }
+    if (now() >= deadline) throw timeout();
+    if (captured.includes(banner)) return;
+    const sleepMs = Math.min(25, deadline - now());
+    if (sleepMs <= 0) throw timeout();
+    await sleep(sleepMs);
+  }
+}
+
 const INSPECT_CAPTURE_LIMIT = 1024 * 1024;
 const KEY_ENV = "RAIL_FAKE_CLAUDE_HANDLE_KEY";
 let controllerAdmission = null;
@@ -165,11 +208,11 @@ function getControllerAdmission() {
   return state;
 }
 
-function requestAdmission(context, record, pipe) {
+function requestAdmission(context, record, pipe, trace) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(pipe);
     socket.setEncoding("utf8");
-    const timeout = setTimeout(() => fail(), 15000);
+    const timeout = setTimeout(() => fail(), FIXTURE_ADMISSION_TIMEOUT_MS);
     timeout.unref();
     let input = "";
     let settled = false;
@@ -181,8 +224,11 @@ function requestAdmission(context, record, pipe) {
     }
     socket.on("error", fail);
     socket.once("close", () => { if (!settled) fail(); });
-    socket.once("connect", () => socket.write(JSON.stringify({ version: 1, runId: record.runId, recordId: record.recordId,
-      pid: record.pid, authorization: mac(context.key, admissionTuple(context, record)) }) + "\n"));
+    socket.once("connect", () => {
+      trace("connected");
+      socket.write(JSON.stringify({ version: 1, runId: record.runId, recordId: record.recordId,
+        pid: record.pid, authorization: mac(context.key, admissionTuple(context, record)) }) + "\n");
+    });
     socket.on("data", (bytes) => {
       input += bytes.toString("utf8");
       if (Buffer.byteLength(input) > 4096) return fail();
@@ -195,13 +241,14 @@ function requestAdmission(context, record, pipe) {
         if (!published) {
           if (Object.keys(response).sort().join() !== "granted,record,version" || response.version !== 1 || response.granted !== true ||
               response.record?.pid !== record.pid || response.record?.recordId !== record.recordId || !authenticatedRecord(response.record, context)) return fail();
+          trace("granted");
           publishFixtureProcessRecord(context.directory, response.record);
           published = true;
           socket.write(JSON.stringify({ version: 1, completed: true, runId: record.runId, recordId: record.recordId, pid: record.pid,
             authorization: mac(context.key, ["fixture-handle-completed", ...admissionTuple(context, record), response.record.holderMac]) }) + "\n");
         } else {
           if (Object.keys(response).sort().join() !== "completed,version" || response.version !== 1 || response.completed !== true) return fail();
-          settled = true; clearTimeout(timeout); socket.end(); resolve();
+          settled = true; clearTimeout(timeout); socket.end(); trace("completed"); resolve();
         }
       } catch { fail(); }
     });
@@ -369,7 +416,7 @@ function captureFixtureProcess(pid, controller) {
 
 // The fake child records itself before accepting any test work. A pending
 // record remains if inspection fails, so cleanup cannot overlook that child.
-export async function recordFixtureProcess() {
+export async function recordFixtureProcess({ onAdmissionPhase } = {}) {
   const directory = process.env.RAIL_FAKE_CLAUDE_PROCESS_DIR;
   if (!directory) return;
   const runId = process.env.RAIL_FAKE_CLAUDE_RUN_ID;
@@ -390,7 +437,13 @@ export async function recordFixtureProcess() {
       !/^\\\\\.\\pipe\\rail-fixture-handles-[0-9a-f-]{36}$/.test(pipe ?? "")) throw new Error("Fixture handle context is unproven; pending evidence was preserved");
   const context = { key: Buffer.from(key, "hex"), directory: fs.realpathSync(directory), controllerPid, controllerCreationFileTime,
     runId, fixturePath: record.fixturePath, executablePath: fs.realpathSync(process.execPath) };
-  await requestAdmission(context, record, pipe);
+  const started = performance.now();
+  const trace = (phase) => {
+    try { onAdmissionPhase?.(phase, Math.round((performance.now() - started) * 1000) / 1000); }
+    catch { /* Optional timing diagnostics never change admission or exit behavior. */ }
+  };
+  trace("request");
+  await requestAdmission(context, record, pipe, trace);
 }
 
 export function publishFixtureProcessRecord(directory, record) {

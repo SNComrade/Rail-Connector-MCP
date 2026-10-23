@@ -10,7 +10,7 @@ export const WINDOWS_BROKER_PROTOCOL = 1;
 // Keep compatibility strict for broker-enforced stop identity and the native
 // terminal backend. An already-running older broker cannot supply these
 // guarantees and must not be reused.
-export const WINDOWS_BROKER_VERSION = "1.0.0-beta.4+broker.6";
+export const WINDOWS_BROKER_VERSION = "1.0.0-beta.5+broker.8";
 const BROKER_START_TIMEOUT_MS = 15000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
@@ -133,18 +133,31 @@ function requestOnce(
   operation,
   payload,
   timeoutMs,
-  launchPolicyFingerprint
+  launchPolicyFingerprint,
+  { signal, onDispatch } = {}
 ) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      const error = new Error("Read-only broker request cancelled before dispatch.");
+      error.code = "ECANCELLED";
+      error.brokerRequestDispatched = false;
+      reject(error);
+      return;
+    }
     const socket = net.createConnection(paths.pipeName);
     let response = "";
     let settled = false;
+    let dispatched = false;
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", aborted);
       socket.destroy();
-      if (error) reject(error);
+      if (error) {
+        error.brokerRequestDispatched = dispatched;
+        reject(error);
+      }
       else resolve(value);
     };
     const timer = setTimeout(() => {
@@ -152,9 +165,21 @@ function requestOnce(
       error.code = "ETIMEDOUT";
       finish(error);
     }, timeoutMs);
+    const aborted = () => {
+      const error = new Error("Read-only broker request cancelled.");
+      error.code = "ECANCELLED";
+      finish(error);
+    };
+    signal?.addEventListener("abort", aborted, { once: true });
+    if (signal?.aborted) aborted();
 
     socket.setEncoding("utf8");
     socket.on("connect", () => {
+      if (settled) return;
+      try {
+      onDispatch?.();
+      // A throw/reset after write is not proof that a mutation was unsent.
+      dispatched = true;
       socket.write(
         `${JSON.stringify({
           protocol: WINDOWS_BROKER_PROTOCOL,
@@ -165,6 +190,7 @@ function requestOnce(
           payload,
         })}\n`
       );
+      } catch (error) { finish(error); }
     });
     socket.on("data", (chunk) => {
       response += chunk;
@@ -181,6 +207,7 @@ function requestOnce(
         if (!parsed.ok) {
           const error = new Error(parsed.error || `Windows broker operation failed: ${operation}`);
           error.code = parsed.code || "EBROKER";
+          error.brokerReplyReceived = true;
           finish(error);
         } else {
           finish(null, parsed.result);
@@ -412,7 +439,7 @@ async function stopInactiveBroker(
   throw error;
 }
 
-async function readyBrokerPaths(env, startIfMissing) {
+async function readyBrokerPaths(env, startIfMissing, signal) {
   const tokenPaths = windowsBrokerPaths(env);
   // A no-start request is a read-only availability check. In particular,
   // conditional stops must not create, replace, or repair a shared broker
@@ -433,7 +460,8 @@ async function readyBrokerPaths(env, startIfMissing) {
       "ping",
       {},
       1500,
-      launchPolicyFingerprint
+      launchPolicyFingerprint,
+      { signal }
     );
     if (
       ping.version !== WINDOWS_BROKER_VERSION ||
@@ -468,23 +496,43 @@ async function readyBrokerPaths(env, startIfMissing) {
 export async function windowsBrokerRequest(
   operation,
   payload = {},
-  { startIfMissing = true, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, env = process.env } = {}
+  { startIfMissing = true, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, env = process.env, signal, onDispatch } = {}
 ) {
-  const { paths, token, launchPolicyFingerprint } =
-    await readyBrokerPaths(env, startIfMissing);
+  // Signals are deliberately limited to observations. acquire/renew/release and
+  // product mutations must settle their original bounded outcome after dispatch.
+  if (signal && !new Set(["ping", "status", "metadata", "conditionalMetadata",
+    "conditionalStopMetadata", "capture", "isRunning", "listSessions"]).has(operation)) {
+    const error = new Error("Cancellation is supported only for read-only broker requests.");
+    error.code = "EINVAL";
+    error.brokerRequestDispatched = false;
+    throw error;
+  }
+  let paths;
+  let operationStarted = false;
   try {
+    if (signal?.aborted) {
+      const error = new Error("Read-only broker request cancelled before dispatch.");
+      error.code = "ECANCELLED";
+      throw error;
+    }
+    const ready = await readyBrokerPaths(env, startIfMissing, signal);
+    paths = ready.paths;
+    const { token, launchPolicyFingerprint } = ready;
+    operationStarted = true;
     const result = await requestOnce(
       paths,
       token,
       operation,
       payload,
       timeoutMs,
-      launchPolicyFingerprint
+      launchPolicyFingerprint,
+      { signal, onDispatch }
     );
     if (operation === "shutdown") forgetReadyBroker(paths);
     return result;
   } catch (error) {
-    if (isBrokerUnavailable(error)) forgetReadyBroker(paths);
+    if (!operationStarted || error.brokerRequestDispatched === undefined) error.brokerRequestDispatched = false;
+    if (paths && isBrokerUnavailable(error)) forgetReadyBroker(paths);
     throw error;
   }
 }
@@ -492,29 +540,34 @@ export async function windowsBrokerRequest(
 export async function windowsBrokerCleanupRequest(
   operation,
   payload = {},
-  { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, env = process.env } = {}
+  { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, env = process.env, onDispatch } = {}
 ) {
-  if (!COMPATIBILITY_CLEANUP_OPERATIONS.has(operation)) {
-    const error = new Error(
-      `Unsupported Windows broker compatibility cleanup operation: ${operation}`
-    );
-    error.code = "EINVAL";
-    throw error;
-  }
-  const tokenPaths = windowsBrokerPaths(env);
-  const token = readExistingBrokerToken(tokenPaths);
-  const paths = windowsBrokerPaths(env, token);
+  let paths;
   try {
+    if (!COMPATIBILITY_CLEANUP_OPERATIONS.has(operation)) {
+      const error = new Error(
+        `Unsupported Windows broker compatibility cleanup operation: ${operation}`
+      );
+      error.code = "EINVAL";
+      throw error;
+    }
+    const tokenPaths = windowsBrokerPaths(env);
+    const token = readExistingBrokerToken(tokenPaths);
+    paths = windowsBrokerPaths(env, token);
     return await requestOnce(
       paths,
       token,
       operation,
       payload,
       timeoutMs,
-      windowsBrokerLaunchPolicyFingerprint(env)
+      windowsBrokerLaunchPolicyFingerprint(env),
+      { onDispatch }
     );
   } catch (error) {
-    if (isBrokerUnavailable(error)) forgetReadyBroker(paths);
+    // requestOnce annotates transport outcomes. Earlier validation/token errors
+    // are definitely unsent; retain any dispatch/reply evidence it supplied.
+    if (error.brokerRequestDispatched === undefined) error.brokerRequestDispatched = false;
+    if (paths && isBrokerUnavailable(error)) forgetReadyBroker(paths);
     throw error;
   }
 }

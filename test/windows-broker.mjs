@@ -5,20 +5,269 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createFixtureProcessLedger } from "./fixtures/fixture-process-ledger.mjs";
-import {
+import vm from "node:vm";
+
+// Evaluate the real handler and its helpers without broker startup, imports,
+// sockets, child processes, node-pty, or native fixtures. Timers and renderer
+// observations are inert boundaries; the chunk loop and its guards are not copied.
+async function framedZeroDelayInertTests() {
+  const brokerSource = fs.readFileSync(new URL("../src/windows-broker.js", import.meta.url), "utf8");
+  const terminalSource = fs.readFileSync(new URL("../src/terminal.js", import.meta.url), "utf8");
+  function sourceRange(source, startMarker, endMarker) {
+    const start = source.indexOf(startMarker);
+    const end = source.indexOf(endMarker, start);
+    assert.ok(start >= 0 && end > start, `Missing inert source boundary: ${startMarker}`);
+    assert.equal(source.indexOf(startMarker, start + startMarker.length), -1);
+    return source.slice(start, end);
+  }
+  const librarySource = [
+    sourceRange(terminalSource, "const TERMINAL_CONTROL_RE =", "function terminalText(").replace(/^export /gm, ""),
+    sourceRange(brokerSource, "const MAX_REQUEST_BYTES =", "function argumentValue("),
+    sourceRange(brokerSource, "function sleep(ms)", "const server = net.createServer"),
+    "({ handleOperation, sessions })",
+  ].join("\n");
+  function fixture({ firstBodyEffect, framed = true } = {}) {
+    const writes = [];
+    const sleeps = [];
+    const state = { flushes: 0, pendingModeOff: false, bodyObserved: false };
+    const context = vm.createContext({
+      setTimeout(callback, delay) {
+        assert.ok(sleeps.length < 100, "Inert handler exceeded its timer budget");
+        sleeps.push(delay);
+        queueMicrotask(callback);
+      },
+    }, { codeGeneration: { strings: false, wasm: false } });
+    const { handleOperation, sessions } = new vm.Script(librarySource, {
+      filename: "windows-broker-inert-source.js",
+    }).runInContext(context, { timeout: 1000 });
+    const session = {
+      generationId: "inert-framed-zero-generation",
+      startedAtMs: 123456,
+      exited: false,
+      recoveryOnly: false,
+      lease: { id: "inert-framed-zero-lease", expiresAt: Date.now() + 60_000 },
+      renderer: {
+        bracketedPasteMode: framed,
+        async flush() {
+          state.flushes += 1;
+          await Promise.resolve();
+          if (state.pendingModeOff) this.bracketedPasteMode = false;
+        },
+      },
+      ptyProcess: {
+        write(text) {
+          writes.push(text);
+          if (!state.bodyObserved && text !== "\x1b[200~") {
+            state.bodyObserved = true;
+            queueMicrotask(() => firstBodyEffect?.({ session, sessions, state }));
+          }
+        },
+      },
+    };
+    sessions.set("inert_framed_zero", session);
+    return {
+      session, writes, sleeps, state,
+      send(text, overrides = {}) {
+        return handleOperation("sendText", {
+          sessionName: "inert_framed_zero",
+          requireExactPair: true,
+          expectedGenerationId: session.generationId,
+          expectedStartedAtMs: session.startedAtMs,
+          leaseId: "inert-framed-zero-lease",
+          text, bracketedPaste: framed, requireBracketedPaste: framed,
+          chunkSize: 256, chunkDelayMs: 0, submit: true,
+          ...overrides,
+        });
+      },
+    };
+  }
+  const cases = [
+    ["framed zero-delay observes queued mode loss before later body", async () => {
+      const f = fixture({ firstBodyEffect: ({ state }) => { state.pendingModeOff = true; } });
+      const text = `${"x".repeat(256)}\nsecond\rthird${"y".repeat(300)}`;
+      await assert.rejects(f.send(text), (error) => error.code === "EPASTEMODE");
+      assert.deepEqual(f.writes.map((text) => text.length), [6, 256],
+        "Mode loss must prevent later body/newlines, closing frame, and Enter");
+      assert.deepEqual(f.writes, ["\x1b[200~", text.slice(0, 256)]);
+      assert.equal(f.session.recoveryOnly, true);
+      assert.deepEqual(f.sleeps, [0]);
+      assert.equal(f.state.flushes, 2);
+    }],
+    ["framed zero-delay preserves Unicode and line endings", async () => {
+      const f = fixture();
+      const text = `${"x".repeat(255)}🚀\tline\nnext\r${"y".repeat(300)}`;
+      const result = await f.send(text);
+      assert.equal(result.bracketedPasteUsed, true);
+      assert.deepEqual(f.writes, ["\x1b[200~", text.slice(0, 255), text.slice(255, 511), text.slice(511), "\x1b[201~", "\r"]);
+      assert.deepEqual(f.sleeps, [0, 0, 100, 400]);
+      assert.equal(f.state.flushes, 5);
+    }],
+    ["unframed zero-delay keeps uninterrupted chunk pacing", async () => {
+      const f = fixture({ framed: false });
+      const text = "u".repeat(600);
+      const result = await f.send(text);
+      assert.equal(result.bracketedPasteUsed, false);
+      assert.deepEqual(f.writes, [text.slice(0, 256), text.slice(256, 512), text.slice(512), "\r"]);
+      assert.deepEqual(f.sleeps, [100, 400]);
+      assert.equal(f.state.flushes, 0);
+    }],
+    ...[
+      ["generation", "ESTALE", ({ sessions, session }) => sessions.set("inert_framed_zero", { ...session })],
+      ["lease", "ELEASE", ({ session }) => { session.lease = null; }],
+      ["exit", null, ({ session }) => { session.exited = true; }],
+      ["terminal fault", "ERECOVERY", ({ session }) => { session.terminalErrorCode = "EIO"; }],
+    ].map(([name, code, firstBodyEffect]) => [
+      `framed zero-delay rechecks ${name} after yielding`, async () => {
+        const f = fixture({ firstBodyEffect });
+        const text = "g".repeat(600);
+        await assert.rejects(f.send(text), (error) => code
+          ? error.code === code
+          : /Managed native Windows Claude session has exited: inert_framed_zero/.test(error.message));
+        assert.deepEqual(f.writes, ["\x1b[200~", text.slice(0, 256)]);
+        assert.deepEqual(f.sleeps, [0]);
+        assert.equal(f.state.flushes, 1);
+      },
+    ]),
+  ];
+  const failures = [];
+  for (const [name, test] of cases) {
+    try {
+      await test();
+      console.log(`windows-broker inert PASS: ${name}`);
+    } catch (error) {
+      console.error(`windows-broker inert FAIL: ${name}\n${error.stack}`);
+      failures.push(error);
+    }
+  }
+  assert.equal(failures.length, 0, `${failures.length} framed zero-delay inert regression(s) failed`);
+  console.log(`windows-broker inert: ${cases.length} actual-handler cases passed; no native boundaries`);
+}
+
+await framedZeroDelayInertTests();
+if (process.argv.includes("--framed-zero-inert-only")) process.exit(0);
+
+async function compatibilityCleanupClientTests() {
+  const { windowsBrokerCleanupRequest, windowsBrokerPaths } =
+    await import("../src/windows-broker-client.js");
+  const tempRoot = path.resolve(os.tmpdir());
+  const directory = fs.mkdtempSync(path.join(tempRoot, "rail-cleanup-client-"));
+  const absent = path.join(directory, "absent");
+  const env = { ...process.env, RAIL_CONNECTOR_STATE_DIR: absent };
+  let dispatches = 0;
+  const options = { env, timeoutMs: 1000, onDispatch() { dispatches += 1; } };
+  function undispatched(code) {
+    return (error) => {
+      assert.equal(error.code, code);
+      assert.equal(error.brokerRequestDispatched, false);
+      assert.equal(error.brokerReplyReceived, undefined);
+      return true;
+    };
+  }
+  try {
+    await assert.rejects(windowsBrokerCleanupRequest("status", {}, options), undispatched("EINVAL"));
+    for (const operation of ["acquireCleanupLease", "releaseCleanupLease", "cleanupStop"]) {
+      await assert.rejects(windowsBrokerCleanupRequest(operation, {}, options), undispatched("ENOENT"));
+    }
+    assert.equal(fs.existsSync(absent), false, "cleanup must not create an absent token directory");
+    assert.equal(dispatches, 0);
+
+    const cause = new Error("synthetic metadata cause");
+    const metadataError = Object.assign(new Error("synthetic pre-dispatch metadata failure", { cause }), {
+      code: "EACCES",
+    });
+    const metadataEnv = { get RAIL_CONNECTOR_STATE_DIR() { throw metadataError; } };
+    await assert.rejects(windowsBrokerCleanupRequest("cleanupStop", {}, {
+      ...options, env: metadataEnv,
+    }), (error) => {
+      assert.equal(error, metadataError, "metadata errors must retain object identity");
+      assert.equal(error.cause, cause);
+      assert.equal(error.message, "synthetic pre-dispatch metadata failure");
+      return undispatched("EACCES")(error);
+    });
+
+    const state = path.join(directory, "state");
+    const token = "a".repeat(64);
+    const localEnv = { ...process.env, RAIL_CONNECTOR_STATE_DIR: state };
+    const paths = windowsBrokerPaths(localEnv, token);
+    fs.mkdirSync(state);
+    fs.writeFileSync(paths.tokenFile, "short\n", { flag: "wx" });
+    await assert.rejects(windowsBrokerCleanupRequest("cleanupStop", {}, {
+      ...options, env: localEnv,
+    }), undispatched("EAUTH"));
+    assert.equal(fs.readFileSync(paths.tokenFile, "utf8"), "short\n", "cleanup must not repair a token");
+    assert.equal(dispatches, 0);
+    fs.writeFileSync(paths.tokenFile, `${token}\n`);
+
+    async function responseCase(reply) {
+      const sockets = new Set();
+      let requests = 0;
+      const server = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.on("error", () => {});
+        socket.once("close", () => sockets.delete(socket));
+        socket.once("data", () => {
+          requests += 1;
+          socket.end(reply);
+        });
+      });
+      try {
+        await new Promise((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(paths.pipeName, resolve);
+        });
+        let dispatched = 0;
+        await assert.rejects(windowsBrokerCleanupRequest("cleanupStop", {}, {
+          env: localEnv, timeoutMs: 1000, onDispatch() { dispatched += 1; },
+        }), (error) => {
+          assert.equal(error.brokerRequestDispatched, true, "delivery uncertainty must remain dispatched");
+          assert.equal(error.brokerReplyReceived, reply ? true : undefined);
+          assert.equal(error.code, reply ? "ESTALE" : "ECONNRESET");
+          if (reply) assert.equal(error.message, "synthetic stale generation");
+          return true;
+        });
+        assert.equal(dispatched, 1);
+        assert.equal(requests, 1);
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        if (server.listening) await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      }
+    }
+    await responseCase(); // Request received, reply lost: outcome remains uncertain.
+    await responseCase(`${JSON.stringify({ ok: false, code: "ESTALE", error: "synthetic stale generation" })}\n`);
+    assert.equal(fs.readFileSync(paths.tokenFile, "utf8"), `${token}\n`);
+    assert.deepEqual(fs.readdirSync(state), ["broker-token"], "client checks must not start a broker");
+    console.log("windows-broker cleanup client: pre-dispatch validation/token/metadata and dispatched uncertainty/reply checks passed");
+  } finally {
+    if (path.dirname(path.resolve(directory)) === tempRoot &&
+        path.basename(directory).startsWith("rail-cleanup-client-")) {
+      fs.rmSync(directory, { recursive: true, force: true });
+    } else {
+      console.error("Refusing cleanup outside the exact task-owned temporary root.");
+      process.exitCode = 1;
+    }
+  }
+}
+
+await compatibilityCleanupClientTests();
+if (process.argv.includes("--cleanup-client-only")) process.exit();
+
+const { createFixtureProcessLedger, inspectFixtureProcess, readFixtureProcessRecords,
+  waitForFixtureReady, FIXTURE_READY_TIMEOUT_MS, DIRECT_FIXTURE_LEASE_TTL_MS
+} = await import("./fixtures/fixture-process-ledger.mjs");
+const {
+  WINDOWS_BROKER_VERSION,
   probeWindowsBroker,
   windowsBrokerLaunchPolicyFingerprint,
   windowsBrokerPaths,
   windowsBrokerCleanupRequest,
   windowsBrokerRequest,
-} from "../src/windows-broker-client.js";
+} = await import("../src/windows-broker-client.js");
 
 await import("./fixture-process-ledger.mjs");
 
 if (process.platform !== "win32") {
   console.log("windows-broker skipped on non-Windows");
-  process.exit(0);
+  process.exit();
 }
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -26,6 +275,7 @@ const canonicalRepoRoot =
   fs.realpathSync.native?.(repoRoot) ?? fs.realpathSync(repoRoot);
 const fixture = path.join(repoRoot, "test", "fixtures", "fake-claude-tui.mjs");
 const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "rail-connector-broker-"));
+console.log(`windows-broker owned state ${stateDir}`);
 const fixtureLedger = await createFixtureProcessLedger({ directory: path.join(stateDir, "fixture-processes"), fixturePath: fixture });
 const fixtureLedgers = new Set([fixtureLedger]);
 const previousFixtureEnvironment = Object.fromEntries(Object.keys(fixtureLedger.environment).map((key) => [key, process.env[key]]));
@@ -42,10 +292,16 @@ process.env.RAIL_CONNECTOR_CLAUDE_PATH = process.execPath;
 // loaded into the broker), plus the end-to-end facts that terminal can show.
 const fakeTerminalSeesPasteMarkers = Number(process.versions.node.split(".")[0]) >= 22;
 const previousNodeOptions = process.env.NODE_OPTIONS;
+const previousNodeEnv = process.env.NODE_ENV;
+const previousBrokerErrorDir = process.env.RAIL_TEST_BROKER_ERROR_DIR;
+process.env.NODE_ENV = "test";
+process.env.RAIL_TEST_BROKER_ERROR_DIR = stateDir;
+const errorPreload = pathToFileURL(path.join(repoRoot, "test", "fixtures", "broker-error-injection.mjs"));
+process.env.NODE_OPTIONS = [previousNodeOptions, `--import=${errorPreload.href}`].filter(Boolean).join(" ");
 const ptyWriteReceipt = path.join(stateDir, "pty-writes.jsonl");
 if (!fakeTerminalSeesPasteMarkers) {
   const recorder = pathToFileURL(path.join(repoRoot, "test", "fixtures", "pty-write-recorder-loader.mjs"));
-  process.env.NODE_OPTIONS = [previousNodeOptions, `--import=${recorder.href}`].filter(Boolean).join(" ");
+  process.env.NODE_OPTIONS = [process.env.NODE_OPTIONS, `--import=${recorder.href}`].filter(Boolean).join(" ");
   process.env.RAIL_TEST_PTY_WRITE_RECEIPT = ptyWriteReceipt;
   console.log(`windows-broker: Node ${process.versions.node} fake terminal cannot see paste markers; keyword framing is verified at the broker's PTY writes`);
 }
@@ -100,6 +356,24 @@ async function waitForCapture(pattern) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`Timed out waiting for broker capture: ${capture}`);
+}
+
+// Startup includes authenticated fixture admission. Keep generic ACK/framing
+// waits above on their original operation-specific deadline.
+async function waitForBrokerFixtureReady(name, metadata) {
+  let capture = "";
+  await waitForFixtureReady({
+    banner: "Fake Claude TUI", description: "broker fixture " + name,
+    capture: async (timeoutMs) => {
+      capture = (await windowsBrokerRequest("capture", {
+        sessionName: name, lines: 80, requireExactPair: true,
+        expectedGenerationId: metadata.generationId,
+        expectedStartedAtMs: metadata.startedAtMs,
+      }, { startIfMissing: false, timeoutMs })).capture;
+      return capture;
+    },
+  });
+  return capture;
 }
 
 let legacyServer = null;
@@ -226,6 +500,7 @@ try {
   const olderVersionPaths = windowsBrokerPaths(olderVersionEnv, olderVersionToken);
   const olderVersionOperations = [];
   const olderVersionPolicy = windowsBrokerLaunchPolicyFingerprint(olderVersionEnv);
+  let olderVersionActive = true;
   olderVersionServer = net.createServer((socket) => {
     socket.setEncoding("utf8");
     let request = "";
@@ -239,10 +514,14 @@ try {
         ok: true,
         result: {
           protocol: 1,
-          version: "1.2.0+agility.12",
+          version: "1.2.0+agility.16",
           launchPolicyFingerprint: olderVersionPolicy,
+          ...(message.operation === "status" ? { managedSessions: olderVersionActive
+            ? [{ name: "inert-predecessor-session", exited: false }] : [] } : {}),
         },
-      })}\n`);
+      })}\n`, () => {
+        if (message.operation === "shutdown") olderVersionServer.close();
+      });
     });
   });
   await new Promise((resolve, reject) => {
@@ -268,8 +547,37 @@ try {
     ["ping"],
     "an older same-policy broker must be rejected before exact-stop metadata dispatch"
   );
-  await new Promise((resolve) => olderVersionServer.close(resolve));
-  olderVersionServer = null;
+  await assert.rejects(windowsBrokerRequest("ping", {}, { env: olderVersionEnv }),
+    (error) => error.code === "EBROKERUPGRADE");
+  assert.deepEqual(olderVersionOperations.slice(1), ["ping", "status"],
+    "the immediate predecessor with an active session must not receive shutdown");
+  assert.equal(olderVersionServer.listening, true);
+  olderVersionActive = false;
+  const idleOperationsBefore = olderVersionOperations.length;
+  try {
+    // Only this owned inert predecessor is retired. The replacement is an
+    // ordinary current broker in this test's unique token/state, with no PTY.
+    const upgraded = await windowsBrokerRequest("ping", {}, { env: olderVersionEnv });
+    assert.equal(upgraded.version, WINDOWS_BROKER_VERSION);
+    assert.ok(Number.isSafeInteger(upgraded.pid) && upgraded.pid > 0);
+    assert.deepEqual(olderVersionOperations.slice(idleOperationsBefore), ["ping", "status", "shutdown"],
+      "an idle predecessor must be queried then shut down before the current broker is accepted");
+    console.log("broker compatibility evidence agility.16 predecessor active refused; idle replaced by agility.17");
+  } finally {
+    if (olderVersionServer.listening) await new Promise((resolve) => olderVersionServer.close(resolve));
+    olderVersionServer = null;
+    const current = await probeWindowsBroker(olderVersionEnv);
+    if (current) {
+      assert.equal(current.compatible, true, "owned replacement cleanup must identify the current broker");
+      assert.deepEqual(current.managedSessions, []);
+      await windowsBrokerRequest("shutdown", {}, { env: olderVersionEnv, startIfMissing: false });
+      const deadline = Date.now() + 5000;
+      while (await probeWindowsBroker(olderVersionEnv)) {
+        assert.ok(Date.now() < deadline, "owned compatibility replacement failed to exit");
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+  }
   const legacyIdentity = createHash("sha256")
     .update(`${os.userInfo().username}\0${stateDir.toLowerCase()}`)
     .digest("hex")
@@ -307,6 +615,351 @@ try {
   assert.equal(legacyData.includes(brokerToken), false);
   await new Promise((resolve) => legacyServer.close(resolve));
   legacyServer = null;
+
+  // Faults run only inside this test's real broker, never a shared runtime.
+  // Every request below forbids restart so a crash cannot masquerade as recovery.
+  {
+  const faultReceipts = path.join(stateDir, "broker-error-receipts.jsonl");
+  const faultControl = path.join(stateDir, "broker-error-control.json");
+  const noStart = { startIfMissing: false };
+  const readFaults = () => fs.existsSync(faultReceipts)
+    ? fs.readFileSync(faultReceipts, "utf8").split("\n").slice(0, -1).filter(Boolean).map((line) => JSON.parse(line))
+    : [];
+  let faultId = 0;
+  function armFault(command) {
+    const id = ++faultId;
+    fs.writeFileSync(faultControl, JSON.stringify({ ...command, id }), { flag: "wx" });
+    return id;
+  }
+  async function faultReceipt(id) {
+    let record;
+    const deadline = Date.now() + 5000;
+    do {
+      record = readFaults().find((entry) => entry.id === id);
+      if (record) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    } while (Date.now() < deadline);
+    assert.ok(record, "deterministic broker fault was not acknowledged");
+    return record;
+  }
+  async function sameBroker() {
+    const status = await windowsBrokerRequest("status", {}, noStart);
+    assert.equal(status.pid, ping.pid, "fault must not restart the broker");
+    return status;
+  }
+  async function rawConnection(text) {
+    await new Promise((resolve, reject) => {
+      const socket = net.createConnection(windowsBrokerPaths(process.env, brokerToken).pipeName);
+      const timer = setTimeout(() => { socket.destroy(); reject(new Error("owned socket did not close")); }, 5000);
+      socket.on("error", () => {});
+      socket.on("close", () => { clearTimeout(timer); resolve(); });
+      socket.on("connect", () => socket.write(text));
+      socket.resume();
+    });
+  }
+  let id = armFault({ kind: "socket", stage: "setup", code: "private-error-code\n" });
+  await rawConnection("not-json\n");
+  assert.equal((await faultReceipt(id)).destroyed, true);
+  await sameBroker();
+  id = armFault({ kind: "socket", stage: "reply", code: "ECONNRESET" });
+  await assert.rejects(windowsBrokerRequest("ping", {}, noStart));
+  assert.equal((await faultReceipt(id)).responseOk, true);
+  assert.equal((await faultReceipt(id)).destroyed, true);
+  await sameBroker();
+  id = armFault({ kind: "socket", stage: "reply", code: "ECONNRESET" });
+  await rawConnection("not-json\n");
+  assert.equal((await faultReceipt(id)).responseOk, false);
+  assert.equal((await faultReceipt(id)).destroyed, true);
+  await sameBroker();
+
+  const faultName = `${sessionName}_fault`;
+  const healthyName = `${sessionName}_healthy`;
+  const faultLease = "fault-generation-lease";
+  const healthyLease = "healthy-generation-lease";
+  async function startErrorFixture(name, lease, target, ledger = fixtureLedger) {
+    return windowsBrokerRequest("start", {
+      sessionName: name, command: process.execPath,
+      args: [fixture, ...ledger.fixtureArgs], metadataCommand: process.execPath,
+      metadataArgs: [fixture, ...ledger.fixtureArgs],
+      cwd: repoRoot, canonicalCwd: canonicalRepoRoot,
+      env: { ...process.env, ...ledger.environment, RAIL_TEST_BROKER_ERROR_TARGET: target },
+      leaseId: lease, leaseTtlMs: 120000,
+    }, noStart);
+  }
+  const failedStart = await startErrorFixture(faultName, faultLease, "fault");
+  const healthyStart = await startErrorFixture(healthyName, healthyLease, "healthy");
+  const failedBinding = { expectedGenerationId: failedStart.metadata.generationId, expectedStartedAtMs: failedStart.metadata.startedAtMs };
+  const healthyBinding = { expectedGenerationId: healthyStart.metadata.generationId, expectedStartedAtMs: healthyStart.metadata.startedAtMs };
+  // Actual onExit callbacks are buffered only by the preload, making the
+  // distinction between an error and confirmed exit deterministic.
+  id = armFault({ kind: "terminal", stage: "setup", target: "fault", code: "ECONNRESET" });
+  await windowsBrokerRequest("ping", {}, noStart);
+  await faultReceipt(id);
+  let faulted = (await sameBroker()).managedSessions.find((entry) => entry.name === faultName);
+  assert.equal(faulted.recoveryOnly, true);
+  assert.equal(faulted.terminalErrorCode, "ECONNRESET");
+  assert.equal(faulted.exited, false, "error alone must not claim child exit");
+  assert.equal(faulted.exitCode, null);
+  assert.equal(faulted.pid, failedStart.metadata.pid);
+  assert.equal(faulted.generationId, failedStart.metadata.generationId);
+  await assert.rejects(windowsBrokerRequest("sendText", {
+    sessionName: faultName, text: "must-not-send", submit: true,
+    leaseId: faultLease, ...failedBinding,
+  }, noStart), (error) => error.code === "ERECOVERY");
+  await assert.rejects(windowsBrokerRequest("stop", {
+    sessionName: faultName, force: true, leaseId: faultLease,
+  }, noStart), /exact expectedGenerationId/);
+  assert.equal((await windowsBrokerRequest("acquireLease", {
+    sessionName: faultName, leaseId: "foreign-lease", ...failedBinding,
+  }, noStart)).status, "busy", "terminal failure must preserve the existing lease");
+  await waitForBrokerFixtureReady(healthyName, healthyStart.metadata);
+  await windowsBrokerRequest("sendText", {
+    sessionName: healthyName, text: "error-isolated-healthy", submit: true,
+    leaseId: healthyLease, ...healthyBinding,
+  }, noStart);
+  let healthyCapture = "";
+  const healthyDeadline = Date.now() + 10000;
+  do {
+    healthyCapture = (await windowsBrokerRequest("capture", { sessionName: healthyName, ...healthyBinding }, noStart)).capture;
+    if (healthyCapture.includes("ACK:error-isolated-healthy")) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } while (Date.now() < healthyDeadline);
+  assert.match(healthyCapture, /ACK:error-isolated-healthy/);
+  const pendingFaultStop = windowsBrokerRequest("stop", {
+    sessionName: faultName, force: true, leaseId: faultLease, ...failedBinding,
+  }, noStart).then((value) => ({ value }), (error) => ({ error }));
+  const exitDeadline = Date.now() + 4000;
+  while (!readFaults().some((entry) => entry.kind === "actualExitBuffered" && entry.target === "fault") && Date.now() < exitDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(readFaults().some((entry) => entry.kind === "actualExitBuffered" && entry.target === "fault"));
+  id = armFault({ kind: "releaseExit", stage: "setup", target: "fault", code: "private-error-code\n" });
+  await windowsBrokerRequest("ping", {}, noStart);
+  const releasedExit = await faultReceipt(id);
+  assert.ok(Number.isInteger(releasedExit.observedExit), "released exit must carry numeric actual evidence");
+  const faultStop = await pendingFaultStop;
+  if (faultStop.error) throw faultStop.error;
+  assert.equal(faultStop.value.status, "stopped");
+  assert.ok(Number.isInteger(faultStop.value.exitCode));
+  assert.equal(faultStop.value.exitCode, releasedExit.observedExit, "duplicate callback must retain actual exit evidence");
+  // Real socket destruction, with unmodified/unheld public onExit delivery.
+  // A separate authenticated ledger isolates exact-owned native cleanup.
+  for (const channel of ["outputSocket", "inputSocket"]) {
+    const ledger = await createFixtureProcessLedger({ directory: path.join(stateDir, `${channel}-processes`), fixturePath: fixture });
+    fixtureLedgers.add(ledger);
+    const name = `${sessionName}_${channel}`;
+    const leaseId = `${channel}-lease`;
+    const started = await startErrorFixture(name, leaseId, channel, ledger);
+    const binding = { expectedGenerationId: started.metadata.generationId, expectedStartedAtMs: started.metadata.startedAtMs };
+    let record;
+    const publicationDeadline = Date.now() + FIXTURE_READY_TIMEOUT_MS;
+    do {
+      const records = await readFixtureProcessRecords(ledger.directory, ledger.runId);
+      record = records.find((entry) => entry.pid === started.metadata.pid && entry.state === "ready");
+      if (record) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } while (Date.now() < publicationDeadline);
+    assert.ok(record, "socket fault child must have an authenticated ledger record");
+    const assertOwnedAlive = () => {
+      assert.equal(record.runId, ledger.runId);
+      assert.equal(path.resolve(record.fixturePath).toLowerCase(), path.resolve(fixture).toLowerCase());
+      for (let check = 0; check < 2; check += 1) {
+        const identity = inspectFixtureProcess(record.pid);
+        assert.equal(identity.creationFileTime, record.creationFileTime);
+        assert.equal(path.resolve(identity.executablePath).toLowerCase(), path.resolve(process.execPath).toLowerCase());
+        // Read-only native signal-zero observation bracketed by exact birth
+        // checks. Actual termination later uses authenticated retained handles.
+        if (check === 0) process.kill(record.pid, 0);
+      }
+    };
+    assertOwnedAlive();
+    id = armFault({ kind: channel, stage: "setup", target: channel, code: "ECONNRESET" });
+    await windowsBrokerRequest("ping", {}, noStart);
+    await faultReceipt(id);
+    if (channel === "outputSocket") {
+      const deadline = Date.now() + 3000;
+      while (!readFaults().some((entry) => entry.kind === "onExitObserved" && entry.target === channel) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.ok(readFaults().some((entry) => entry.kind === "onExitObserved" && entry.target === channel && entry.numeric === false && entry.held === false),
+        "actual output close must expose the unheld unknown-exit regression");
+    }
+    const failed = (await sameBroker()).managedSessions.find((entry) => entry.name === name);
+    assert.equal(failed.recoveryOnly, true);
+    assert.equal(failed.terminalErrorCode, "ECONNRESET");
+    if (channel === "outputSocket" || !failed.exited) {
+      assert.equal(failed.exited, false);
+      assert.equal(failed.exitCode, null);
+    } else {
+      assert.ok(Number.isInteger(failed.exitCode), "input EOF may end the fixture, but only numeric exit evidence is accepted");
+      assert.ok(readFaults().some((entry) => entry.kind === "nativeExitObserved" && entry.target === channel && entry.exitCode === failed.exitCode));
+      assert.ok(readFaults().some((entry) => entry.kind === "onExitObserved" && entry.target === channel && entry.numeric && entry.held === false));
+    }
+    assert.equal(failed.generationId, binding.expectedGenerationId);
+    if (channel === "outputSocket") assertOwnedAlive(); // Output close is not native child-exit proof.
+    await windowsBrokerRequest("sendText", { sessionName: healthyName, text: `healthy-after-${channel}`, submit: true,
+      leaseId: healthyLease, ...healthyBinding }, noStart);
+    const healthyUntil = Date.now() + 5000;
+    let capture = "";
+    do {
+      capture = (await windowsBrokerRequest("capture", { sessionName: healthyName, ...healthyBinding }, noStart)).capture;
+      if (capture.includes(`ACK:healthy-after-${channel}`)) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } while (Date.now() < healthyUntil);
+    assert.ok(capture.includes(`ACK:healthy-after-${channel}`));
+    if (channel === "outputSocket" && process.argv.includes("--exercise-fault-cleanup")) {
+      throw new Error("Intentional actual-socket fault-cleanup exercise");
+    }
+    const stopped = await windowsBrokerRequest("stop", { sessionName: name, force: true, leaseId, ...binding }, noStart);
+    if (channel === "outputSocket") assert.equal(stopped.status, "stop_timeout", "unknown output-close evidence must not manufacture a stopped result");
+    else assert.ok(["stopped", "not_running", "stop_timeout"].includes(stopped.status));
+    if (stopped.status !== "stop_timeout") {
+      assert.ok(Number.isInteger(stopped.exitCode));
+      assert.ok(readFaults().some((entry) => entry.kind === "nativeExitObserved" && entry.target === channel && entry.exitCode === stopped.exitCode));
+      assert.ok(readFaults().some((entry) => entry.kind === "onExitObserved" && entry.target === channel && entry.numeric && entry.held === false));
+    }
+    else {
+      const retained = (await sameBroker()).managedSessions.find((entry) => entry.name === name);
+      assert.equal(retained.exited, false);
+      assert.equal(retained.exitCode, null);
+      assert.equal(retained.recoveryOnly, true);
+      await assert.rejects(windowsBrokerRequest("shutdown", {}, noStart), /sessions are running/);
+    }
+    // Retained handles verify original-child extinction (or perform exact-owned
+    // recovery); neither a stale PID nor public onExit is substituted for it.
+    const reaped = await ledger.reap({ graceMs: 0, final: true });
+    assert.deepEqual(reaped, [], "the exact ConPTY stop must have ended this original child");
+    if (stopped.status === "stop_timeout") {
+      assert.ok(readFaults().some((entry) => entry.kind === "nativeExitObserved" && entry.target === channel && Number.isInteger(entry.exitCode)));
+      id = armFault({ kind: "cleanupNativeExits", stage: "setup" });
+      await windowsBrokerRequest("ping", {}, noStart);
+      await faultReceipt(id);
+      assert.ok(readFaults().some((entry) => entry.kind === "syntheticNativeExitCleanup" && entry.target === channel && entry.synthetic));
+      const lease = await windowsBrokerRequest("acquireLease", { sessionName: name, leaseId, ...binding }, noStart);
+      assert.equal(lease.status, "acquired");
+      assert.equal((await windowsBrokerRequest("stop", { sessionName: name, force: true, leaseId, ...binding }, noStart)).status, "not_running");
+    }
+    console.log(`broker socket-destroy evidence ${JSON.stringify({ channel,
+      nativeBirthMatchedBeforeFault: true,
+      nativeBirthAndSignalZeroAliveAfterFault: channel === "outputSocket" ? true : "not-measured-input-EOF-may-exit",
+      publicOnExitHeld: false,
+      unknownPublicExitObserved: readFaults().some((entry) => entry.kind === "onExitObserved" && entry.target === channel && entry.numeric === false),
+      productionStopStatus: stopped.status, originalChildAlreadyGoneAtRetainedHandleCleanup: reaped.length === 0,
+      syntheticNativeExitForwardedOnlyForTestCleanup: stopped.status === "stop_timeout" })}`);
+  }
+  async function waitForErrorFixtureReady(name, metadata) {
+    // Start can observe ConPTY handshake output before admission and the
+    // program's ready banner/paste mode. Flush it before arming a send race.
+    await waitForBrokerFixtureReady(name, metadata);
+  }
+  // Each fault lands inside an in-flight send, rather than before admission.
+  // Exact PTY write suffixes prove that no later body/frame/Enter is replayed.
+  const sendRaces = [
+    { label: "opening-sync", afterWrite: "\x1b[200~", asynchronous: false,
+      payload: { text: "race-opening", bracketedPaste: true, submit: true },
+      writes: ["\x1b[200~"] },
+    { label: "ordinary-chunk", afterWrite: "x".repeat(256), asynchronous: true,
+      payload: { text: "x".repeat(300), chunkSize: 256, chunkDelayMs: 250, submit: true },
+      writes: ["x".repeat(256)] },
+    { label: "prefix-settle", afterWrite: "ultracode:", asynchronous: true,
+      payload: { text: "ultracode:race-prefix", keywordPrefix: true, bracketedPaste: true, submit: true },
+      writes: ["ultracode:"] },
+    { label: "keyword-chunk", afterWrite: "x".repeat(256), asynchronous: true,
+      payload: { text: `ultracode:${"x".repeat(300)}`, keywordPrefix: true, bracketedPaste: true,
+        chunkSize: 256, chunkDelayMs: 250, submit: true },
+      writes: ["ultracode:", "\x1b[200~", "x".repeat(256)] },
+    { label: "submit-settle", afterWrite: "\x1b[201~", asynchronous: true,
+      payload: { text: "race-submit", bracketedPaste: true, submit: true, submitSettleMs: 500 },
+      writes: ["\x1b[200~", "race-submit", "\x1b[201~"] },
+    { label: "keyword-submit", afterWrite: "\x1b[201~", asynchronous: true,
+      payload: { text: "ultracode:race-submit", keywordPrefix: true, bracketedPaste: true,
+        submit: true, submitSettleMs: 500 },
+      writes: ["ultracode:", "\x1b[200~", "race-submit", "\x1b[201~"] },
+    { label: "text-final", afterWrite: "\r", asynchronous: true,
+      payload: { text: "race-final", submit: true }, writes: ["race-final", "\r"] },
+    { label: "key-final", operation: "sendKey", afterWrite: "\t", asynchronous: true,
+      payload: { key: "Tab" }, writes: ["\t"] },
+  ];
+  for (const scenario of sendRaces) {
+    const target = `send-race-${scenario.label}`;
+    const name = `${sessionName}_${target}`;
+    const leaseId = `${target}-lease`;
+    const started = await startErrorFixture(name, leaseId, target);
+    const binding = { expectedGenerationId: started.metadata.generationId, expectedStartedAtMs: started.metadata.startedAtMs };
+    const writes = () => readFaults().filter((entry) => entry.kind === "ptyWrite" && entry.target === target).map((entry) => entry.data);
+    let before;
+    try {
+      await waitForErrorFixtureReady(name, started.metadata);
+      before = writes().length;
+      id = armFault({ kind: "terminalWrite", stage: "write", target, afterWrite: scenario.afterWrite,
+        asynchronous: scenario.asynchronous, code: "ECONNRESET" });
+      await assert.rejects(windowsBrokerRequest(scenario.operation ?? "sendText", {
+        sessionName: name, ...scenario.payload, leaseId, ...binding,
+      }, noStart), (error) => error.code === "ERECOVERY", `${scenario.label} must not return sent`);
+      const observed = await faultReceipt(id);
+      assert.equal(observed.stage, "write");
+      assert.deepEqual(writes().slice(before), scenario.writes, `${scenario.label}: no later write after fault`);
+      const failed = (await sameBroker()).managedSessions.find((entry) => entry.name === name);
+      assert.equal(failed.recoveryOnly, true);
+      assert.equal(failed.exited, false, "an emitted terminal error is not exit evidence");
+      assert.equal(failed.generationId, binding.expectedGenerationId);
+      assert.equal((await windowsBrokerRequest("acquireLease", {
+        sessionName: name, leaseId: "foreign-race-lease", ...binding,
+      }, noStart)).status, "busy", "interrupted sends must preserve the original lease");
+      await windowsBrokerRequest("sendText", { sessionName: healthyName, text: `healthy-${scenario.label}`,
+        submit: true, leaseId: healthyLease, ...healthyBinding }, noStart);
+      const capture = (await windowsBrokerRequest("capture", { sessionName: healthyName, ...healthyBinding }, noStart)).capture;
+      assert.ok(capture.includes(`ACK:healthy-${scenario.label}`));
+      assert.deepEqual(writes().slice(before), scenario.writes, "healthy traffic must not replay a failed send");
+    } finally {
+      // This scenario emits an error but leaves its real sockets intact, so a
+      // normal exact-owned ConPTY stop must provide numeric native exit proof.
+      const stopped = await windowsBrokerRequest("stop", { sessionName: name, force: true, leaseId, ...binding }, noStart);
+      assert.equal(stopped.status, "stopped");
+      assert.ok(Number.isInteger(stopped.exitCode));
+    }
+    console.log(`broker send-race evidence ${JSON.stringify({ label: scenario.label,
+      asynchronous: scenario.asynchronous, noLaterWrites: true, noFalseSent: true,
+      generationAndLeasePreserved: true, sameBrokerHealthyAck: true })}`);
+  }
+  // A genuine fixture /exit during the final settle is also not a successful
+  // send. This observes the actual native/public numeric exit, with no fault or
+  // synthetic callback and without conflating an output close with child exit.
+  {
+    const target = "send-numeric-exit";
+    const name = `${sessionName}_${target}`;
+    const leaseId = `${target}-lease`;
+    const started = await startErrorFixture(name, leaseId, target);
+    const binding = { expectedGenerationId: started.metadata.generationId, expectedStartedAtMs: started.metadata.startedAtMs };
+    try {
+      await waitForErrorFixtureReady(name, started.metadata);
+      await assert.rejects(windowsBrokerRequest("sendText", {
+        sessionName: name, text: "/exit", submit: true, leaseId, ...binding,
+      }, noStart), /session has exited/);
+      const exited = (await sameBroker()).managedSessions.find((entry) => entry.name === name);
+      assert.equal(exited.exited, true);
+      assert.ok(Number.isInteger(exited.exitCode));
+      assert.ok(readFaults().some((entry) => entry.kind === "nativeExitObserved" && entry.target === target && entry.exitCode === exited.exitCode));
+      assert.ok(readFaults().some((entry) => entry.kind === "onExitObserved" && entry.target === target && entry.numeric && !entry.held && entry.exitCode === exited.exitCode));
+    } finally {
+      const stopped = await windowsBrokerRequest("stop", { sessionName: name, force: true, leaseId, ...binding }, noStart);
+      assert.ok(["stopped", "not_running"].includes(stopped.status));
+      assert.ok(Number.isInteger(stopped.exitCode));
+    }
+    console.log("broker send-race evidence actual numeric exit rejected before sent");
+  }
+  const healthyStop = await windowsBrokerRequest("stop", { sessionName: healthyName, graceful: true, force: false, leaseId: healthyLease, ...healthyBinding }, noStart);
+  assert.equal(healthyStop.status, "stopped");
+  assert.equal(healthyStop.graceful, true);
+  const afterFaults = await sameBroker();
+  assert.equal(afterFaults.managedSessions.some((entry) => [faultName, healthyName].includes(entry.name)), false);
+  const faultLog = fs.readFileSync(path.join(tokenPaths.stateDir, "broker.log"), "utf8");
+  assert.match(faultLog, /client_socket_error ESOCKET/);
+  assert.match(faultLog, /terminal_error ECONNRESET/);
+  assert.equal(faultLog.includes("private-error-message"), false);
+  assert.equal(faultLog.includes("private-error-code"), false);
+  assert.equal(JSON.stringify(afterFaults).includes("private-error-"), false);
+  }
 
   await assert.rejects(
     windowsBrokerRequest("start", {
@@ -396,10 +1049,10 @@ try {
     canonicalCwd: canonicalRepoRoot,
     env: { ...process.env, ...updaterLedger.environment, DISABLE_AUTOUPDATER: "1" },
     leaseId: updaterLease,
-    leaseTtlMs: 10000,
+    leaseTtlMs: DIRECT_FIXTURE_LEASE_TTL_MS,
   });
   assert.equal(updaterStarted.status, "started");
-  const updaterDeadline = Date.now() + 10000;
+  const updaterDeadline = Date.now() + FIXTURE_READY_TIMEOUT_MS;
   while (!fs.existsSync(updaterReceipt) && Date.now() < updaterDeadline) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -641,9 +1294,11 @@ try {
     freshSessionId: exitedSessionId,
     resolvedSessionId: exitedSessionId,
     leaseId: "snapshot-exited-lease",
-    leaseTtlMs: 10000,
+    leaseTtlMs: DIRECT_FIXTURE_LEASE_TTL_MS,
   });
-  const exitedBindingDeadline = Date.now() + 10000;
+  // This observes the startup fixture exiting after its bounded admission;
+  // ordinary operation/cleanup exit deadlines below remain unchanged.
+  const exitedBindingDeadline = Date.now() + FIXTURE_READY_TIMEOUT_MS;
   let exitedBindingMetadata = null;
   while (Date.now() < exitedBindingDeadline) {
     exitedBindingMetadata = (await probeWindowsBroker()).managedSessions.find(
@@ -741,7 +1396,7 @@ try {
     launchEnvironment,
     resolvedSessionId: "33333333-3333-4333-8333-333333333333",
     leaseId: "startup-lease",
-    leaseTtlMs: 10000,
+    leaseTtlMs: DIRECT_FIXTURE_LEASE_TTL_MS,
   });
   assert.equal(started.status, "started");
   assert.deepEqual(started.metadata.launchEnvironment, {
@@ -758,7 +1413,7 @@ try {
   );
   activeGenerationId = started.metadata.generationId;
   assert.match(activeGenerationId, /^[0-9a-f-]{36}$/i);
-  assert.match(await waitForCapture(/Fake Claude TUI/), /Fake Claude TUI/);
+  assert.match(await waitForBrokerFixtureReady(sessionName, started.metadata), /Fake Claude TUI/);
   await assert.rejects(
     windowsBrokerRequest(
       "ping",
@@ -781,10 +1436,42 @@ try {
   const firstLeaseResult = await windowsBrokerRequest("acquireLease", {
     sessionName,
     leaseId: firstLease,
-    ttlMs: 10000,
+    ttlMs: 300000,
   });
   assert.equal(firstLeaseResult.status, "acquired");
   assert.equal(firstLeaseResult.generationId, activeGenerationId);
+  const originalSessionPair = {
+    expectedGenerationId: activeGenerationId,
+    expectedStartedAtMs: started.metadata.startedAtMs,
+  };
+  async function acquireOriginalFixtureLease() {
+    // Independent native fixtures can outlive the earlier 10-second lease.
+    // Acquire this phase explicitly; never revive an expired lease by renewal.
+    const lease = await windowsBrokerRequest("acquireLease", {
+      sessionName,
+      leaseId: firstLease,
+      ttlMs: 300000,
+      requireExactPair: true,
+      ...originalSessionPair,
+    });
+    assert.equal(lease.status, "acquired");
+    assert.equal(lease.generationId, originalSessionPair.expectedGenerationId);
+    assert.equal(lease.startedAtMs, originalSessionPair.expectedStartedAtMs);
+    return lease;
+  }
+  async function renewOriginalFixtureLease() {
+    // Preservation checks must expose a dropped lease or exited generation.
+    // Unlike phase acquisition, renewal must never repair either condition.
+    const lease = await windowsBrokerRequest("renewLease", {
+      sessionName,
+      leaseId: firstLease,
+      ttlMs: 300000,
+      requireExactPair: true,
+      ...originalSessionPair,
+    });
+    assert.equal(lease.status, "renewed");
+    return lease;
+  }
   // Name-selected callers retain this legacy lease path. A controller that
   // opts into the paired protocol must instead be rejected before any listed
   // broker operation can observe, mutate, or stop a same-name session.
@@ -903,6 +1590,99 @@ try {
   assert.equal(sent.bracketedPasteRequested, true);
   assert.equal(sent.bracketedPasteUsed, true);
   assert.match(await waitForCapture(/ACK:broker prompt/), /ACK:broker prompt/);
+
+  async function ordinaryFramingFixture(suffix, environment = {}) {
+    const name = `${sessionName}_${suffix}`;
+    const leaseId = `framing-${suffix}`;
+    const wireFile = path.join(stateDir, `${suffix}-wire.jsonl`);
+    const started = await windowsBrokerRequest("start", {
+      sessionName: name, command: process.execPath, args: [fixture, ...fixtureLedger.fixtureArgs],
+      metadataCommand: process.execPath, metadataArgs: [fixture, ...fixtureLedger.fixtureArgs],
+      cwd: repoRoot, canonicalCwd: canonicalRepoRoot,
+      env: { ...process.env, RAIL_FAKE_CLAUDE_WIRE_RECEIPT: wireFile, ...environment },
+      leaseId, leaseTtlMs: DIRECT_FIXTURE_LEASE_TTL_MS,
+    });
+    const context = { name, leaseId, wireFile, metadata: started.metadata };
+    await waitForBrokerFixtureReady(name, started.metadata);
+    return context;
+  }
+  const framedRequest = (context, payload) => windowsBrokerRequest("sendText", {
+    sessionName: context.name, leaseId: context.leaseId,
+    expectedGenerationId: context.metadata.generationId, ...payload,
+  });
+  async function ordinaryWire(context) {
+    if (!fakeTerminalSeesPasteMarkers) return (await brokerPtyWrites(context.name)).join("");
+    if (!fs.existsSync(context.wireFile)) return "";
+    return fs.readFileSync(context.wireFile, "utf8").split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line)).join("");
+  }
+  async function stopOrdinaryFixture(context) {
+    assert.equal((await windowsBrokerRequest("stop", {
+      sessionName: context.name, leaseId: context.leaseId, graceful: false, force: true,
+      expectedGenerationId: context.metadata.generationId,
+      expectedStartedAtMs: context.metadata.startedAtMs, omitCapture: true,
+    })).status, "stopped");
+  }
+  const ordinaryFrame = await ordinaryFramingFixture("ordinary_frame");
+  const emptyOrdinaryWire = await ordinaryWire(ordinaryFrame);
+  for (const text of ["body\x1b[201~\r/exit", "body\x00", "body\x7f", "body\u009f"]) {
+    await assert.rejects(framedRequest(ordinaryFrame, { text, bracketedPaste: true,
+      requireBracketedPaste: true, submit: true }), (error) => error.code === "EINVAL");
+    assert.equal(await ordinaryWire(ordinaryFrame), emptyOrdinaryWire,
+      "invalid ordinary framed text must send neither markers, body nor Enter");
+  }
+  for (const flags of [{ bracketedPaste: "true" },
+    { bracketedPaste: true, requireBracketedPaste: "true" },
+    { bracketedPaste: false, requireBracketedPaste: true }]) {
+    await assert.rejects(framedRequest(ordinaryFrame, { text: "plain", ...flags, submit: true }),
+      (error) => error.code === "EINVAL");
+    assert.equal(await ordinaryWire(ordinaryFrame), emptyOrdinaryWire);
+  }
+  const ordinaryBody = `Unicode 🧪 résumé\tTAB\nLF\rCR\r\n${"x".repeat(300)}`;
+  const ordinarySent = await framedRequest(ordinaryFrame, { text: ordinaryBody,
+    bracketedPaste: true, requireBracketedPaste: true, chunkSize: 256,
+    chunkDelayMs: 25, submit: true });
+  assert.equal(ordinarySent.bracketedPasteUsed, true);
+  assert.equal((await ordinaryWire(ordinaryFrame)).slice(emptyOrdinaryWire.length),
+    `\x1b[200~${ordinaryBody}\x1b[201~\r`, "ordinary strict framing preserves exact Unicode/TAB/CR/LF wire content");
+  await stopOrdinaryFixture(ordinaryFrame);
+
+  const ordinaryOff = await ordinaryFramingFixture("ordinary_off", {
+    RAIL_FAKE_CLAUDE_DISABLE_PASTE_AFTER_KEYWORD_PREFIX: "1",
+  });
+  // Explicit raw input is intentional here and remains outside framed guards.
+  await framedRequest(ordinaryOff, { text: "ultracode:", bracketedPaste: false, submit: false });
+  const offWire = await ordinaryWire(ordinaryOff);
+  for (const [text, strict] of [["strict plain", true], ["line\nline", false],
+    ["line\rline", false], ["has\ttab", false]]) {
+    await assert.rejects(framedRequest(ordinaryOff, { text, bracketedPaste: true,
+      requireBracketedPaste: strict, submit: true }),
+    (error) => error.code === "EPASTEMODE" && /no input was sent/.test(error.message));
+    assert.equal(await ordinaryWire(ordinaryOff), offWire, "mode-off refusal must write zero bytes");
+  }
+  assert.equal((await framedRequest(ordinaryOff, { text: "safe plain Unicode 🧪",
+    bracketedPaste: true, submit: false })).bracketedPasteUsed, false);
+  assert.equal((await ordinaryWire(ordinaryOff)).slice(offWire.length), "safe plain Unicode 🧪");
+  await stopOrdinaryFixture(ordinaryOff);
+
+  const ordinaryLoss = await ordinaryFramingFixture("ordinary_loss", {
+    [fakeTerminalSeesPasteMarkers ? "RAIL_FAKE_CLAUDE_DISABLE_PASTE_AFTER_KEYWORD_BODY"
+      : "RAIL_FAKE_CLAUDE_DISABLE_PASTE_AFTER_UNFRAMED_KEYWORD_BODY"]: "1",
+  });
+  // Bind this assertion to the send; ConPTY may exchange device attributes
+  // during startup. Preserve every byte after this observed boundary.
+  const ordinaryLossWireBefore = await ordinaryWire(ordinaryLoss);
+  const lossBody = `ultracode:${"x".repeat(650)}`;
+  await assert.rejects(framedRequest(ordinaryLoss, { text: lossBody, bracketedPaste: true,
+    requireBracketedPaste: true, chunkSize: 256, chunkDelayMs: 100, submit: true }),
+  (error) => error.code === "EPASTEMODE" && /Framed body was partially sent/.test(error.message));
+  assert.equal((await ordinaryWire(ordinaryLoss)).slice(ordinaryLossWireBefore.length), `\x1b[200~${lossBody.slice(0, 256)}`,
+    "ordinary mode loss must not repair, continue, close the frame or send Enter");
+  await assert.rejects(framedRequest(ordinaryLoss, { text: "must not replay", bracketedPaste: false }),
+    (error) => error.code === "ERECOVERY");
+  await stopOrdinaryFixture(ordinaryLoss);
+
+  await acquireOriginalFixtureLease();
   const keywordBody = `ultracode:${"x".repeat(255)}🧪\nsecond line\r\nthird line\rfinal line`;
   const keywordWritesBefore = fakeTerminalSeesPasteMarkers ? 0 : (await brokerPtyWrites(sessionName)).length;
   const keywordSent = await windowsBrokerRequest("sendText", {
@@ -966,22 +1746,11 @@ try {
       RAIL_FAKE_CLAUDE_WIRE_RECEIPT: keywordModeLossWireReceipt,
     },
     leaseId: keywordModeLossLease,
-    leaseTtlMs: 10000,
+    leaseTtlMs: DIRECT_FIXTURE_LEASE_TTL_MS,
   });
   const keywordModeLossGenerationId = keywordModeLossStarted.metadata.generationId;
   const keywordModeLossStartedAtMs = keywordModeLossStarted.metadata.startedAtMs;
-  const keywordModeLossReadyDeadline = Date.now() + 10000;
-  let keywordModeLossCapture = "";
-  while (Date.now() < keywordModeLossReadyDeadline) {
-    keywordModeLossCapture = (
-      await windowsBrokerRequest("capture", {
-        sessionName: keywordModeLossSession,
-        expectedGenerationId: keywordModeLossGenerationId,
-      })
-    ).capture;
-    if (keywordModeLossCapture.includes("Fake Claude TUI")) break;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+  const keywordModeLossCapture = await waitForBrokerFixtureReady(keywordModeLossSession, keywordModeLossStarted.metadata);
   assert.match(keywordModeLossCapture, /Fake Claude TUI/);
   await assert.rejects(
     windowsBrokerRequest("sendText", {
@@ -1043,24 +1812,13 @@ try {
       RAIL_FAKE_CLAUDE_WIRE_RECEIPT: keywordPartialModeLossWireReceipt,
     },
     leaseId: keywordPartialModeLossLease,
-    leaseTtlMs: 10000,
+    leaseTtlMs: DIRECT_FIXTURE_LEASE_TTL_MS,
   });
   const keywordPartialModeLossGenerationId =
     keywordPartialModeLossStarted.metadata.generationId;
   const keywordPartialModeLossStartedAtMs =
     keywordPartialModeLossStarted.metadata.startedAtMs;
-  const keywordPartialModeLossReadyDeadline = Date.now() + 10000;
-  let keywordPartialModeLossCapture = "";
-  while (Date.now() < keywordPartialModeLossReadyDeadline) {
-    keywordPartialModeLossCapture = (
-      await windowsBrokerRequest("capture", {
-        sessionName: keywordPartialModeLossSession,
-        expectedGenerationId: keywordPartialModeLossGenerationId,
-      })
-    ).capture;
-    if (keywordPartialModeLossCapture.includes("Fake Claude TUI")) break;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+  const keywordPartialModeLossCapture = await waitForBrokerFixtureReady(keywordPartialModeLossSession, keywordPartialModeLossStarted.metadata);
   assert.match(keywordPartialModeLossCapture, /Fake Claude TUI/);
   // Bundled ConPTY can exchange device attributes during startup. Bind this
   // assertion to the send operation, retaining every subsequent PTY write.
@@ -1147,6 +1905,7 @@ try {
     expectedStartedAtMs: keywordPartialModeLossStartedAtMs,
   });
   assert.equal(keywordPartialModeLossStopped.status, "stopped");
+  await renewOriginalFixtureLease();
   for (const payload of [
     { text: "quoted ultracode: body", bracketedPaste: true },
     { text: "ultracode: body\x1b[201~\r/exit", bracketedPaste: true },
@@ -1275,17 +2034,8 @@ try {
     (error) => error?.code === "ENOENT"
   );
   assert.match(await waitForCapture(/Fake Claude TUI/), /Fake Claude TUI/);
-  const replacementPair = {
-    expectedGenerationId: activeGenerationId,
-    expectedStartedAtMs: started.metadata.startedAtMs,
-  };
-  const replacementLease = await windowsBrokerRequest("renewLease", {
-    sessionName,
-    leaseId: firstLease,
-    ttlMs: 300000,
-    ...replacementPair,
-  });
-  assert.equal(replacementLease.status, "renewed");
+  const replacementPair = originalSessionPair;
+  const replacementLease = await renewOriginalFixtureLease();
   const originalReplacementMetadata = (
     await windowsBrokerRequest("conditionalMetadata", {
       sessionName,
@@ -1439,7 +2189,7 @@ try {
     (error) => error?.code === "ESTALE",
     "a strict capture must reject the original pair after same-name replacement"
   );
-  assert.match(await waitForCapture(/Fake Claude TUI/), /Fake Claude TUI/);
+  assert.match(await waitForBrokerFixtureReady(sessionName, replaced.metadata), /Fake Claude TUI/);
   await assert.rejects(
     windowsBrokerRequest("acquireLease", {
       sessionName,
@@ -1524,13 +2274,13 @@ try {
     ).status,
     "acquired"
   );
-  await windowsBrokerRequest("sendText", {
+  await assert.rejects(windowsBrokerRequest("sendText", {
     sessionName,
     text: "/exit",
     submit: true,
     leaseId: exitLease,
     expectedGenerationId: activeGenerationId,
-  });
+  }), /session has exited/, "a numeric exit during the final settle must not report sent");
   const exitDeadline = Date.now() + 5000;
   let exitedSession = null;
   while (!exitedSession?.exited && Date.now() < exitDeadline) {
@@ -1771,10 +2521,52 @@ try {
 } finally {
   let cleanupError = null;
   const cleanupEnvironment = { ...process.env };
+  // Never leave synthetic held callbacks armed when a failed assertion causes
+  // the fixture ledger to terminate its owned children.
+  try {
+    const control = path.join(stateDir, "broker-error-control.json");
+    if (fs.existsSync(control)) {
+      const stat = fs.lstatSync(control);
+      assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1);
+      fs.unlinkSync(control);
+    }
+    fs.writeFileSync(control, JSON.stringify({ id: "cleanup", kind: "disarm", stage: "setup" }), { flag: "wx" });
+    try {
+      await windowsBrokerRequest("ping", {}, { env: cleanupEnvironment, startIfMissing: false, timeoutMs: 2000 });
+      const receipts = path.join(stateDir, "broker-error-receipts.jsonl");
+      const deadline = Date.now() + 2000;
+      let acknowledged = false;
+      do {
+        acknowledged = fs.existsSync(receipts) && fs.readFileSync(receipts, "utf8").split("\n").slice(0, -1)
+          .filter(Boolean).map((line) => JSON.parse(line)).some((entry) => entry.id === "cleanup" && entry.kind === "disarm");
+        if (acknowledged) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      } while (Date.now() < deadline);
+      assert.ok(acknowledged, "owned fault cleanup was not acknowledged");
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  } catch (error) { cleanupError ??= error; }
   for (const ledger of fixtureLedgers) {
     try { await ledger.reap({ expectRecords: false, final: true }); }
     catch (error) { cleanupError ??= error; }
   }
+  // The real output-socket destruction case can consume public onExit before
+  // native exit. Only after retained-handle cleanup may the test-only preload
+  // forward its independently captured numeric native exit to settle tracking.
+  if (!cleanupError) try {
+    const deadline = Date.now() + 2000;
+    let index = 0;
+    for (;;) {
+      const status = await probeWindowsBroker(cleanupEnvironment);
+      if (!status || status.managedSessions.every((session) => session.exited)) break;
+      const control = path.join(stateDir, "broker-error-control.json");
+      fs.writeFileSync(control, JSON.stringify({ id: `cleanup-native-${index++}`, kind: "cleanupNativeExits", stage: "setup" }), { flag: "wx" });
+      await windowsBrokerRequest("ping", {}, { env: cleanupEnvironment, startIfMissing: false, timeoutMs: 2000 });
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  } catch (error) { cleanupError ??= error; }
   try {
     const deadline = Date.now() + 5000;
     let status;
@@ -1813,9 +2605,13 @@ try {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+  if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+  else process.env.NODE_OPTIONS = previousNodeOptions;
+  if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+  else process.env.NODE_ENV = previousNodeEnv;
+  if (previousBrokerErrorDir === undefined) delete process.env.RAIL_TEST_BROKER_ERROR_DIR;
+  else process.env.RAIL_TEST_BROKER_ERROR_DIR = previousBrokerErrorDir;
   if (!fakeTerminalSeesPasteMarkers) {
-    if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS;
-    else process.env.NODE_OPTIONS = previousNodeOptions;
     delete process.env.RAIL_TEST_PTY_WRITE_RECEIPT;
   }
   if (!cleanupError && !primaryError) {

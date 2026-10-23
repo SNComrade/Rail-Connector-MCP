@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { serializeMessage } from "@modelcontextprotocol/sdk/shared/stdio.js";
+import { CancelledNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import fs from "node:fs";
 import path from "node:path";
@@ -11,7 +14,7 @@ import { StringDecoder } from "node:string_decoder";
 import { performance } from "node:perf_hooks";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
-import { workflowKeywordPrefixLength } from "./terminal.js";
+import { assertFramedPromptText, workflowKeywordPrefixLength } from "./terminal.js";
 import {
   resolveNormalLaunchDescriptor,
   resolveProductClaudeLaunchDescriptor,
@@ -20,7 +23,7 @@ import {
   railConnectorStateDir,
   probeWindowsBroker,
   windowsBrokerCleanupRequest,
-  windowsBrokerRequest,
+  windowsBrokerRequest as rawWindowsBrokerRequest,
 } from "./windows-broker-client.js";
 
 export { renderCapture } from "./terminal.js";
@@ -33,7 +36,7 @@ const CLAUDE_CONFIG_DIR = path.resolve(
 const DEFAULT_CWD = HOME;
 const DEFAULT_MANAGED_SESSION = "rail-connector-managed";
 const DEFAULT_REMOTE_NAME = "Rail-Connector";
-export const SERVER_VERSION = "1.0.0-beta.4";
+export const SERVER_VERSION = "1.0.0-beta.5";
 const IS_NATIVE_WINDOWS = process.platform === "win32";
 const REMOTE_URL_RE = /https:\/\/claude\.ai\/code\/[A-Za-z0-9_:-]+/;
 const DEFAULT_TEXT_CHUNK_SIZE = 2048;
@@ -138,6 +141,338 @@ const sessionOperationLocks = new Map();
 const brokerMutationLeases = new Map();
 const claudeCapabilityCache = new Map();
 const claudeResultCache = new Map();
+const requestStorage = new AsyncLocalStorage();
+const sharedCapabilityWork = new Set();
+const READ_ONLY_BROKER_OPERATIONS = new Set([
+  "ping", "status", "metadata", "conditionalMetadata", "conditionalStopMetadata",
+  "capture", "isRunning", "listSessions",
+]);
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function requestControlError(scope = requestStorage.getStore()) {
+  const error = new Error("MCP request cancelled; further operations were not dispatched.");
+  error.code = "ECANCELLED";
+  Object.defineProperty(error, "controlOutcome", { enumerable: true, get: () => ({
+    delivery: scope?.control.delivery ?? "not_dispatched",
+    lease: scope?.control.lease ?? "not_acquired",
+  }) });
+  return error;
+}
+
+function requestSignal() {
+  const scope = requestStorage.getStore();
+  return scope?.shielded ? undefined : scope?.control.controller.signal;
+}
+
+function assertRequestActive() {
+  if (requestSignal()?.aborted) throw requestControlError();
+}
+
+function shieldRequest(operation) {
+  const scope = requestStorage.getStore();
+  return scope ? requestStorage.run({ ...scope, shielded: true }, operation) : operation();
+}
+
+function markRequestDispatch() {
+  assertRequestActive();
+  const scope = requestStorage.getStore();
+  if (scope) scope.control.delivery = "possibly_delivered";
+}
+
+function waitForRequest(promise, signal = requestSignal()) {
+  const scope = requestStorage.getStore();
+  if (!signal) return promise;
+  return new Promise((resolve, reject) => {
+    const aborted = () => { signal.removeEventListener("abort", aborted); reject(requestControlError(scope)); };
+    if (signal.aborted) { reject(requestControlError(scope)); return; }
+    signal.addEventListener("abort", aborted, { once: true });
+    Promise.resolve(promise).then(
+      (value) => { signal.removeEventListener("abort", aborted); resolve(value); },
+      (error) => { signal.removeEventListener("abort", aborted); reject(error); }
+    );
+  });
+}
+
+export async function requestDelay(ms) {
+  const scope = requestStorage.getStore();
+  const signal = requestSignal();
+  assertRequestActive();
+  if (!signal) return sleep(ms);
+  await new Promise((resolve, reject) => {
+    const finish = (error) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", aborted);
+      if (error) reject(error); else resolve();
+    };
+    const aborted = () => finish(requestControlError(scope));
+    const timer = setTimeout(() => finish(), ms);
+    signal.addEventListener("abort", aborted, { once: true });
+    if (signal.aborted) aborted();
+  });
+}
+
+export async function withRequestSignal(signal, operation) {
+  const control = { controller: new AbortController(), delivery: "not_dispatched", lease: "not_acquired" };
+  const aborted = () => control.controller.abort();
+  signal?.addEventListener("abort", aborted, { once: true });
+  if (signal?.aborted) aborted();
+  try { return await requestStorage.run({ control, shielded: false }, operation); }
+  finally { signal?.removeEventListener("abort", aborted); }
+}
+
+async function windowsBrokerRequest(operation, payload = {}, options = {}) {
+  const cleanup = operation === "releaseLease" || operation === "renewLease";
+  if (!cleanup) assertRequestActive();
+  try {
+  const result = await rawWindowsBrokerRequest(operation, payload, {
+    ...options,
+    ...(READ_ONLY_BROKER_OPERATIONS.has(operation) && requestSignal()
+      ? { signal: requestSignal() } : {}),
+    onDispatch: () => {
+      if (!cleanup) assertRequestActive();
+      options.onDispatch?.();
+      const scope = requestStorage.getStore();
+      if (!scope) return;
+      if (operation === "acquireLease") scope.control.lease = "unknown";
+      else if (!cleanup && !READ_ONLY_BROKER_OPERATIONS.has(operation)) markRequestDispatch();
+    },
+  });
+  const scope = requestStorage.getStore();
+  if (scope && !cleanup && operation !== "acquireLease" && !READ_ONLY_BROKER_OPERATIONS.has(operation)) {
+    scope.control.delivery = "acknowledged";
+  }
+  return result;
+  } catch (error) {
+    if (operation === "acquireLease" && error.brokerReplyReceived === true) {
+      // The broker's negative acquisition replies precede granting a lease.
+      // Apply this to EACH attempt, including an upgrade refusal before a
+      // subsequent retry can fail without ever reaching its dispatch hook.
+      const scope = requestStorage.getStore();
+      if (scope) scope.control.lease = "not_acquired";
+    }
+    if (!cleanup && operation !== "acquireLease" && !READ_ONLY_BROKER_OPERATIONS.has(operation) &&
+        error.brokerRequestDispatched && !error.brokerReplyReceived) {
+      const scope = requestStorage.getStore();
+      if (scope && (operation === "start" || operation === "replace") &&
+          typeof payload.leaseId === "string" && payload.leaseId.length > 0) {
+        // A launch may commit a new lease before its generation reply is lost.
+        scope.control.lease = "unknown";
+      }
+      const uncertain = new Error("Broker mutation outcome is unknown after possible dispatch; do not replay input.");
+      uncertain.code = "EMUTATIONUNKNOWN";
+      uncertain.controlOutcome = { delivery: "possibly_delivered", lease: scope?.control.lease ?? "unknown" };
+      throw uncertain;
+    }
+    throw error;
+  }
+}
+
+// This decorator owns request cancellation and output settlement, using only the
+// SDK's public Transport surface. The inner parser always invokes the SDK's
+// installed callback INSIDE run(); a pre-callback/enterWith would leak scope.
+export function createLifecycleTransport({
+  input = process.stdin, output = process.stdout,
+  inner = new StdioServerTransport(input, output), drainTimeoutMs = 2000, onOutcome,
+} = {}) {
+  const requests = new Map();
+  const sends = new Set();
+  let admission = true;
+  let closing;
+  let finalClose = false;
+  let outputFailed = false;
+  const transport = {
+    get sessionId() { return inner.sessionId; },
+    setProtocolVersion(version) { inner.setProtocolVersion?.(version); },
+    pendingRequestCount() { return requests.size; },
+    async start() {
+      input.on("end", inputEnded);
+      input.on("close", inputEnded);
+      input.on("error", inputFailed);
+      output.on("error", outputFailure);
+      output.on("close", outputFailure);
+      inner.onmessage = (message, extra) => {
+        const cancellation = CancelledNotificationSchema.safeParse(message);
+        if (cancellation.success) {
+          const context = requests.get(cancellation.data.params.requestId);
+          if (context) cancelContext(context);
+          // Cancellation is bound synchronously to this exact admitted
+          // generation. The SDK defers its ID lookup; forwarding it could
+          // abort a later same-chunk reuse (or an as-yet-unknown request).
+          return;
+        }
+        const isRequest = message && typeof message.method === "string" &&
+          Object.hasOwn(message, "id") &&
+          (typeof message.id === "string" || Number.isSafeInteger(message.id));
+        if (!isRequest) { if (admission) transport.onmessage?.(message, extra); return; }
+        if (!admission) return;
+        if (requests.has(message.id) || requests.size >= 128) {
+          transport.onerror?.(new Error("Duplicate or excessive pending MCP request; admission closed."));
+          void beginClose();
+          return;
+        }
+        const context = {
+          id: message.id, tool: message.method === "tools/call" ? message.params?.name : null,
+          controller: new AbortController(), delivery: "not_dispatched", lease: "not_acquired",
+          cleanup: deferred(), response: deferred(), handlerStarted: false,
+          cleanupSettled: false, responseSettled: false,
+        };
+        requests.set(message.id, context);
+        requestStorage.run({ control: context, shielded: false }, () => transport.onmessage?.(message, extra));
+      };
+      inner.onerror = (error) => { transport.onerror?.(error); void beginClose(); };
+      inner.onclose = () => { if (!finalClose) void beginClose(); };
+      await inner.start();
+    },
+    send(message, options) {
+      // options remain part of the public adapter contract; stdio has no
+      // resumption channel. Never rewrite an incoming or outgoing request ID.
+      const scope = requestStorage.getStore();
+      const isResponse = Object.hasOwn(message, "id") &&
+        (Object.hasOwn(message, "result") || Object.hasOwn(message, "error"));
+      const context = isResponse
+        ? (scope?.control.response ? scope.control : requests.get(message.id)) : undefined;
+      // Stdio has no resumption stream. Keep association options intact for
+      // callers without treating a progress notification as a final response.
+      void options;
+      if (context && !context.handlerStarted) finishCleanup(context);
+      if (context?.controller.signal.aborted) { finishResponse(context); return Promise.resolve(); }
+      if (context && message.result && typeof message.result === "object" &&
+          (context.delivery !== "not_dispatched" || context.lease !== "not_acquired")) {
+        message = { ...message, result: { ...message.result, _meta: {
+          ...message.result._meta,
+          "rail-connector/control-outcome": { delivery: context.delivery, lease: context.lease },
+        } } };
+      }
+      if (outputFailed) { finishResponse(context); return Promise.reject(new Error("MCP output is closed.")); }
+      const done = deferred();
+      const send = { promise: done.promise, fail: null };
+      sends.add(send);
+      let settled = false;
+      let callbackDone = false;
+      let writeReturned = false;
+      let needsDrain = false;
+      let drained = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        output.off("error", failed);
+        output.off("close", closed);
+        output.off("drain", onDrain);
+        sends.delete(send);
+        finishResponse(context);
+        if (error) { done.resolve(); rejectSend(error); void beginClose(); }
+        else { done.resolve(); resolveSend(); }
+      };
+      const maybeDone = () => { if (writeReturned && callbackDone && (!needsDrain || drained)) finish(); };
+      const failed = () => finish(new Error("MCP response write failed; client receipt is unknown."));
+      const closed = () => finish(new Error("MCP output closed; client receipt is unknown."));
+      const onDrain = () => { drained = true; maybeDone(); };
+      let resolveSend;
+      let rejectSend;
+      const result = new Promise((resolve, reject) => { resolveSend = resolve; rejectSend = reject; });
+      const timer = setTimeout(() => finish(new Error("MCP response drain deadline exceeded; client receipt is unknown.")), drainTimeoutMs);
+      send.fail = closed;
+      output.on("error", failed);
+      output.on("close", closed);
+      output.on("drain", onDrain);
+      try {
+        needsDrain = !output.write(serializeMessage(message), (error) => {
+          if (error) { failed(); return; }
+          callbackDone = true;
+          maybeDone();
+        });
+        writeReturned = true;
+        maybeDone();
+      } catch { failed(); }
+      return result;
+    },
+    close() { return beginClose(); },
+  };
+  function maybeForget(context) {
+    if (context.cleanupSettled && context.responseSettled && requests.get(context.id) === context) requests.delete(context.id);
+  }
+  function finishCleanup(context) {
+    if (context.cleanupSettled) return;
+    context.cleanupSettled = true;
+    context.cleanup.resolve();
+    maybeForget(context);
+  }
+  function finishResponse(context) {
+    if (!context || context.responseSettled) return;
+    context.responseSettled = true;
+    context.response.resolve();
+    maybeForget(context);
+  }
+  function cancelContext(context) {
+    context.controller.abort();
+    if (!context.handlerStarted) finishCleanup(context);
+    // send() suppresses this generation's response for every ID. The SDK must
+    // still settle its own handler chain without retaining our context.
+    finishResponse(context);
+  }
+  function inputEnded() { void beginClose(); }
+  function inputFailed() { void beginClose(); }
+  function outputFailure() {
+    outputFailed = true;
+    for (const send of [...sends]) send.fail?.();
+    void beginClose();
+  }
+  function beginClose() {
+    if (closing) return closing;
+    admission = false;
+    // Shared bounded capability probes finish without inheriting one waiter's
+    // abort. Other requests stop safe work but still own their lease/finally.
+    const admitted = [...requests.values()];
+    for (const context of admitted) {
+      if (!context.cleanupSettled && context.tool !== "get_claude_capabilities") cancelContext(context);
+    }
+    closing = (async () => {
+      await Promise.all(admitted.map((context) => context.cleanup.promise));
+      await Promise.allSettled([...sharedCapabilityWork]);
+      let timer;
+      await Promise.race([
+        Promise.all(admitted.map((context) => context.response.promise)),
+        new Promise((resolve) => { timer = setTimeout(resolve, drainTimeoutMs); }),
+      ]);
+      clearTimeout(timer);
+      for (const send of [...sends]) send.fail?.();
+      finalClose = true;
+      await inner.close();
+      input.off("end", inputEnded);
+      input.off("close", inputEnded);
+      input.off("error", inputFailed);
+      output.off("error", outputFailure);
+      output.off("close", outputFailure);
+      transport.onclose?.();
+    })();
+    return closing;
+  }
+  transport.runTool = async (handler, args, extra) => {
+    const context = requestStorage.getStore()?.control;
+    if (!context?.cleanup) return handler(...args);
+    context.handlerStarted = true;
+    const aborted = () => cancelContext(context);
+    extra?.signal?.addEventListener("abort", aborted, { once: true });
+    if (extra?.signal?.aborted) aborted();
+    try { assertRequestActive(); return await handler(...args); }
+    finally {
+      extra?.signal?.removeEventListener("abort", aborted);
+      finishCleanup(context);
+      if (context.controller.signal.aborted &&
+          (context.delivery !== "not_dispatched" || context.lease === "unknown")) {
+        onOutcome?.({ event: "cancelled_request_cleanup", delivery: context.delivery, lease: context.lease });
+      }
+      if (context.controller.signal.aborted) finishResponse(context);
+    }
+  };
+  return transport;
+}
 
 function text(data) {
   const value = typeof data === "string" ? data : JSON.stringify(data, null, 2);
@@ -253,6 +588,7 @@ async function pairedBoundaryTestHook(stage, sessionName, expectedGeneration) {
 }
 
 export async function withSessionOperationLock(sessionName, operation) {
+  assertRequestActive();
   const previous = sessionOperationLocks.get(sessionName) ?? Promise.resolve();
   let release;
   const current = new Promise((resolve) => {
@@ -261,6 +597,7 @@ export async function withSessionOperationLock(sessionName, operation) {
   sessionOperationLocks.set(sessionName, current);
   await previous;
   try {
+    assertRequestActive();
     return await operation();
   } finally {
     release();
@@ -808,7 +1145,7 @@ function recordUltraEffortTransition(state, direction, timestamp = "") {
   state.ultraEffortAttachmentLastTransitionAt = timestamp;
 }
 
-async function withManagedMutationLock(
+export async function withManagedMutationLock(
   sessionName,
   operation,
   { allowMissingBackend = false, expectedGeneration = null, startsSession = false } = {}
@@ -827,36 +1164,56 @@ async function withManagedMutationLock(
     let leasedGeneration = null;
     let awaitingStartedGeneration = false;
     let startTransitionBegun = false;
+    const acquire = (startIfMissing) => windowsBrokerRequest(
+      "acquireLease",
+      {
+        sessionName,
+        leaseId,
+        ttlMs: BROKER_LEASE_TTL_MS,
+        expectedGenerationId: queuedGenerationId,
+        expectedStartedAtMs: queuedStartedAtMs,
+        requireExactPair: Boolean(expectedGeneration),
+      },
+      { startIfMissing }
+    );
     for (;;) {
       let result;
       try {
-        result = await windowsBrokerRequest(
-          "acquireLease",
-          {
-            sessionName,
-            leaseId,
-            ttlMs: BROKER_LEASE_TTL_MS,
-            expectedGenerationId: queuedGenerationId,
-            expectedStartedAtMs: queuedStartedAtMs,
-            requireExactPair: Boolean(expectedGeneration),
-          },
-          { startIfMissing: false }
-        );
+        try {
+          result = await acquire(false);
+        } catch (error) {
+          if (error?.code !== "EBROKERUPGRADE" || !allowMissingBackend) throw error;
+          // Both attempts pass through the same dispatch/outcome classifier.
+          // Only an authoritative upgrade refusal permits this second attempt.
+          result = await acquire(true);
+        }
       } catch (error) {
-        if (error?.code === "EBROKERUPGRADE" && allowMissingBackend) {
-          result = await windowsBrokerRequest(
-            "acquireLease",
-            {
-              sessionName,
-              leaseId,
-              ttlMs: BROKER_LEASE_TTL_MS,
-              expectedGenerationId: queuedGenerationId,
-              expectedStartedAtMs: queuedStartedAtMs,
-              requireExactPair: Boolean(expectedGeneration),
-            },
-            { startIfMissing: true }
-          );
-        } else if (brokerUnavailable(error)) {
+        if (error?.brokerRequestDispatched === true && !error.brokerReplyReceived) {
+          // Even a reset/EPIPE can follow a granted acquisition. Never turn a
+          // lost reply into an unleased product operation or another acquire.
+          const scope = requestStorage.getStore();
+          if (scope) scope.control.lease = "unknown";
+          if (queuedGenerationId && Number.isSafeInteger(queuedStartedAtMs)) {
+            try {
+              const released = await shieldRequest(() => windowsBrokerRequest("releaseLease", {
+                sessionName, leaseId,
+                expectedGenerationId: queuedGenerationId,
+                expectedStartedAtMs: queuedStartedAtMs,
+                requireExactPair: Boolean(expectedGeneration),
+              }, { startIfMissing: false, timeoutMs: 5000 }));
+              if (scope && released.status === "released") scope.control.lease = "released";
+            } catch (releaseError) {
+              if (scope && releaseError.brokerReplyReceived && releaseError.code === "ESTALE") {
+                scope.control.lease = "generation_changed";
+              }
+              // Any other absent acknowledgement remains unknown.
+            }
+          }
+          const uncertain = new Error("Broker lease acquisition outcome is unknown after possible dispatch; no product operation was run.");
+          uncertain.code = "ELEASEUNKNOWN";
+          uncertain.controlOutcome = { delivery: "not_dispatched", lease: scope?.control.lease ?? "unknown" };
+          throw uncertain;
+        } else if (brokerUnavailable(error) && error.brokerRequestDispatched === false) {
           if (expectedGeneration) {
             // A generation-bound operation must never fall through to a local
             // name-only operation when the broker cannot prove its lease.
@@ -871,6 +1228,10 @@ async function withManagedMutationLock(
         } else {
           throw error;
         }
+      }
+      if (result.status === "busy" || result.status === "not_running") {
+        const scope = requestStorage.getStore();
+        if (scope) scope.control.lease = "not_acquired";
       }
       if (!queuedGenerationId && result.generationId) {
         queuedGenerationId = result.generationId;
@@ -921,6 +1282,8 @@ async function withManagedMutationLock(
         }
         brokerMutationLeases.set(sessionName, leaseId);
         hasBrokerLease = true;
+        const scope = requestStorage.getStore();
+        if (scope) scope.control.lease = "acquired";
         break;
       }
       if (result.status === "not_running") {
@@ -941,7 +1304,7 @@ async function withManagedMutationLock(
       if (Date.now() >= deadline) {
         throw new Error(`Timed out waiting for another MCP mutation workflow on ${sessionName}.`);
       }
-      await sleep(150);
+      await requestDelay(150);
     }
     let renewalError = null;
     let renewalPromise = Promise.resolve();
@@ -956,7 +1319,7 @@ async function withManagedMutationLock(
       }
       renewalPromise = renewalPromise.then(async () => {
         try {
-          const result = await windowsBrokerRequest(
+          const result = await shieldRequest(() => windowsBrokerRequest(
             "renewLease",
             {
               sessionName,
@@ -966,7 +1329,7 @@ async function withManagedMutationLock(
               requireExactPair: Boolean(expectedGeneration),
             },
             { startIfMissing: false, timeoutMs: 5000 }
-          );
+          ));
           if (
             result.status !== "renewed" &&
             !(leaseReservedForStart && result.status === "not_running")
@@ -985,7 +1348,9 @@ async function withManagedMutationLock(
       });
     }, BROKER_LEASE_RENEW_INTERVAL_MS) : null;
     renewalTimer?.unref?.();
+    let operationError;
     try {
+      assertRequestActive();
       const result = await operation({
         beginStartTransition: async () => {
           if (!startsSession || startTransitionBegun) {
@@ -1019,14 +1384,18 @@ async function withManagedMutationLock(
       await renewalPromise;
       if (renewalError) throw renewalError;
       return result;
+    } catch (error) {
+      operationError = error;
+      throw error;
     } finally {
       if (renewalTimer) clearInterval(renewalTimer);
       await renewalPromise;
       if (brokerMutationLeases.get(sessionName) === leaseId) {
         brokerMutationLeases.delete(sessionName);
         if (leasedGeneration) {
+          let releaseKnown = false;
           try {
-            await windowsBrokerRequest(
+            const released = await shieldRequest(() => windowsBrokerRequest(
               "releaseLease",
               {
                 sessionName,
@@ -1035,9 +1404,22 @@ async function withManagedMutationLock(
                 requireExactPair: Boolean(expectedGeneration),
               },
               { startIfMissing: false, timeoutMs: 5000 }
-            );
-          } catch {
+            ));
+            const scope = requestStorage.getStore();
+            releaseKnown = released.status === "released";
+            if (scope) scope.control.lease = released.status === "released" ? "released" : "unknown";
+          } catch (error) {
             // The broker or original generation may have exited or changed.
+            const scope = requestStorage.getStore();
+            const changed = error.brokerReplyReceived && error.code === "ESTALE";
+            releaseKnown = Boolean(changed);
+            if (scope) scope.control.lease = changed ? "generation_changed" : "unknown";
+          }
+          if (!releaseKnown && !operationError) {
+            const error = new Error("Broker mutation lease release acknowledgement is unknown; TTL is not proof of release.");
+            error.code = "ELEASEUNKNOWN";
+            error.controlOutcome = { delivery: requestStorage.getStore()?.control.delivery ?? "unknown", lease: "unknown" };
+            throw error;
           }
         }
       }
@@ -1994,12 +2376,15 @@ function archiveMarkerPath(projectDir, sessionId, stateDir = railConnectorStateD
 }
 
 async function withArchiveMutationLock(marker, operation) {
+  assertRequestActive();
   const lockFile = `${marker}.lock`;
+  markRequestDispatch();
   await fs.promises.mkdir(path.dirname(marker), { recursive: true, mode: 0o700 });
   const deadline = performance.now() + 10000;
   let handle;
   for (;;) {
     try {
+      assertRequestActive();
       handle = await fs.promises.open(lockFile, "wx", 0o600);
       break;
     } catch (error) {
@@ -2024,7 +2409,7 @@ async function withArchiveMutationLock(marker, operation) {
         timeout.code = "ETIMEDOUT";
         throw timeout;
       }
-      await sleep(25);
+      await requestDelay(25);
     }
   }
   try {
@@ -2039,6 +2424,7 @@ async function withArchiveMutationLock(marker, operation) {
     throw error;
   }
   try {
+    assertRequestActive();
     return await operation();
   } finally {
     await handle.close();
@@ -2102,6 +2488,7 @@ export async function setSessionArchiveState(
 
     if (!archived) {
       try {
+        assertRequestActive();
         await fs.promises.unlink(marker);
         return { status: "unarchived", sessionId, archived: false };
       } catch (error) {
@@ -2121,6 +2508,7 @@ export async function setSessionArchiveState(
     }
     if (existing.markerCorrupt) {
       try {
+        assertRequestActive();
         await fs.promises.unlink(marker);
       } catch (error) {
         if (error.code !== "ENOENT") throw error;
@@ -2135,11 +2523,13 @@ export async function setSessionArchiveState(
       projectDir: path.resolve(projectDir),
       archivedAt,
     };
+    assertRequestActive();
     await fs.promises.writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, {
       flag: "wx",
       mode: 0o600,
     });
     try {
+      assertRequestActive();
       await fs.promises.rename(temporary, marker);
     } catch (error) {
       try {
@@ -3162,10 +3552,16 @@ export function resolveTmuxCommand() {
 }
 
 async function tmux(args, options = {}) {
+  const readOnly = new Set(["-V", "capture-pane", "display-message", "show-options", "list-panes", "list-sessions", "has-session"]).has(args[0]);
+  // requestCleanup is an internal helper option, never a public tool input.
+  const cleanup = options.requestCleanup === true;
+  if (!cleanup) assertRequestActive();
+  if (!readOnly && !cleanup) markRequestDispatch();
   try {
     const { stdout, stderr } = await execFileAsync(resolveTmuxCommand(), args, {
       timeout: options.timeoutMs ?? 15000,
       maxBuffer: options.maxBuffer ?? 1024 * 1024 * 8,
+      ...(readOnly && requestSignal() ? { signal: requestSignal() } : {}),
     });
     return { ok: true, stdout, stderr };
   } catch (error) {
@@ -3218,6 +3614,7 @@ async function requireSupportedTmuxVersion() {
 }
 
 async function tmuxWithInput(args, input, options = {}) {
+  markRequestDispatch();
   return new Promise((resolve) => {
     let child;
     try {
@@ -3591,6 +3988,7 @@ async function forceCleanupIncompatibleWindowsBrokerSession(
   sessionName,
   brokerStatus
 ) {
+  assertRequestActive();
   if (brokerStatus?.protocol !== 1) {
     const error = new Error(
       "The active Windows broker uses an unsupported protocol and cannot be cleaned up from this MCP process."
@@ -3625,25 +4023,71 @@ async function forceCleanupIncompatibleWindowsBrokerSession(
 
   const leaseId = randomUUID();
   const deadline = Date.now() + 30000;
+  const scope = requestStorage.getStore();
+  const signal = requestSignal();
   let acquired = false;
+  let leaseMayBeAcquired = false;
+  let acquireDispatched = false;
+  let stopDispatched = false;
+  let operationError;
+  // Capture the request identity: socket dispatch callbacks need not run in
+  // the same async context as the caller's cancellation notification.
+  const dispatchOptions = (operation, timeoutMs) => ({
+    timeoutMs,
+    onDispatch: () => {
+      if (signal?.aborted) throw requestControlError(scope);
+      if (operation === "acquireCleanupLease") {
+        acquireDispatched = true;
+        leaseMayBeAcquired = true;
+        if (scope) scope.control.lease = "unknown";
+      } else {
+        stopDispatched = true;
+        if (scope) scope.control.delivery = "possibly_delivered";
+      }
+    },
+  });
+  const uncertainOutcome = (code, message) => {
+    const error = new Error(message);
+    error.code = code;
+    Object.defineProperty(error, "controlOutcome", { enumerable: true, get: () => ({
+      delivery: scope?.control.delivery ?? (stopDispatched ? "possibly_delivered" : "not_dispatched"),
+      lease: scope?.control.lease ?? "unknown",
+    }) });
+    return error;
+  };
   try {
     for (;;) {
-      const lease = await windowsBrokerCleanupRequest(
-        "acquireCleanupLease",
-        {
-          sessionName,
-          leaseId,
-          ttlMs: BROKER_LEASE_TTL_MS,
-          expectedStartedAtMs: session.startedAtMs,
-          expectedGenerationId: session.generationId,
-        },
-        { timeoutMs: 5000 }
-      );
+      assertRequestActive();
+      let lease;
+      try {
+        lease = await windowsBrokerCleanupRequest(
+          "acquireCleanupLease",
+          {
+            sessionName,
+            leaseId,
+            ttlMs: BROKER_LEASE_TTL_MS,
+            expectedStartedAtMs: session.startedAtMs,
+            expectedGenerationId: session.generationId,
+          },
+          dispatchOptions("acquireCleanupLease", 5000)
+        );
+      } catch (error) {
+        if (error.brokerReplyReceived === true) {
+          leaseMayBeAcquired = false;
+          if (scope) scope.control.lease = "not_acquired";
+        }
+        throw error;
+      }
+      if (lease.status === "busy" || lease.status === "not_running") {
+        leaseMayBeAcquired = false;
+        if (scope) scope.control.lease = "not_acquired";
+      }
       if (lease.status === "not_running") {
         return { status: "not_running", managedSession: sessionName };
       }
       if (lease.status === "acquired") {
         acquired = true;
+        if (scope) scope.control.lease = "acquired";
         break;
       }
       if (Date.now() >= deadline) {
@@ -3653,8 +4097,9 @@ async function forceCleanupIncompatibleWindowsBrokerSession(
         error.code = "ELEASE";
         throw error;
       }
-      await sleep(150);
+      await requestDelay(150);
     }
+    assertRequestActive();
     const result = await windowsBrokerCleanupRequest(
       "cleanupStop",
       {
@@ -3663,8 +4108,9 @@ async function forceCleanupIncompatibleWindowsBrokerSession(
         expectedStartedAtMs: session.startedAtMs,
         expectedGenerationId: session.generationId,
       },
-      { timeoutMs: 20000 }
+      dispatchOptions("cleanupStop", 20000)
     );
+    if (scope) scope.control.delivery = "acknowledged";
     return {
       ...result,
       compatibilityCleanup: true,
@@ -3672,6 +4118,17 @@ async function forceCleanupIncompatibleWindowsBrokerSession(
       graceful: false,
     };
   } catch (error) {
+    operationError = error;
+    if (error.brokerRequestDispatched === true && error.brokerReplyReceived !== true) {
+      if (stopDispatched) {
+        throw uncertainOutcome("EMUTATIONUNKNOWN",
+          "Compatibility cleanup stop outcome is unknown after possible dispatch; do not replay the stop.");
+      }
+      if (leaseMayBeAcquired) {
+        throw uncertainOutcome("ELEASEUNKNOWN",
+          "Compatibility cleanup lease outcome is unknown after possible dispatch; no stop was run.");
+      }
+    }
     if (
       error?.code === "EBROKERUPGRADE" ||
       (error?.code === "EBROKER" &&
@@ -3683,14 +4140,18 @@ async function forceCleanupIncompatibleWindowsBrokerSession(
       upgradeError.code = "EBROKERUPGRADE";
       throw upgradeError;
     }
-    if (brokerUnavailable(error)) {
+    // Unavailability stands in for absence only before any acquire reached the
+    // broker. A busy reply does not erase that earlier dispatch evidence.
+    if (brokerUnavailable(error) && error.brokerRequestDispatched === false &&
+        !acquireDispatched && !acquired && !leaseMayBeAcquired) {
       return { status: "not_running", managedSession: sessionName };
     }
     throw error;
   } finally {
-    if (acquired) {
+    if (acquired || leaseMayBeAcquired) {
+      let releaseKnown = false;
       try {
-        await windowsBrokerCleanupRequest(
+        const released = await shieldRequest(() => windowsBrokerCleanupRequest(
           "releaseCleanupLease",
           {
             sessionName,
@@ -3699,9 +4160,17 @@ async function forceCleanupIncompatibleWindowsBrokerSession(
             expectedStartedAtMs: session.startedAtMs,
           },
           { timeoutMs: 5000 }
-        );
-      } catch {
-        // A successful cleanup removes the session before lease release.
+        ));
+        releaseKnown = released.status === "released";
+        if (scope) scope.control.lease = releaseKnown ? "released" : "unknown";
+      } catch (error) {
+        const changed = error.brokerReplyReceived === true && error.code === "ESTALE";
+        releaseKnown = changed;
+        if (scope) scope.control.lease = changed ? "generation_changed" : "unknown";
+      }
+      if (!releaseKnown && !operationError) {
+        throw uncertainOutcome("ELEASEUNKNOWN",
+          "Compatibility cleanup lease release acknowledgement is unknown; TTL is not proof of release.");
       }
     }
   }
@@ -4421,7 +4890,7 @@ export function signalsWithWorkflowActivity(signals = {}, workflowActivity = {})
   const terminalWorkflowSuperseded =
     !logUncertain &&
     logPendingCount !== null &&
-    workflowActivity.observationCoverage === "full" &&
+    workflowEvidenceComplete(workflowActivity) &&
     workflowActivity.launchObserved === true;
   const baseState =
     terminalWorkflowSuperseded &&
@@ -5123,6 +5592,7 @@ async function backendSendText(sessionName, value, submit, options = {}) {
         text: textValue,
         submit: Boolean(submit),
         bracketedPaste: Boolean(options.bracketedPaste),
+        requireBracketedPaste: Boolean(options.requireBracketedPaste),
         keywordPrefix: Boolean(options.keywordPrefix),
         chunkSize,
         chunkDelayMs,
@@ -5141,28 +5611,141 @@ async function backendSendText(sessionName, value, submit, options = {}) {
     throw new Error("Keyword prefix delivery currently requires native Windows.");
   }
   const metadata = await requireManagedTmuxSession(sessionName);
+  return sendTmuxText(metadata.paneId, value, submit, options);
+}
+
+function tmuxCommandText(args) {
+  // Only internally generated ASCII arguments enter the nested tmux parser.
+  // Prompt content travels exclusively through load-buffer stdin, never here.
+  return args.map((arg) => {
+    if (!/^[A-Za-z0-9_%:-]+$/.test(arg)) throw new Error("Unsafe internal tmux command argument.");
+    return `'${arg}'`;
+  }).join(" ");
+}
+
+export async function sendTmuxText(paneId, value, submit, options = {}, {
+  runTmux = tmux, loadTmux = tmuxWithInput, delay = requestDelay,
+} = {}) {
+  assertRequestActive();
+  if (!/^%\d+$/.test(paneId)) throw new Error("A concrete managed tmux pane is required.");
+  if (options.keywordPrefix) throw new Error("Keyword prefix delivery currently requires native Windows.");
   const textValue = String(value);
+  for (const field of ["bracketedPaste", "requireBracketedPaste"]) {
+    if (options[field] !== undefined && typeof options[field] !== "boolean") {
+      const error = new Error(`${field} must be a boolean.`);
+      error.code = "EINVAL";
+      throw error;
+    }
+  }
+  if (options.requireBracketedPaste && !options.bracketedPaste) {
+    const error = new Error("Strict framing requires bracketedPaste.");
+    error.code = "EINVAL";
+    throw error;
+  }
+  if (options.bracketedPaste) assertFramedPromptText(value);
   const bufferName = `rail-${process.pid}-${randomUUID().replaceAll("-", "")}`;
-  const loaded = await tmuxWithInput(["load-buffer", "-b", bufferName, "-"], textValue, { timeoutMs: 15000 });
-  if (!loaded.ok) throw new Error(loaded.stderr || `Unable to load tmux paste buffer for ${sessionName}.`);
-  const pasteArgs = ["paste-buffer", "-r", "-d", "-b", bufferName, "-t", metadata.paneId];
-  if (options.bracketedPaste) pasteArgs.splice(1, 0, "-p");
-  const pasted = await tmux(pasteArgs, { timeoutMs: 15000 });
-  if (!pasted.ok) {
-    await tmux(["delete-buffer", "-b", bufferName], { timeoutMs: 5000 });
-    throw new Error(pasted.stderr || `Unable to paste text into managed tmux session ${sessionName}.`);
+  const marker = `RAIL_SEND:${randomUUID().replaceAll("-", "")}`;
+  const pasteArgs = ["paste-buffer", "-r", "-d", "-b", bufferName, "-t", paneId];
+  const condition = "#{==:#{bracket_paste_flag},1}";
+  const requiresFrame = options.requireBracketedPaste || /[\t\r\n]/.test(textValue);
+  let bracketedPasteUsed = false;
+  let bufferNeedsCleanup = false;
+  let primaryError;
+  try {
+    assertRequestActive();
+    bufferNeedsCleanup = true;
+    const loaded = await loadTmux(["load-buffer", "-b", bufferName, "-"], textValue, { timeoutMs: 15000 });
+    assertRequestActive();
+    if (!loaded.ok) throw new Error(loaded.stderr || "Unable to load owned tmux paste buffer.");
+    if (options.bracketedPaste) {
+      const framed = `${tmuxCommandText(["paste-buffer", "-p", ...pasteArgs.slice(1)])} ; ${tmuxCommandText(["display-message", "-p", `${marker}:framed`])}`;
+      const otherwise = requiresFrame
+        ? tmuxCommandText(["display-message", "-p", `${marker}:refused`])
+        : `${tmuxCommandText(pasteArgs)} ; ${tmuxCommandText(["display-message", "-p", `${marker}:literal`])}`;
+      const pasted = await runTmux(["if-shell", "-F", "-t", paneId, condition, framed, otherwise], { timeoutMs: 15000 });
+      const observed = pasted.stdout?.trim();
+      const consumed = String(pasted.stdout ?? "").split(/\r?\n/).some((line) =>
+        line === `${marker}:framed` || line === `${marker}:literal`);
+      // An exact nonce line proves -d consumption even if a later hook prints
+      // output or fails. Delivery success still requires a clean whole receipt.
+      if (consumed) bufferNeedsCleanup = false;
+      assertRequestActive();
+      if (pasted.ok !== true || ![`${marker}:framed`, `${marker}:literal`].includes(observed)) {
+        const error = new Error(observed === `${marker}:refused`
+          ? "Bracketed paste is unavailable or unobservable; no input was sent."
+          : "tmux paste delivery was not confirmed; inspect the composer before any retry.");
+        error.code = "EPASTEMODE";
+        throw error;
+      }
+      bracketedPasteUsed = observed === `${marker}:framed`;
+    } else {
+      const pasted = await runTmux(pasteArgs, { timeoutMs: 15000 });
+      if (pasted.ok === true) bufferNeedsCleanup = false;
+      assertRequestActive();
+      if (!pasted.ok) throw new Error(pasted.stderr || "Unable to paste owned tmux buffer.");
+    }
+    if (submit) {
+      await waitForRequest(delay(options.submitSettleMs ?? 100));
+      assertRequestActive();
+      let submitted;
+      if (bracketedPasteUsed) {
+        submitted = await runTmux(["if-shell", "-F", "-t", paneId, condition,
+          `${tmuxCommandText(["send-keys", "-t", paneId, "Enter"])} ; ${tmuxCommandText(["display-message", "-p", `${marker}:entered`])}`,
+          tmuxCommandText(["display-message", "-p", `${marker}:enter_refused`])], { timeoutMs: 5000 });
+        assertRequestActive();
+        if (!submitted.ok || submitted.stdout?.trim() !== `${marker}:entered`) {
+          const refused = submitted.ok && submitted.stdout?.trim() === `${marker}:enter_refused`;
+          const error = new Error(refused
+            ? "The prompt was pasted, but framing support changed before Enter; no Enter was sent. Inspect the composer before any retry. No automatic replay was attempted."
+            : "The prompt was pasted, but Enter was not confirmed; inspect the composer before any retry. No automatic replay was attempted.");
+          error.code = "EPASTEMODE";
+          throw error;
+        }
+      } else {
+        submitted = await runTmux(["send-keys", "-t", paneId, "Enter"], { timeoutMs: 5000 });
+        assertRequestActive();
+        if (!submitted.ok) throw new Error(submitted.stderr || "Unable to submit text in managed tmux pane.");
+      }
+    }
+    await waitForRequest(delay(500));
+    assertRequestActive();
+    return { status: "sent", bracketedPasteRequested: Boolean(options.bracketedPaste), bracketedPasteUsed };
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    if (bufferNeedsCleanup) {
+      try {
+        // Exact-name set-buffer (without -a/-n) replaces only this generated
+        // buffer with inert data and makes it newest. An after-set hook may
+        // intervene, so delete only if the subsequent top-name guard still
+        // matches. Missing-name delete-buffer is unsafe on tmux 3.2.
+        const deletedMarker = `${marker}:cleanup_deleted`;
+        const cleanup = await shieldRequest(() => runTmux([
+          "set-buffer", "-b", bufferName, "x", ";", "if-shell", "-F",
+          `#{==:#{buffer_name},${bufferName}}`,
+          `${tmuxCommandText(["delete-buffer", "-b", bufferName])} ; ${tmuxCommandText(["display-message", "-p", deletedMarker])}`,
+          tmuxCommandText(["display-message", "-p", `${marker}:cleanup_unconfirmed`]),
+        ], { timeoutMs: 5000, requestCleanup: true }));
+        if (cleanup.ok !== true || cleanup.stdout?.trim() !== deletedMarker) {
+          const cleanupCode = typeof cleanup.code === "string" && /^[A-Z][A-Z0-9_]{0,31}$/.test(cleanup.code)
+            ? cleanup.code : undefined;
+          const error = new Error("Owned tmux paste buffer cleanup UNCONFIRMED; no absence or delivery outcome is inferred.",
+            cleanupCode ? { cause: { code: cleanupCode } } : undefined);
+          error.code = "ECLEANUP";
+          throw error;
+        }
+      } catch (error) {
+        const cleanupError = error?.code === "ECLEANUP" ? error
+          : Object.assign(new Error("Owned tmux paste buffer cleanup UNCONFIRMED.",
+            { cause: error }), { code: "ECLEANUP" });
+        if (primaryError) throw Object.assign(new AggregateError([primaryError, cleanupError],
+          `tmux delivery failed: ${primaryError.message}; owned buffer cleanup UNCONFIRMED.`,
+          { cause: primaryError }), { code: "ECLEANUP" });
+        throw cleanupError;
+      }
+    }
   }
-  if (submit) {
-    await sleep(options.submitSettleMs ?? 100);
-    const submitted = await tmux(["send-keys", "-t", metadata.paneId, "Enter"], { timeoutMs: 5000 });
-    if (!submitted.ok) throw new Error(submitted.stderr || `Unable to submit text in managed tmux session ${sessionName}.`);
-  }
-  await sleep(500);
-  return {
-    status: "sent",
-    bracketedPasteRequested: Boolean(options.bracketedPaste),
-    bracketedPasteUsed: Boolean(options.bracketedPaste),
-  };
 }
 
 async function backendSendKey(
@@ -5922,6 +6505,7 @@ function runtimeObservationFromState(
     skippedBytes = 0,
     trailingRecordIncomplete = false,
     recordOverflowed = false,
+    workflowReconstruction = null,
   } = {}
 ) {
   const permissionMode = trailingRecordIncomplete ? "" : state.permissionMode;
@@ -5942,7 +6526,8 @@ function runtimeObservationFromState(
         ? true
         : null;
   const observationUncertain =
-    state.workflowObservationUncertain === true || trailingRecordIncomplete;
+    state.workflowObservationUncertain === true || trailingRecordIncomplete ||
+    (workflowReconstruction !== null && workflowReconstruction.status !== "complete");
   const workflowActivityObserved =
     observationUncertain ||
     state.workflowLaunchObserved ||
@@ -5987,6 +6572,7 @@ function runtimeObservationFromState(
       observationUncertain,
       observationCoverage: coverage,
       observationSkippedBytes: skippedBytes,
+      ...(workflowReconstruction ? { reconstruction: workflowReconstruction } : {}),
       completionEvidence:
         state.workflowSnapshotCompletionCount > 0
           ? "claude_workflow_snapshot"
@@ -6022,6 +6608,192 @@ const RUNTIME_OBSERVATION_MAX_TRAILING_RECORD_BYTES = 8 * 1024 * 1024;
 const MAX_RUNTIME_OBSERVATION_BUFFERED_RECORD_BYTES = 32 * 1024 * 1024;
 const MAX_WORKFLOW_SNAPSHOT_BYTES = 128 * 1024;
 const WORKFLOW_SNAPSHOT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+const WORKFLOW_RECONSTRUCTION_LIMITS = Object.freeze({
+  maxBytes: 16 * 1024 * 1024,
+  maxRecords: 100_000,
+  maxRecordBytes: RUNTIME_OBSERVATION_MAX_TRAILING_RECORD_BYTES,
+  timeoutMs: 1000,
+});
+
+function workflowEvidenceComplete(activity) {
+  return activity.observationCoverage === "full" ||
+    activity.reconstruction?.status === "complete";
+}
+
+function workflowRelevantRecord(record) {
+  const result = record.toolUseResult;
+  return record.pendingWorkflowCount !== undefined ||
+    result?.pendingWorkflowCount !== undefined ||
+    result?.taskType === "local_workflow" ||
+    result?.retrieval_status !== undefined ||
+    result?.task?.task_id !== undefined ||
+    record.interruptedMessageId !== undefined ||
+    record.origin?.kind === "task-notification" ||
+    record.attachment?.commandMode === "task-notification";
+}
+
+function workflowProjection(state) {
+  return Object.fromEntries(WORKFLOW_RECONSTRUCTED_FIELDS.map((field) => [field, state[field]]));
+}
+
+// Logical UTF-16 string payload, with conservative counting of aliased strings.
+// This is not an estimate or bound for V8 collection overhead or process RSS.
+function workflowStringUnits(value) {
+  if (typeof value === "string") return value.length;
+  if (!value || typeof value !== "object") return 0;
+  if (value instanceof Map) return [...value].reduce((sum, [key, item]) =>
+    sum + workflowStringUnits(key) + workflowStringUnits(item), 0);
+  if (value instanceof Set || Array.isArray(value)) return [...value].reduce(
+    (sum, item) => sum + workflowStringUnits(item), 0);
+  return Object.entries(value).reduce((sum, [key, item]) =>
+    sum + key.length + workflowStringUnits(item), 0);
+}
+
+function workflowOnlyRecord(record, expectedSessionId) {
+  const selected = { sessionId: expectedSessionId, timestamp: record.timestamp,
+    isSidechain: record.isSidechain, toolUseResult: record.toolUseResult,
+    pendingWorkflowCount: record.pendingWorkflowCount,
+    interruptedMessageId: record.interruptedMessageId };
+  if (record.type === "user" && record.origin?.kind === "task-notification") {
+    selected.type = "user";
+    selected.origin = record.origin;
+    selected.message = { content: record.message?.content };
+  } else if (record.type === "attachment" && record.attachment?.type === "queued_command" &&
+      record.attachment.commandMode === "task-notification") {
+    selected.type = "attachment";
+    selected.attachment = record.attachment;
+  }
+  return selected;
+}
+
+const CACHEABLE_WORKFLOW_RECONSTRUCTION_FAILURES = new Set([
+  "byte_limit", "record_limit", "record_too_large", "malformed_record",
+  "partial_record", "invalid_encoding", "identity_ambiguous", "identity_limit",
+  "retained_string_limit",
+]);
+
+// A separate complete workflow replay never repairs the posture/history gap.
+// Options are an inert test seam; limits can only be tightened, not enlarged.
+export async function reconstructWorkflowObservation(
+  handle, size, metadata, { now = () => performance.now(), ...requested } = {}
+) {
+  const limits = Object.fromEntries(Object.entries(WORKFLOW_RECONSTRUCTION_LIMITS)
+    .map(([key, maximum]) => [key, Math.min(maximum,
+      Number.isFinite(requested[key]) && requested[key] >= 0 ? requested[key] : maximum)]));
+  const state = createSessionSummaryState();
+  const proof = { status: "incomplete", reason: "", bytesRead: 0, recordsRead: 0 };
+  const fail = (reason) => ({ state: null, proof: { ...proof, reason } });
+  const started = now();
+  const expired = () => now() - started >= limits.timeoutMs;
+  if (!SESSION_ID_RE.test(metadata?.resolvedSessionId ?? "") ||
+      !Number.isFinite(Number(metadata?.startedAtMs)) ||
+      Number(metadata.startedAtMs) <= 0) return fail("identity_ambiguous");
+  if (!Number.isSafeInteger(size) || size < 0 || size > limits.maxBytes) return fail("byte_limit");
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const buffer = Buffer.alloc(Math.min(RUNTIME_OBSERVATION_READ_BYTES, Math.max(1, size)));
+  let remainder = "";
+  let remainderBytes = 0;
+  let chargedBytes = 0;
+  const reserve = (bytes) => {
+    if (runtimeObservationBufferedRecordBytes + bytes > MAX_RUNTIME_OBSERVATION_BUFFERED_RECORD_BYTES) return false;
+    runtimeObservationBufferedRecordBytes += bytes;
+    chargedBytes += bytes;
+    return true;
+  };
+  const release = () => {
+    runtimeObservationBufferedRecordBytes -= chargedBytes;
+    chargedBytes = 0;
+  };
+  const consumeLine = (line) => {
+    if (expired()) return "deadline";
+    if (!line.trim()) return "";
+    if (++proof.recordsRead > limits.maxRecords) return "record_limit";
+    let record;
+    try { record = JSON.parse(line); } catch { return "malformed_record"; }
+    if (!record || typeof record !== "object" || Array.isArray(record)) return "malformed_record";
+    const relevant = workflowRelevantRecord(record);
+    if (!relevant) return expired() ? "deadline" : "";
+    // Match the generation filter exactly; numeric timestamps must not become
+    // apparently valid evidence that the filter then buffers as untimestamped.
+    const timestamp = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : NaN;
+    if (!Number.isFinite(timestamp)) return "identity_ambiguous";
+    const cutoff = Number(metadata.startedAtMs) - (workflowRecordCarriesRunIdentity(record) ? 0 : 5000);
+    // Only this fully parsed record is skipped, never a timestamp-inferred range.
+    if (timestamp < cutoff) return expired() ? "deadline" : "";
+    const expectedSessionId = metadata.resolvedSessionId;
+    if (!recordMatchesSession(record, expectedSessionId) ||
+        (record.sessionId !== expectedSessionId && record.session_id !== expectedSessionId)) {
+      return "identity_ambiguous";
+    }
+    if (timestamp > Date.now()) return "future_timestamp";
+    addRuntimeObservationRecord(state, workflowOnlyRecord(record, expectedSessionId), metadata);
+    if (state.activeWorkflowTaskIds.size > 4096) return "identity_limit";
+    if (workflowStringUnits(workflowProjection(state)) > 128 * 1024) return "retained_string_limit";
+    return expired() ? "deadline" : "";
+  };
+  try {
+  while (proof.bytesRead < size) {
+    if (expired()) return fail("deadline");
+    const requestedBytes = Math.min(buffer.length, size - proof.bytesRead);
+    let bytesRead;
+    try { ({ bytesRead } = await handle.read(buffer, 0, requestedBytes, proof.bytesRead)); }
+    catch { return fail("read_error"); }
+    if (expired()) return fail("deadline");
+    if (!Number.isInteger(bytesRead) || bytesRead <= 0 || bytesRead > requestedBytes) return fail("short_read");
+    proof.bytesRead += bytesRead;
+    let text;
+    try { text = decoder.decode(buffer.subarray(0, bytesRead), { stream: true }); }
+    catch { return fail("invalid_encoding"); }
+    let start = 0;
+    for (;;) {
+      const end = text.indexOf("\n", start);
+      if (end < 0) break;
+      const segment = text.slice(start, end);
+      const segmentBytes = Buffer.byteLength(segment);
+      if (remainderBytes + segmentBytes > limits.maxRecordBytes) return fail("record_too_large");
+      if (!reserve(segmentBytes)) return fail("buffer_limit");
+      const reason = consumeLine(remainder + segment);
+      release();
+      if (reason) return fail(reason);
+      remainder = "";
+      remainderBytes = 0;
+      start = end + 1;
+    }
+    const tail = text.slice(start);
+    const tailBytes = Buffer.byteLength(tail);
+    remainderBytes += tailBytes;
+    if (remainderBytes > limits.maxRecordBytes) return fail("record_too_large");
+    if (!reserve(tailBytes)) return fail("buffer_limit");
+    remainder += tail;
+  }
+  try { remainder += decoder.decode(); } catch { return fail("invalid_encoding"); }
+  if (remainder.trim()) {
+    const reason = consumeLine(remainder);
+    if (reason) return fail(reason === "malformed_record" ? "partial_record" : reason);
+  }
+  if (expired()) return fail("deadline");
+  if (state.workflowObservationUncertain) return fail("identity_ambiguous");
+  return { state: workflowProjection(state), proof: { ...proof, status: "complete", reason: "" } };
+  } finally {
+    release();
+  }
+}
+
+const WORKFLOW_RECONSTRUCTED_FIELDS = [
+  "workflowLaunchObserved", "workflowLaunchStatus", "workflowLaunchUpdatedAt",
+  "workflowLastObservedAt", "pendingWorkflowCount", "pendingWorkflowUpdatedAt",
+  "workflowPendingCounterObservation", "activeWorkflowTaskIds", "activeWorkflowRunIds",
+  "activeWorkflowLaunchTimestamps", "unidentifiedPendingWorkflowCount",
+  "workflowSnapshotCandidates", "workflowSnapshotConflicts", "workflowSnapshotCompletionCount",
+  "workflowObservationUncertain",
+];
+
+function sameRuntimeObservationFile(left, right) {
+  return right.isFile() && !right.isSymbolicLink() &&
+    ["dev", "ino", "birthtimeMs", "size", "mtimeMs", "ctimeMs"]
+      .every((field) => left[field] === right[field]);
+}
 
 function runtimeObservationLogFile(metadata) {
   if (!metadata?.cwd || !metadata?.resolvedSessionId) return "";
@@ -6224,12 +6996,13 @@ function pendingCounterContradictsCompletion(state, taskId, completedAtMs) {
 async function applyWorkflowCompletionSnapshots(
   state,
   metadata,
-  { observationUncertain = false, coverage = "none", logFileIdentity = "" } = {}
+  { observationUncertain = false, coverage = "none", logFileIdentity = "",
+    workflowComplete = false } = {}
 ) {
   if (
     observationUncertain ||
     state.workflowObservationUncertain ||
-    coverage !== "full" ||
+    (coverage !== "full" && !workflowComplete) ||
     !verifiedWorkflowSnapshotBinding(metadata, logFileIdentity) ||
     state.workflowSnapshotCandidates.size === 0
   ) return;
@@ -6285,6 +7058,7 @@ function newRuntimeObservationCacheEntry(stat) {
     fullGuardSize: 0,
     fullGuardDigest: "",
     ctimeMs: stat.ctimeMs,
+    workflowRecovery: null,
   };
 }
 
@@ -6653,6 +7427,7 @@ async function loadRuntimeObservation(metadata, file, key) {
   let cacheCommitted = false;
   let observedState = null;
   let observationUncertain = false;
+  let workflowReconstruction = null;
 
   try {
     const handle = await fs.promises.open(file, "r");
@@ -6723,10 +7498,37 @@ async function loadRuntimeObservation(metadata, file, key) {
         entry.recordOverflowed
       );
       observedState = snapshotOverlayState(entry.state);
+      if (entry.coverage === "head_tail") {
+        // Reuse only after the ordinary cache guards matched and the entire
+        // metadata tuple is unchanged. Every append rebuilds from byte zero.
+        const cachedRecovery = entry.workflowRecovery;
+        const reuseRecovery = cachedRecovery && sameRuntimeObservationFile(cachedRecovery.stat, stat);
+        const reconstruction = reuseRecovery ? cachedRecovery :
+          await reconstructWorkflowObservation(handle, stat.size, metadata);
+        const handleStat = await handle.stat();
+        const pathStat = await fs.promises.lstat(file).catch(() => null);
+        workflowReconstruction = { ...reconstruction.proof, cacheHit: Boolean(reuseRecovery) };
+        if (!sameRuntimeObservationFile(stat, handleStat) || !pathStat ||
+            !sameRuntimeObservationFile(stat, pathStat)) {
+          workflowReconstruction = { ...reconstruction.proof, status: "incomplete", reason: "file_changed" };
+          entry.workflowRecovery = null;
+        } else if (reconstruction.state) {
+          entry.workflowRecovery = { state: reconstruction.state, proof: reconstruction.proof, stat };
+          const workflowState = snapshotOverlayState(reconstruction.state);
+          for (const field of WORKFLOW_RECONSTRUCTED_FIELDS) observedState[field] = workflowState[field];
+        } else {
+          // Repeated wait polls need not rescan an unchanged, deterministically
+          // unsupported range. Transient I/O/deadline/shared-budget failures retry.
+          entry.workflowRecovery = CACHEABLE_WORKFLOW_RECONSTRUCTION_FAILURES.has(reconstruction.proof.reason)
+            ? { state: null, proof: reconstruction.proof, stat } : null;
+        }
+      }
       await applyWorkflowCompletionSnapshots(observedState, metadata, {
-        observationUncertain,
+        observationUncertain: observationUncertain ||
+          (workflowReconstruction !== null && workflowReconstruction.status !== "complete"),
         coverage: entry.coverage,
         logFileIdentity: entry.fileIdentity,
+        workflowComplete: workflowReconstruction?.status === "complete",
       });
       await updateRuntimeObservationCacheGuards(handle, entry, stat, {
         historyHash,
@@ -6751,6 +7553,7 @@ async function loadRuntimeObservation(metadata, file, key) {
         observationUncertain
       ),
       recordOverflowed: entry.recordOverflowed,
+      workflowReconstruction,
     });
     cacheCommitted = true;
     return result;
@@ -7119,6 +7922,22 @@ async function sessionTranscriptSnapshot(metadata) {
   };
 }
 
+export function validateSubmitPromptInput(input, { isNativeWindows = IS_NATIVE_WINDOWS } = {}) {
+  const pasteMode = input.pasteMode === undefined ? "auto" : input.pasteMode;
+  if (!["auto", "bracketed", "literal", "keyword"].includes(pasteMode)) {
+    const error = new Error("pasteMode must be auto, bracketed, literal, or keyword.");
+    error.code = "EINVAL";
+    throw error;
+  }
+  if (pasteMode === "keyword") {
+    if (!isNativeWindows) throw new Error("Keyword prefix delivery currently requires native Windows.");
+    workflowKeywordPrefixLength(input.text);
+  } else if (pasteMode !== "literal") {
+    assertFramedPromptText(input.text);
+  }
+  return pasteMode;
+}
+
 export async function runSubmitPrompt(
   input,
   {
@@ -7131,13 +7950,9 @@ export async function runSubmitPrompt(
     isNativeWindows = IS_NATIVE_WINDOWS,
   } = {}
 ) {
+  const requestedPasteMode = validateSubmitPromptInput(input, { isNativeWindows });
   const sessionName = managedSessionName(input);
-  const requestedPasteMode = input.pasteMode ?? "auto";
   const keywordPrefix = requestedPasteMode === "keyword";
-  if (keywordPrefix) {
-    if (!isNativeWindows) throw new Error("Keyword prefix delivery currently requires native Windows.");
-    workflowKeywordPrefixLength(input.text);
-  }
   const lines = clampInteger(input.lines, 160, 20, 1000);
   // A second Enter could start another keyword turn under ambiguous UI evidence.
   const submitRetries = keywordPrefix ? 0 : clampInteger(input.submitRetries, 1, 0, 2);
@@ -7178,18 +7993,24 @@ export async function runSubmitPrompt(
   }
 
   const submittedAtMs = Date.now();
+  assertRequestActive();
   const sendResult = await sendText(sessionName, input.text, true, {
     bracketedPaste,
+    requireBracketedPaste: requestedPasteMode === "bracketed" || keywordPrefix,
     ...(keywordPrefix ? { keywordPrefix: true } : {}),
     chunkSize,
     chunkDelayMs,
   });
-  const bracketedPasteUsed =
-    sendResult?.bracketedPasteUsed === undefined
-      ? bracketedPaste
-      : Boolean(sendResult.bracketedPasteUsed);
+  assertRequestActive();
+  const bracketedPasteUsed = sendResult?.bracketedPasteUsed === true;
   if (keywordPrefix && (sendResult?.bracketedPasteUsed !== true || sendResult?.literalPrefixCharacters !== 10)) {
     const error = new Error("Keyword delivery was not confirmed by the backend; inspect the session before any retry.");
+    error.code = "EPASTEMODE";
+    throw error;
+  }
+  if (bracketedPaste && (typeof sendResult?.bracketedPasteUsed !== "boolean" ||
+      (!bracketedPasteUsed && (requestedPasteMode === "bracketed" || /[\t\r\n]/.test(input.text))))) {
+    const error = new Error("Safe framed delivery was not confirmed by the backend; inspect the session before any retry. No automatic replay was attempted.");
     error.code = "EPASTEMODE";
     throw error;
   }
@@ -7204,7 +8025,8 @@ export async function runSubmitPrompt(
   retryLoop: for (let i = 0; i < submitRetries && !transcriptAcknowledged; i += 1) {
     let retryReady = false;
     for (let poll = 0; poll < SUBMIT_RETRY_VISIBILITY_POLLS; poll += 1) {
-      await delay(retryDelayMs);
+      await waitForRequest(delay(retryDelayMs));
+      assertRequestActive();
       capturedText = await capture(sessionName, lines);
       const signals = await observedSignals(capturedText);
       transcriptAcknowledged =
@@ -7225,6 +8047,7 @@ export async function runSubmitPrompt(
       }
     }
     if (!retryReady) break;
+    assertRequestActive();
     await sendKey(sessionName, "Enter");
     retriesUsed += 1;
   }
@@ -7755,7 +8578,10 @@ function claudeCapabilityCacheKey(command) {
 
 async function inspectClaudeCapabilitiesUncached(command) {
   try {
-    const [versionResult, helpResult, ultracodeProbe, ultracodeControlProbe] = await Promise.all([
+    // A failed version/help child does not release ownership of its siblings.
+    // EOF awaits this shared work, so settle every bounded probe before
+    // exposing either a capability result or an inspection failure.
+    const probes = await Promise.allSettled([
       execClaudeCommand(command, ["--version"], { timeout: 10000, maxBuffer: 1024 * 1024 }),
       execClaudeCommand(command, ["--help"], { timeout: 10000, maxBuffer: 2 * 1024 * 1024 }),
       runClaudeArgumentProbe(command, ["--effort=ultracode", "--version"]),
@@ -7764,6 +8590,9 @@ async function inspectClaudeCapabilitiesUncached(command) {
         "--version",
       ]),
     ]);
+    const failedProbe = probes.find((probe) => probe.status === "rejected");
+    if (failedProbe) throw failedProbe.reason;
+    const [versionResult, helpResult, ultracodeProbe, ultracodeControlProbe] = probes.map((probe) => probe.value);
     return parseClaudeCapabilities(versionResult.stdout, helpResult.stdout, command, {
       ...ultracodeProbe,
       controlAttempted: ultracodeControlProbe.attempted,
@@ -7805,10 +8634,20 @@ async function inspectClaudeCapabilities(command = resolveClaudeCommand()) {
   const key = claudeCapabilityCacheKey(command);
   const now = Date.now();
   const cached = claudeCapabilityCache.get(key);
-  if (cached && cached.expiresAt > now) return cached.promise;
+  if (cached && cached.expiresAt > now) return waitForRequest(cached.promise);
   if (cached) claudeCapabilityCache.delete(key);
 
-  const promise = inspectClaudeCapabilitiesUncached(command);
+  // A cached probe belongs to the process, never to its first subscriber's ALS
+  // cancellation scope. Each waiter can detach without aborting its peer.
+  const promise = requestStorage.exit(() => inspectClaudeCapabilitiesUncached(command));
+  sharedCapabilityWork.add(promise);
+  promise.then(
+    () => sharedCapabilityWork.delete(promise),
+    () => {
+      sharedCapabilityWork.delete(promise);
+      if (claudeCapabilityCache.get(key)?.promise === promise) claudeCapabilityCache.delete(key);
+    }
+  );
   claudeCapabilityCache.set(key, {
     expiresAt: now + CLAUDE_CAPABILITY_CACHE_TTL_MS,
     promise,
@@ -7819,7 +8658,7 @@ async function inspectClaudeCapabilities(command = resolveClaudeCommand()) {
   while (claudeCapabilityCache.size > MAX_CLAUDE_CAPABILITY_CACHE_ENTRIES) {
     claudeCapabilityCache.delete(claudeCapabilityCache.keys().next().value);
   }
-  return promise;
+  return waitForRequest(promise);
 }
 
 export function resolveLaunchOptionsFromCapabilities(
@@ -8240,6 +9079,15 @@ const server = new McpServer({
   name: "rail-connector-mcp",
   version: SERVER_VERSION,
 });
+let lifecycleTransport;
+function registerRequestTool(name, config, handler) {
+  return server.registerTool(name, config, (...args) => {
+    const extra = args.at(-1);
+    return lifecycleTransport
+      ? lifecycleTransport.runTool(handler, args, extra)
+      : handler(...args);
+  });
+}
 
 const claudeToolRuleSchema = z
   .string()
@@ -8259,7 +9107,7 @@ const EXPECTED_GENERATION_ID_DESCRIPTION =
 const EXPECTED_STARTED_AT_MS_DESCRIPTION =
   "Optional native-Windows broker start timestamp from sessionBinding or status. Must be paired with expectedGenerationId.";
 
-server.registerTool(
+registerRequestTool(
   "list_claude_sessions",
   {
     description:
@@ -8308,7 +9156,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerRequestTool(
   "get_claude_session",
   {
     description:
@@ -8329,7 +9177,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerRequestTool(
   "get_claude_result",
   {
     description:
@@ -8371,7 +9219,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerRequestTool(
   "start_remote_control",
   {
     description:
@@ -8891,7 +9739,7 @@ server.registerTool(
     )
 );
 
-server.registerTool(
+registerRequestTool(
   "capture_remote_control",
   {
     description: "Capture visible terminal output from the managed native Rail Connector Control session.",
@@ -8945,7 +9793,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerRequestTool(
   "wait_for_claude_turn",
   {
     description:
@@ -9168,7 +10016,7 @@ server.registerTool(
           transcript,
         }, observation);
       }
-      await sleep(input.pollIntervalMs);
+      await requestDelay(input.pollIntervalMs);
     }
     return terminalWaitResult({
       status: "timeout",
@@ -9180,7 +10028,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerRequestTool(
   "send_text",
   {
     description:
@@ -9284,7 +10132,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerRequestTool(
   "submit_prompt",
   {
     description:
@@ -9325,6 +10173,7 @@ server.registerTool(
     },
   },
   async (input) => {
+    validateSubmitPromptInput(input);
     const sessionName = managedSessionName(input);
     const expectedGeneration = expectedManagedGeneration(input);
     requireNativeGenerationBinding(expectedGeneration);
@@ -9357,12 +10206,17 @@ server.registerTool(
       const result = await runSubmitPrompt(input, {
         capture: (name, lines) =>
           backendCapture(name, lines, metadata, expectedGeneration),
-        sendText: (name, value, submit, options) =>
-          backendSendText(name, value, submit, {
+        sendText: (name, value, submit, options) => {
+          // A new delivery attempt owns its own uncertainty. An old turn's
+          // anchor must not survive a lost acknowledgement or cancellation.
+          // Preflight refusals never call this wrapper, preserving that anchor.
+          pendingTurnAnchors.delete(sessionName);
+          return backendSendText(name, value, submit, {
             ...options,
             metadata,
             expectedGeneration,
-          }),
+          });
+        },
         sendKey: (name, key) =>
           backendSendKey(name, key, metadata, expectedGeneration),
         promptAcknowledged: (name, prompt, sinceMs) =>
@@ -9409,7 +10263,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerRequestTool(
   "send_key",
   {
     description: "Send a single key name to the managed native Claude session, such as Enter, Escape, C-c, Up, Down. Enter-equivalent keys are blocked during pending workflows unless force=true after inspection.",
@@ -9520,7 +10374,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerRequestTool(
   "rename_claude_session",
   {
     description:
@@ -9631,7 +10485,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerRequestTool(
   "archive_claude_session",
   {
     description:
@@ -9653,7 +10507,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerRequestTool(
   "unarchive_claude_session",
   {
     description:
@@ -9675,7 +10529,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerRequestTool(
   "stop_remote_control",
   {
     description: "Stop a managed native Rail Connector Control session.",
@@ -9831,7 +10685,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerRequestTool(
   "get_claude_capabilities",
   {
     description:
@@ -9841,7 +10695,7 @@ server.registerTool(
   async () => text(await inspectClaudeCapabilities())
 );
 
-server.registerTool(
+registerRequestTool(
   "status",
   {
     description: "Show terminal backend and Claude process status relevant to managed Remote Control sessions.",
@@ -9985,6 +10839,10 @@ server.registerTool(
 );
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  // A closed diagnostic pipe must not bypass another operation's finally.
+  process.stderr.on("error", () => {});
+  lifecycleTransport = createLifecycleTransport({
+    onOutcome: (outcome) => process.stderr.write(`${JSON.stringify(outcome)}\n`, () => {}),
+  });
+  await server.connect(lifecycleTransport);
 }

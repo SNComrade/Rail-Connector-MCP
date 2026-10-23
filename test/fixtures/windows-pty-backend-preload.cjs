@@ -55,6 +55,7 @@ if (process.env.NODE_ENV === "test" &&
     }
     const dataListeners = new Set();
     const exitListeners = new Set();
+    const errorListeners = new Set();
     let pid = 0;
     let closed = false;
     let kills = 0;
@@ -70,6 +71,18 @@ if (process.env.NODE_ENV === "test" &&
     };
     const mock = {
       get pid() { return pid; },
+      _agent: { inSocket: {
+        on(event, listener) {
+          if (event !== "error") throw new Error("Unsupported inert input socket event");
+          errorListeners.add(listener);
+        },
+        write() {}, destroy() {},
+      } },
+      on(event, listener) {
+        if (event !== "error") throw new Error("Unsupported inert PTY event");
+        errorListeners.add(listener);
+        return this;
+      },
       onData: (listener) => subscribe(dataListeners, listener),
       onExit: (listener) => subscribe(exitListeners, listener),
       write: (data) => record("inert-write", { mode, characters: String(data).length, synthetic: true }),

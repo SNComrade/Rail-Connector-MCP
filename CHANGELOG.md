@@ -5,6 +5,32 @@ Semantic Versioning after the first stable release.
 
 ## [Unreleased]
 
+## [1.0.0-beta.5] - 2026-10-22
+
+Release notes for the beta.5 prerelease.
+
+### Fixed
+
+- Clean up the pinned Windows node-pty output worker after its socket closes,
+  using the tracked version/hash-guarded JavaScript compatibility patch
+- Strengthen generation-bound cancellation and managed-session lifecycle guards
+- Preserve strict bracketed-paste framing and fail closed on unsupported prompt
+  transport states
+- Require Windows upgrade preparation before source or dependency replacement,
+  with explicit `-ClientsClosed` acknowledgement in the guarded installer
+- Align public server, broker and immutable installation examples with beta.5
+
+### Security
+
+- Preserve the accepted SHA-pinned CodeQL 4.39.0 public workflow update
+
+### Known Limitations
+
+- This candidate does not establish a fix for host-retained MCP connections,
+  native HPCON leakage or overall RAM pressure. Historical Windows test-session
+  timeout attribution and separate live qualification remain unresolved.
+- A completed Claude turn does not close its host MCP client connection.
+
 ## [1.0.0-beta.4] - 2026-10-14
 
 ### Added
@@ -221,7 +247,8 @@ interpret `lastKnownPendingCount` as a current count.
 - Absolute Claude-path registration, optional allowed roots, and tagged-source
   installation guidance
 
-[Unreleased]: https://github.com/SNComrade/Rail-Connector-MCP/compare/v1.0.0-beta.4...HEAD
+[Unreleased]: https://github.com/SNComrade/Rail-Connector-MCP/compare/v1.0.0-beta.5...HEAD
+[1.0.0-beta.5]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.5
 [1.0.0-beta.4]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.4
 [1.0.0-beta.3]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.3
 [1.0.0-beta.2]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.2
