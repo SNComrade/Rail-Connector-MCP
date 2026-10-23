@@ -542,17 +542,18 @@ export async function windowsBrokerCleanupRequest(
   payload = {},
   { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, env = process.env, onDispatch } = {}
 ) {
-  if (!COMPATIBILITY_CLEANUP_OPERATIONS.has(operation)) {
-    const error = new Error(
-      `Unsupported Windows broker compatibility cleanup operation: ${operation}`
-    );
-    error.code = "EINVAL";
-    throw error;
-  }
-  const tokenPaths = windowsBrokerPaths(env);
-  const token = readExistingBrokerToken(tokenPaths);
-  const paths = windowsBrokerPaths(env, token);
+  let paths;
   try {
+    if (!COMPATIBILITY_CLEANUP_OPERATIONS.has(operation)) {
+      const error = new Error(
+        `Unsupported Windows broker compatibility cleanup operation: ${operation}`
+      );
+      error.code = "EINVAL";
+      throw error;
+    }
+    const tokenPaths = windowsBrokerPaths(env);
+    const token = readExistingBrokerToken(tokenPaths);
+    paths = windowsBrokerPaths(env, token);
     return await requestOnce(
       paths,
       token,
@@ -563,7 +564,10 @@ export async function windowsBrokerCleanupRequest(
       { onDispatch }
     );
   } catch (error) {
-    if (isBrokerUnavailable(error)) forgetReadyBroker(paths);
+    // requestOnce annotates transport outcomes. Earlier validation/token errors
+    // are definitely unsent; retain any dispatch/reply evidence it supplied.
+    if (error.brokerRequestDispatched === undefined) error.brokerRequestDispatched = false;
+    if (paths && isBrokerUnavailable(error)) forgetReadyBroker(paths);
     throw error;
   }
 }

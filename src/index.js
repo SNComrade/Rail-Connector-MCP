@@ -4027,6 +4027,7 @@ async function forceCleanupIncompatibleWindowsBrokerSession(
   const signal = requestSignal();
   let acquired = false;
   let leaseMayBeAcquired = false;
+  let acquireDispatched = false;
   let stopDispatched = false;
   let operationError;
   // Capture the request identity: socket dispatch callbacks need not run in
@@ -4036,6 +4037,7 @@ async function forceCleanupIncompatibleWindowsBrokerSession(
     onDispatch: () => {
       if (signal?.aborted) throw requestControlError(scope);
       if (operation === "acquireCleanupLease") {
+        acquireDispatched = true;
         leaseMayBeAcquired = true;
         if (scope) scope.control.lease = "unknown";
       } else {
@@ -4138,7 +4140,10 @@ async function forceCleanupIncompatibleWindowsBrokerSession(
       upgradeError.code = "EBROKERUPGRADE";
       throw upgradeError;
     }
-    if (brokerUnavailable(error) && error.brokerRequestDispatched === false) {
+    // Unavailability stands in for absence only before any acquire reached the
+    // broker. A busy reply does not erase that earlier dispatch evidence.
+    if (brokerUnavailable(error) && error.brokerRequestDispatched === false &&
+        !acquireDispatched && !acquired && !leaseMayBeAcquired) {
       return { status: "not_running", managedSession: sessionName };
     }
     throw error;

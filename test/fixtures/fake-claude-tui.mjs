@@ -14,7 +14,9 @@ if (process.env.RAIL_FAKE_CLAUDE_EXIT_TRACE) {
   recordExitTrace("starting");
   process.on("exit", (code) => recordExitTrace("exit", { code }));
 }
-await recordFixtureProcess();
+await recordFixtureProcess({
+  onAdmissionPhase: (phase, elapsedMs) => recordExitTrace("admission-" + phase, { elapsedMs }),
+});
 
 const argv = process.argv.slice(2);
 recordExitTrace("arguments", { sessionId: argumentValue("--session-id"), probe: argv.includes("--help") || argv.includes("--version") });

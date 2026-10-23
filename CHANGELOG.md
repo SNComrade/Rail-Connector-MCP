@@ -5,9 +5,9 @@ Semantic Versioning after the first stable release.
 
 ## [Unreleased]
 
-## 1.0.0-beta.5 (candidate)
+## [1.0.0-beta.5] - 2026-10-22
 
-Prepared on 2026-10-21; publication and platform qualification remain pending.
+Release notes for the beta.5 prerelease.
 
 ### Fixed
 
@@ -247,7 +247,8 @@ interpret `lastKnownPendingCount` as a current count.
 - Absolute Claude-path registration, optional allowed roots, and tagged-source
   installation guidance
 
-[Unreleased]: https://github.com/SNComrade/Rail-Connector-MCP/compare/v1.0.0-beta.4...HEAD
+[Unreleased]: https://github.com/SNComrade/Rail-Connector-MCP/compare/v1.0.0-beta.5...HEAD
+[1.0.0-beta.5]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.5
 [1.0.0-beta.4]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.4
 [1.0.0-beta.3]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.3
 [1.0.0-beta.2]: https://github.com/SNComrade/Rail-Connector-MCP/releases/tag/v1.0.0-beta.2

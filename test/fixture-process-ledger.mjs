@@ -15,12 +15,15 @@ import {
 } from "./fixtures/fixture-process-ledger.mjs";
 import * as fixtureHelper from "./fixtures/fixture-process-ledger.mjs";
 
-if (process.argv[2] === "--inspect-failure-regression") {
+if (process.argv[2] === "--readiness-regression") {
+  await fixtureReadinessRegression();
+} else if (process.argv[2] === "--inspect-failure-regression") {
   inspectFailureRegression();
 } else if (process.argv[2] === "--admission-isolation") {
   await isolatedAdmissionRegression(process.argv[3]);
 } else {
 
+await fixtureReadinessRegression();
 inspectFailureRegression();
 
 const runId = randomUUID();
@@ -821,15 +824,104 @@ ${serveEntry}`);
         fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
       } catch (error) { cleanupError = error; }
     }
-    if (primaryError) primaryError.message += `\nSynthetic ledger diagnostics preserved at ${root}`;
+    if (primaryError) {
+      const detail = `Synthetic ledger diagnostics preserved at ${root}`;
+      console.error(detail);
+      primaryError.message += `\n${detail}`;
+    }
     if (cleanupError) {
-      if (primaryError) primaryError.message += `\nFixture cleanup also failed: ${cleanupError.message}`;
+      if (primaryError) {
+        const detail = `Fixture cleanup also failed: ${cleanupError.message}`;
+        console.error(detail);
+        primaryError.message += `\n${detail}`;
+      }
       else throw cleanupError;
     }
   }
 }
 console.log("fixture-process-ledger ok");
 
+}
+
+async function fixtureReadinessRegression() {
+  const { FIXTURE_ADMISSION_TIMEOUT_MS, FIXTURE_UI_READY_TIMEOUT_MS, FIXTURE_READY_TIMEOUT_MS,
+    DIRECT_FIXTURE_LEASE_TTL_MS, waitForFixtureReady } = fixtureHelper;
+  assert.equal(FIXTURE_ADMISSION_TIMEOUT_MS, 15000, "fixture admission must keep its original deadline");
+  assert.equal(FIXTURE_UI_READY_TIMEOUT_MS, 5000);
+  assert.equal(FIXTURE_READY_TIMEOUT_MS, FIXTURE_ADMISSION_TIMEOUT_MS + FIXTURE_UI_READY_TIMEOUT_MS);
+  assert.ok(DIRECT_FIXTURE_LEASE_TTL_MS >= FIXTURE_READY_TIMEOUT_MS + 10000,
+    "a direct fixture lease must cover readiness and its existing operation allowance");
+  assert.ok(DIRECT_FIXTURE_LEASE_TTL_MS >= 5000 && DIRECT_FIXTURE_LEASE_TTL_MS <= 300000);
+  const expectedBanner = "ORIGINAL_CAPTURE_READY";
+  function simulation({ bannerAt = Infinity, text = expectedBanner, exitAt = Infinity,
+    captureError = null, captureAdvance = 0, firstCaptureAt = null } = {}) {
+    let elapsed = 0;
+    const timeouts = [];
+    const sleeps = [];
+    const promise = waitForFixtureReady({
+      banner: expectedBanner, description: "synthetic readiness regression",
+      now: () => elapsed,
+      capture: async (timeoutMs) => {
+        assert.ok(Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= FIXTURE_READY_TIMEOUT_MS,
+          "each exact-generation capture receives a positive remaining request budget");
+        assert.equal(timeoutMs, Math.ceil(FIXTURE_READY_TIMEOUT_MS - elapsed));
+        timeouts.push(timeoutMs);
+        if (timeouts.length === 1 && firstCaptureAt !== null) elapsed = firstCaptureAt;
+        else elapsed += captureAdvance;
+        if (captureError) throw captureError;
+        if (elapsed >= exitAt) return "[managed session exited, code 75]\n" + expectedBanner;
+        return elapsed >= bannerAt ? text : "";
+      },
+      sleep: async (milliseconds) => {
+        assert.ok(milliseconds > 0 && milliseconds <= 25);
+        assert.ok(milliseconds <= FIXTURE_READY_TIMEOUT_MS - elapsed, "sleep must not overrun the remaining wait budget");
+        sleeps.push(milliseconds); elapsed += milliseconds;
+      },
+    });
+    return { promise, timeouts, sleeps, elapsed: () => elapsed };
+  }
+  for (const bannerAt of [6000, 19900]) {
+    const run = simulation({ bannerAt });
+    await run.promise;
+    assert.equal(run.elapsed(), bannerAt, "admission exceeding the old 5s UI-only budget must still be eligible");
+    assert.ok(run.timeouts.length > 1);
+  }
+  for (const options of [{}, { bannerAt: 0, text: "REPLACEMENT_CAPTURE_READY" }]) {
+    const run = simulation(options);
+    await assert.rejects(run.promise, (error) => error.code === "EFIXTUREREADY" && /admission 15000ms \+ UI 5000ms/.test(error.message));
+    assert.equal(run.elapsed(), FIXTURE_READY_TIMEOUT_MS, "missing or foreign banners cannot pass beyond the composite bound");
+  }
+  for (const captureAdvance of [FIXTURE_READY_TIMEOUT_MS, FIXTURE_READY_TIMEOUT_MS + 1]) {
+    const run = simulation({ bannerAt: 0, captureAdvance });
+    await assert.rejects(run.promise, (error) => error.code === "EFIXTUREREADY");
+    assert.equal(run.timeouts.length, 1, "a late capture response must not accept even a matching banner or retry");
+    assert.equal(run.sleeps.length, 0);
+  }
+  const exited = simulation({ exitAt: 15100 });
+  await assert.rejects(exited.promise, (error) => error.code === "EFIXTUREEXIT" && /code 75/.test(error.message));
+  assert.equal(exited.elapsed(), 15100, "an exited generation must fail promptly even when its capture retains the ready banner");
+  const stale = Object.assign(new Error("injected exact-generation mismatch"), { code: "ESTALE" });
+  const generationFailure = simulation({ captureError: stale });
+  await assert.rejects(generationFailure.promise, (error) => error === stale);
+  assert.equal(generationFailure.timeouts.length, 1, "generation mismatch must propagate unchanged without retry");
+  assert.equal(generationFailure.sleeps.length, 0);
+  const brokerTimeout = Object.assign(new Error("injected broker capture timeout"), { code: "ETIMEDOUT" });
+  for (const captureAdvance of [FIXTURE_READY_TIMEOUT_MS - 0.5, FIXTURE_READY_TIMEOUT_MS]) {
+    const atDeadline = simulation({ captureError: brokerTimeout, captureAdvance });
+    await assert.rejects(atDeadline.promise, (error) => error.code === "EFIXTUREREADY" && error.cause === brokerTimeout);
+    assert.equal(atDeadline.timeouts.length, 1, "an expired broker timeout must retain its cause without retry");
+  }
+  const earlyTimeout = simulation({ captureError: brokerTimeout, captureAdvance: 100 });
+  await assert.rejects(earlyTimeout.promise, (error) => error === brokerTimeout);
+  assert.equal(earlyTimeout.timeouts.length, 1, "an early transport timeout must propagate unchanged without retry");
+  const lateExit = simulation({ exitAt: 0, captureAdvance: FIXTURE_READY_TIMEOUT_MS + 1 });
+  await assert.rejects(lateExit.promise, (error) => error.code === "EFIXTUREEXIT" && /code 75/.test(error.message));
+  assert.equal(lateExit.timeouts.length, 1, "a late final exit must retain its exit code and cannot pass using the banner");
+  const fractional = simulation({ firstCaptureAt: FIXTURE_READY_TIMEOUT_MS - 0.5 });
+  await assert.rejects(fractional.promise, (error) => error.code === "EFIXTUREREADY");
+  assert.deepEqual(fractional.sleeps, [0.5], "the final sleep must clamp to the remaining fractional budget");
+  assert.equal(fractional.timeouts.length, 1, "no capture request may start at an expired deadline");
+  console.log("fixture-readiness regression ok");
 }
 
 function inspectFailureRegression() {

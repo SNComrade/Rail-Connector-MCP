@@ -9,7 +9,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { windowsBrokerRequest, windowsBrokerPaths, windowsBrokerLaunchPolicyFingerprint,
   WINDOWS_BROKER_VERSION } from "../src/windows-broker-client.js";
-import { createFixtureProcessLedger } from "./fixtures/fixture-process-ledger.mjs";
+import { createFixtureProcessLedger, DIRECT_FIXTURE_LEASE_TTL_MS, waitForFixtureReady } from "./fixtures/fixture-process-ledger.mjs";
 import {
   createPortableWaitCursor,
   expectedManagedGeneration,
@@ -91,6 +91,7 @@ const workspace = repoRoot;
 const canonicalWorkspace = fs.realpathSync.native?.(workspace) ?? fs.realpathSync(workspace);
 const stateDir = path.join(root, "state");
 const boundaryHookDir = path.join(stateDir, "test-boundary-hooks");
+const heldPairedBoundaries = new Set();
 const configDir = path.join(root, "config");
 const fixture = path.join(repoRoot, "test", "fixtures", "fake-claude-tui.mjs");
 const fixtureLedger = await createFixtureProcessLedger({ directory: path.join(root, "fixture-processes"), fixturePath: fixture });
@@ -214,24 +215,21 @@ function directFixtureLaunch(sessionName, leaseId, {
       ? { freshSessionId: sessionId, resolvedSessionId: sessionId }
       : {}),
     leaseId,
-    leaseTtlMs: 10000,
+    leaseTtlMs: DIRECT_FIXTURE_LEASE_TTL_MS,
   };
 }
 
 async function waitForDirectFixtureReady(sessionName, metadata, banner, launchEnvironment = environment) {
+  assert.equal(heldPairedBoundaries.size, 0, "fixture readiness must not wait inside a held 10000ms paired boundary");
   const expected = brokerGenerationPair(metadata);
-  const deadline = performance.now() + 5000;
-  do {
-    const captured = await windowsBrokerRequest("capture", {
+  await waitForFixtureReady({
+    banner, description: "fixture " + sessionName,
+    capture: async (timeoutMs) => (await windowsBrokerRequest("capture", {
       sessionName,
       ...expected,
       lines: 40,
-    }, { env: launchEnvironment, startIfMissing: false });
-    if (captured.capture.includes(banner)) return;
-    if (performance.now() >= deadline) break;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  } while (true);
-  assert.fail(`fixture ${sessionName} did not become ready with banner ${banner}`);
+    }, { env: launchEnvironment, startIfMissing: false, timeoutMs })).capture,
+  });
 }
 
 async function releaseDirectFixtureLease(sessionName, leaseId, metadata) {
@@ -247,7 +245,7 @@ async function acquireDirectFixtureLease(sessionName, leaseId, metadata) {
   const acquired = await windowsBrokerRequest("acquireLease", {
     sessionName,
     leaseId,
-    ttlMs: 10000,
+    ttlMs: DIRECT_FIXTURE_LEASE_TTL_MS,
     ...brokerGenerationPair(metadata),
   }, { env: environment, startIfMissing: false });
   assert.equal(acquired.status, "acquired");
@@ -267,7 +265,9 @@ async function stopDirectFixture(sessionName, leaseId, metadata) {
 
 function appendCleanupFailure(primaryError, cleanupError) {
   if (!primaryError) throw cleanupError;
-  primaryError.message += `\nFixture cleanup also failed: ${cleanupError.message}`;
+  const detail = `Fixture cleanup also failed: ${cleanupError.message}`;
+  console.error(detail); // A previously captured .stack may not reflect .message edits.
+  primaryError.message += `\n${detail}`;
 }
 
 async function forceStopExactDirectFixture(sessionName, expected, tracked) {
@@ -990,7 +990,11 @@ async function waitForPairedBoundary(stage) {
   const enteredPath = boundaryPath(stage, "entered");
   for (let attempt = 0; attempt < 200; attempt += 1) {
     if (fs.existsSync(enteredPath)) {
-      return JSON.parse(fs.readFileSync(enteredPath, "utf8"));
+      const entered = JSON.parse(fs.readFileSync(enteredPath, "utf8"));
+      assert.equal(entered.stage, stage, "paired boundary entry must match the observed stage");
+      assert.match(entered.token, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+      heldPairedBoundaries.add(JSON.stringify([stage, entered.token]));
+      return entered;
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
@@ -998,11 +1002,14 @@ async function waitForPairedBoundary(stage) {
 }
 
 function releasePairedBoundary(stage, token) {
+  const key = JSON.stringify([stage, token]);
+  assert.ok(heldPairedBoundaries.has(key), "paired boundary release must match an observed stage and token");
   fs.writeFileSync(
     boundaryPath(stage, "release"),
     `${JSON.stringify({ token })}\n`,
     { flag: "wx" }
   );
+  heldPairedBoundaries.delete(key); // A failed write must retain the hold guard.
 }
 
 async function productionBoundaryHookIsInert() {
@@ -1878,7 +1885,7 @@ async function captureTerminalGenerationCase(testCase) {
         tracked.metadata = replacement.metadata;
         assert.equal(replacement.metadata.resolvedSessionId, sessionId);
         assert.notEqual(replacement.metadata.generationId, started.metadata.generationId);
-        await waitForDirectFixtureReady(sessionName, replacement.metadata, replacementBanner);
+        // Readiness is checked after the held MCP boundary is released.
         replacementMarker = "synthetic-capture-replacement-" + testCase.name + "-" + replacement.metadata.generationId;
         fs.appendFileSync(logFile, JSON.stringify(assistantRecord(replacementMarker)) + "\n");
       }
@@ -1887,6 +1894,9 @@ async function captureTerminalGenerationCase(testCase) {
     }
     const captured = await capturePromise;
     captureSettled = true;
+    if (replacementMarker) {
+      await waitForDirectFixtureReady(sessionName, tracked.metadata, replacementBanner);
+    }
     let result;
     try { result = JSON.parse(contentText(captured)); } catch { result = {}; }
     const surviving = (await brokerStatus()).managedSessions.find((session) => session.name === sessionName);
@@ -2111,6 +2121,7 @@ async function waitTerminalGenerationCase(testCase) {
     // Observe a possible transport rejection immediately; it is still awaited
     // and propagated below, so no rejection can escape the exact cleanup.
     waitPromise.catch(() => {});
+    let replacementReadyMetadata = null;
     if (testCase.stage) {
       boundary = await waitForPairedBoundary(testCase.stage);
       if (testCase.expireBeforePoll) {
@@ -2130,7 +2141,7 @@ async function waitTerminalGenerationCase(testCase) {
         tracked.metadata = replacement.metadata;
         assert.equal(replacement.metadata.resolvedSessionId, sessionId);
         assert.notEqual(replacement.metadata.generationId, started.metadata.generationId);
-        await waitForDirectFixtureReady(sessionName, replacement.metadata, "Fake Claude TUI");
+        replacementReadyMetadata = replacement.metadata;
       }
       if (testCase.completion === "after_capture") appendCompletion();
       if (testCase.resubmitAtBoundary) await submitRememberedAnchor("newer");
@@ -2139,6 +2150,9 @@ async function waitTerminalGenerationCase(testCase) {
     }
     const waited = await waitPromise;
     waitSettled = true;
+    if (replacementReadyMetadata) {
+      await waitForDirectFixtureReady(sessionName, replacementReadyMetadata, "Fake Claude TUI");
+    }
     let result;
     try { result = JSON.parse(contentText(waited)); } catch { result = {}; }
     const surviving = (await brokerStatus()).managedSessions.find((session) => session.name === sessionName);
@@ -2585,7 +2599,12 @@ async function authoritativeLeaseRefusalCoverage() {
 
 async function incompatibleCleanupCancellationCoverage() {
   for (const mode of ["before-acquire-cancel", "busy-cancel", "delayed-grant-cancel", "success",
-    "lost-acquire-ack", "lost-stop-ack", "lost-release-ack"]) {
+    "lost-acquire-ack", "lost-stop-ack", "lost-release-ack", "missing-token-before-acquire",
+    "missing-token-after-acquire", "busy-then-not-running", "busy-then-acquired", "busy-then-missing-token"]) {
+    const busyThenMissing = mode === "busy-then-missing-token";
+    const busyThenNotRunning = mode === "busy-then-not-running";
+    const busyThenAcquired = mode === "busy-then-acquired";
+    const busyRetry = busyThenNotRunning || busyThenAcquired;
     const fixtureState = path.join(root, "incompatible-cleanup-" + mode);
     fs.mkdirSync(fixtureState, { recursive: true });
     const env = { ...process.env, RAIL_CONNECTOR_STATE_DIR: fixtureState,
@@ -2607,6 +2626,7 @@ async function incompatibleCleanupCancellationCoverage() {
     const pair = { expectedGenerationId: "00000000-0000-4000-8000-000000000000",
       expectedStartedAtMs: Date.now() - 10_000 };
     const records = [];
+    let acquireRequests = 0;
     const sockets = new Set();
     let gate;
     let fixtureError;
@@ -2633,10 +2653,21 @@ async function incompatibleCleanupCancellationCoverage() {
               managedSessions: [{ name: sessionName, cwd: repoRoot, canonicalCwd: canonicalWorkspace,
                 generationId: pair.expectedGenerationId, startedAtMs: pair.expectedStartedAtMs,
                 exited: false, args: [] }] });
+            if (mode === "missing-token-before-acquire") fs.unlinkSync(paths.tokenFile);
             if (mode === "before-acquire-cancel") gate = status;
             else status();
           } else if (request.operation === "acquireCleanupLease") {
-            const grant = () => reply({ status: mode === "busy-cancel" ? "busy" : "acquired" });
+            acquireRequests++;
+            const busy = mode === "busy-cancel" || ((busyThenMissing || busyRetry) && acquireRequests === 1);
+            const grant = () => reply({
+              status: busy ? "busy" : busyThenNotRunning ? "not_running" : "acquired",
+              ...(busy ? { generationId: pair.expectedGenerationId, startedAtMs: pair.expectedStartedAtMs } : {}),
+            });
+            // Removing only this fixture's token before replying makes the next
+            // acquire fail at token admission, before any socket dispatch.
+            if (mode === "missing-token-after-acquire" || (busyThenMissing && acquireRequests === 1)) {
+              fs.unlinkSync(paths.tokenFile);
+            }
             if (mode === "lost-acquire-ack") socket.destroy();
             else if (mode === "busy-cancel" || mode === "delayed-grant-cancel") gate = grant;
             else grant();
@@ -2695,9 +2726,14 @@ async function incompatibleCleanupCancellationCoverage() {
       } else {
         const outcome = await pending;
         assert.equal(outcome.error, undefined);
-        const failed = mode.startsWith("lost-");
+        const missingBefore = mode === "missing-token-before-acquire";
+        const missingAfter = mode === "missing-token-after-acquire";
+        const knownNotRunning = missingBefore || busyThenNotRunning;
+        const failed = mode.startsWith("lost-") || missingAfter || busyThenMissing;
         assert.equal(outcome.value.isError === true, failed, contentText(outcome.value));
-        const expected = mode === "lost-acquire-ack" ? { delivery: "not_dispatched", lease: "released" }
+        const expected = knownNotRunning || busyThenMissing ? undefined
+          : missingAfter ? { delivery: "not_dispatched", lease: "unknown" }
+          : mode === "lost-acquire-ack" ? { delivery: "not_dispatched", lease: "released" }
           : mode === "lost-stop-ack" ? { delivery: "possibly_delivered", lease: "released" }
           : mode === "lost-release-ack" ? { delivery: "acknowledged", lease: "unknown" }
           : { delivery: "acknowledged", lease: "released" };
@@ -2706,14 +2742,30 @@ async function incompatibleCleanupCancellationCoverage() {
         if (mode === "lost-acquire-ack") assert.match(contentText(outcome.value), /lease outcome is unknown.*no stop was run/i);
         if (mode === "lost-stop-ack") assert.match(contentText(outcome.value), /stop outcome is unknown.*do not replay/i);
         if (mode === "lost-release-ack") assert.match(contentText(outcome.value), /lease release acknowledgement is unknown.*TTL is not proof/i);
+        if (missingAfter || busyThenMissing) {
+          assert.match(contentText(outcome.value), /No Windows broker token is available/);
+          assert.doesNotMatch(contentText(outcome.value), /not_running/,
+            "cleanup that reached the broker must not be converted into a not-running result");
+          if (busyThenMissing) {
+            assert.deepEqual(records.map((record) => record.operation), ["status", "acquireCleanupLease"],
+              "token loss after a busy reply must not dispatch another acquire, stop or release");
+          }
+        }
         if (!failed) {
           const result = JSON.parse(contentText(outcome.value));
-          assert.equal(result.status, "stopped");
-          assert.equal(result.compatibilityCleanup, true);
-          assert.equal(result.terminalCaptureRead, false);
+          assert.equal(result.status, knownNotRunning ? "not_running" : "stopped");
+          if (knownNotRunning) {
+            assert.equal(result.managedSession, sessionName);
+            assert.deepEqual(records.map((record) => record.operation), missingBefore
+              ? ["status"] : ["status", "acquireCleanupLease", "acquireCleanupLease"],
+              "known absence must not dispatch stop or release");
+          } else {
+            assert.equal(result.compatibilityCleanup, true);
+            assert.equal(result.terminalCaptureRead, false);
+          }
         }
         const diagnostic = JSON.stringify(outcome.value);
-        for (const excluded of [token, sessionName, pair.expectedGenerationId]) {
+        for (const excluded of [token, pair.expectedGenerationId, ...(knownNotRunning ? [] : [sessionName])]) {
           assert.equal(diagnostic.includes(excluded), false,
             "uncertain compatibility outcomes must not disclose token/session identity");
         }
@@ -2722,9 +2774,11 @@ async function incompatibleCleanupCancellationCoverage() {
       const acquire = records.filter((r) => r.operation === "acquireCleanupLease");
       const stop = records.filter((r) => r.operation === "cleanupStop");
       const release = records.filter((r) => r.operation === "releaseCleanupLease");
-      assert.equal(acquire.length, mode === "before-acquire-cancel" ? 0 : 1, "cancel/unknown never authorizes a retry");
-      assert.equal(stop.length, ["success", "lost-stop-ack", "lost-release-ack"].includes(mode) ? 1 : 0);
-      assert.equal(release.length, ["before-acquire-cancel", "busy-cancel"].includes(mode) ? 0 : 1);
+      assert.equal(acquire.length, ["before-acquire-cancel", "missing-token-before-acquire"].includes(mode) ? 0 : busyRetry ? 2 : 1,
+        "only the explicit busy retry controls dispatch a second acquire");
+      assert.equal(stop.length, busyThenAcquired || ["success", "lost-stop-ack", "lost-release-ack"].includes(mode) ? 1 : 0);
+      assert.equal(release.length, busyThenMissing || busyThenNotRunning || ["before-acquire-cancel", "busy-cancel", "missing-token-before-acquire",
+        "missing-token-after-acquire"].includes(mode) ? 0 : 1);
       for (const record of [...acquire, ...stop, ...release]) {
         assert.equal(record.payload.sessionName, sessionName);
         assert.equal(record.payload.expectedGenerationId, pair.expectedGenerationId);
@@ -3475,7 +3529,9 @@ try {
       const summary = (value = {}) => ({ readable: value.readable, present: value.present, exited: value.exited, exitCode: value.exitCode, generationMatchesInitial: value.generationMatchesInitial });
       console.error(`stop-generation fixture status: ${JSON.stringify({ before: summary(diagnostic.before), after: summary(diagnostic.after), sendTextIsError: diagnostic.sendTextIsError })}`);
     } catch { /* Earlier failures may precede this diagnostic checkpoint. */ }
-    primaryError.message += `\nSynthetic fixture diagnostics preserved at ${root}`;
+    const detail = `Synthetic fixture diagnostics preserved at ${root}`;
+    console.error(detail);
+    primaryError.message += `\n${detail}`;
   }
   if (cleanupError) appendCleanupFailure(primaryError, cleanupError);
 }

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFixtureProcessLedger } from "./fixtures/fixture-process-ledger.mjs";
+import { createFixtureProcessLedger, waitForFixtureReady } from "./fixtures/fixture-process-ledger.mjs";
 import { probeWindowsBroker, windowsBrokerRequest } from "../src/windows-broker-client.js";
 
 if (process.platform !== "win32") {
@@ -54,14 +54,12 @@ async function request(operation, payload = {}, startIfMissing = false) {
 }
 
 async function captureReady(sessionName, metadata, banner) {
-  const deadline = performance.now() + 5000;
-  do {
-    const captured = await request("capture", { sessionName, ...pair(metadata), lines: 40 });
-    if (captured.capture.includes(banner)) return;
-    if (performance.now() >= deadline) break;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  } while (true);
-  assert.fail("exact test fixture did not reach its ready banner");
+  await waitForFixtureReady({
+    banner, description: "exact PTY test fixture " + sessionName,
+    capture: async (timeoutMs) => (await windowsBrokerRequest("capture", {
+      sessionName, ...pair(metadata), lines: 40,
+    }, { env: environment, startIfMissing: false, timeoutMs })).capture,
+  });
 }
 
 function fixturePayload(sessionName, leaseId, sessionId, extraEnvironment = {}) {
